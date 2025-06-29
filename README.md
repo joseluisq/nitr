@@ -10,7 +10,7 @@ The server aims to provide a flexible and extensible architecture for building d
 
 An application can define a `scripts/config.lua` script file to perform setup at server startup and process HTTP requests via a `scripts/handler.lua` script file.
 
-The setup script data will be shared with the HTTP handler script, allowing to pass data to be re-used in on every request.
+The setup script data will be shared with the HTTP handler script, allowing to pass data to be re-used on every request.
 
 ## Features
 
@@ -113,10 +113,6 @@ end
 Unless you explicitly state otherwise, any contribution you intentionally submitted for inclusion in current work, as defined in the Apache-2.0 license, shall be dual licensed as described below, without any additional terms or conditions.
 
 Feel free to submit a [pull request](https://github.com/joseluisq/nitr/pulls) or file an [issue](https://github.com/joseluisq/nitr/issues).
-
-## Community
-
-[SWS Community on Discord](https://discord.gg/VWvtZeWAA7)
 
 ## License
 
