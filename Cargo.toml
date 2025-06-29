@@ -1,0 +1,64 @@
+[package]
+name = "nitr"
+version = "0.0.0-beta.0"
+edition = "2021"
+rust-version = "1.82.0"
+authors = ["Jose Quintana <https://joseluisq.net>"]
+license = "MIT OR Apache-2.0"
+description = "A dynamic web server written in Rust with Lua scripting support."
+repository = "https://github.com/joseluisq/nitr"
+readme = "README.md"
+homepage = "https://github.com/joseluisq/nitr"
+autotests = true
+autoexamples = true
+keywords = [
+    "dynamic-web-server",
+    "http-server",
+    "lua-server"
+]
+include = [
+    "src/**/*.rs",
+    "build.rs",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
+]
+
+[dependencies]
+bytes = "1.10"
+mlua = { version = "0.10", features = ["async", "macros", "lua54", "serialize", "vendored", "anyhow", "send"] }
+futures-util = { version = "0.3", default-features = false }
+hyper = { version = "1.6", features = ["full"] }
+hyper-util = { version = "0.1.11", features = ["full"] }
+http-body-util = "0.1.3"
+tokio = { version = "1.0", features = ["macros", "rt", "time"] }
+anyhow = "1.0"
+reqwest = { version = "0.12.15", features = ["json"] }
+serde_json = "1.0.140"
+minijinja = { version = "2.10.2", features = ["loader"] }
+rusqlite = { version = "0.35.0", features = ["bundled"] }
+
+[profile.release]
+codegen-units = 1
+debug = false
+debug-assertions = false
+lto = "fat"
+opt-level = 3
+panic = "abort"
+rpath = false
+strip = true
+
+[lib]
+name = "nitr"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nitr"
+path = "src/bin/server.rs"
+doc = false
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+rustc-args = []
