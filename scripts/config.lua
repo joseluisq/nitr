@@ -1,12 +1,16 @@
 function(conn)
     -- Using database connection
     local sql = ""..
-        "CREATE TABLE IF NOT EXISTS person ("..
-        "    id    INTEGER PRIMARY KEY,"..
-        "    name  TEXT NOT NULL,"..
-        "    data  BLOB"..
+        "CREATE TABLE IF NOT EXISTS users ("..
+        "    id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,"..
+        "    name TEXT NOT NULL,"..
+        "    age INTEGER NOT NULL"..
         ")"
-    local affected = conn:execute(sql)
+    conn:execute(sql)
+    conn:execute("DELETE FROM users")
+    conn:execute("INSERT INTO users (name, age) VALUES ('Eve', 30), ('Bob', 25), ('Diana', 15);")
+    -- Querying some data
+    local users = conn:query("SELECT * FROM users WHERE age > ?", { 20 })
 
     -- Using Fetch HTTP client
     local headers = {
@@ -28,7 +32,7 @@ function(conn)
     -- Passing custom data to the HTTP handler
     return {
         status = resp.status,
-        affected = affected,
+        users = users,
         server_time = os.date("%d-%m-%YT%H:%M:%S"),
     }
 end
