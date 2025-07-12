@@ -46,7 +46,7 @@ pub(crate) async fn handle(
             Ok(resp.body(body)?)
         }
         Err(err) => {
-            eprintln!("{}", err);
+            eprintln!("{err}");
             Ok(Response::builder()
                 .status(hyper::StatusCode::INTERNAL_SERVER_ERROR.as_u16())
                 .body(Full::new(Bytes::from("Internal Server Error")).boxed())?)

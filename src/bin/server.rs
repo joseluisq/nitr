@@ -14,7 +14,7 @@ async fn main() -> Result {
     let listen_addr = "127.0.0.1:3000";
     let listener = TcpListener::bind(listen_addr)
         .await
-        .with_context(|| format!("Unable to listen on {}", listen_addr))?;
+        .with_context(|| format!("Unable to listen on {listen_addr}"))?;
 
     // TODO: use configuration instead
     let conf_src = Path::new("scripts/config.lua");
@@ -60,7 +60,7 @@ async fn main() -> Result {
                 .serve_connection(TokioIo::new(stream), svc)
                 .await
             {
-                eprintln!("Error serving connection: {:?}", err);
+                eprintln!("Error serving connection: {err}",);
             }
         });
     }

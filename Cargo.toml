@@ -37,7 +37,7 @@ anyhow = "1.0"
 reqwest = { version = "0.12.15", features = ["json"] }
 serde_json = "1.0.140"
 minijinja = { version = "2.10.2", features = ["loader"] }
-rusqlite = { version = "0.35.0", features = ["bundled"] }
+rusqlite = { version = "0.37.0", features = ["bundled"] }
 
 [profile.release]
 codegen-units = 1
