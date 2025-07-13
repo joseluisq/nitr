@@ -2,10 +2,8 @@ use mlua::{AnyUserData, Lua, Table, UserData, UserDataMethods};
 use rusqlite::Connection;
 use std::sync::{Arc, Mutex};
 
-use crate::{
-    error::{Context, Result},
-    userdata::db::types::Conn,
-};
+use crate::error::{Context, Result};
+use crate::userdata::db::types::Conn;
 
 pub(crate) mod execute;
 pub(crate) mod query;

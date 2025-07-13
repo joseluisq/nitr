@@ -1,5 +1,6 @@
+use anyhow::anyhow;
 use mlua::{FromLua, Function, IntoLua, IntoLuaMulti, Lua, LuaOptions, RegistryKey, StdLib, Table};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::{Context, Result};
 use crate::userdata::{db, fetch, json, template, utils, UserData, USERDATA_LIBS};
@@ -13,6 +14,9 @@ pub struct Runtime {
     lua: Lua,
     cfg: Option<Table>,
     http_fn: Option<Function>,
+    http_fn_key: Option<RegistryKey>,
+    http_fn_path: Option<PathBuf>,
+    opts: RuntimeOpts,
 }
 
 /// Options for configuring the Lua runtime.
@@ -20,6 +24,7 @@ pub struct Runtime {
 pub struct RuntimeOpts {
     pub libs: mlua::StdLib,
     pub memory_limit: usize,
+    pub dynamic_handler: bool,
 }
 
 impl Runtime {
@@ -42,6 +47,7 @@ impl Runtime {
             | StdLib::UTF8
             | StdLib::COROUTINE,
             memory_limit: MEMORY_LIMIT,
+            dynamic_handler: true,
         })
         .await
     }
@@ -61,6 +67,9 @@ impl Runtime {
             lua,
             cfg: None,
             http_fn: None,
+            http_fn_key: None,
+            http_fn_path: None,
+            opts,
         })
     }
 
@@ -150,6 +159,17 @@ impl Runtime {
     /// It loads the Lua script from the path and evaluates it to allocate the function,
     /// but it's not invoked immediately. It will be called on every request.
     pub async fn register_http_fn(&mut self, http_src: &Path) -> Result {
+        let meta = std::fs::metadata(http_src)
+            .with_context(|| "Failed to read HTTP handler file metadata")?;
+
+        if meta.is_file() {
+            self.http_fn_path = Some(http_src.to_owned());
+        } else {
+            return Err(anyhow!(
+                "HTTP handler path is not a regular file or does not exist"
+            ));
+        }
+
         let data = std::fs::read(http_src)
             .with_context(|| "Failed to read the Lua HTTP handler file content.")?;
 
@@ -160,6 +180,7 @@ impl Runtime {
             .with_context(|| "Failed to create Lua HTTP handler")?;
 
         let http_fn = self.lua.registry_value::<Function>(&key)?;
+        self.http_fn_key = Some(key);
 
         self.http_fn = Some(http_fn);
         Ok(())
@@ -185,5 +206,44 @@ impl Runtime {
     /// The Lua HTTP handler function that will be called for each HTTP request.
     pub fn http_fn(&self) -> Option<&Function> {
         self.http_fn.as_ref()
+    }
+
+    /// Reloads the Lua HTTP handler function from the file specified in `http_fn_path`.
+    pub fn http_fn_reload(&mut self) -> Result<()> {
+        // TODO: group all those fields in a struct
+        if !self.opts.dynamic_handler
+            || self.http_fn.is_none()
+            || self.http_fn_key.is_none()
+            || self.http_fn_path.is_none()
+        {
+            return Ok(());
+        }
+
+        // TODO: add logging
+        println!(
+            "Reloading http handler from {}",
+            self.http_fn_path.as_ref().unwrap().display()
+        );
+
+        let data = std::fs::read(self.http_fn_path.as_ref().unwrap())
+            .with_context(|| "Failed to read HTTP handler file content")?;
+
+        let http_fn = self
+            .lua
+            .load(data)
+            .eval::<Function>()
+            .with_context(|| "Failed to create Lua HTTP handler")?;
+        let mut existing_key = self.http_fn_key.take().unwrap();
+        self.lua
+            .replace_registry_value(&mut existing_key, http_fn)
+            .with_context(|| "Failed to replace Lua HTTP handler in registry")?;
+        let http_fn = self
+            .lua
+            .registry_value::<Function>(&existing_key)
+            .with_context(|| "Failed to get Lua HTTP handler from registry")?;
+        self.http_fn = Some(http_fn);
+        self.http_fn_key = Some(existing_key);
+
+        Ok(())
     }
 }

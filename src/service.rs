@@ -7,6 +7,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use crate::error::Result;
 use crate::handler;
@@ -16,12 +17,12 @@ use crate::Error;
 
 /// Service that handles incoming requests
 pub struct Svc {
-    rt: Arc<Runtime>,
+    rt: Arc<Mutex<Runtime>>,
     peer_addr: SocketAddr,
 }
 
 impl Svc {
-    pub fn new(rt: Arc<Runtime>, peer_addr: SocketAddr) -> Self {
+    pub fn new(rt: Arc<Mutex<Runtime>>, peer_addr: SocketAddr) -> Self {
         Self { rt, peer_addr }
     }
 }

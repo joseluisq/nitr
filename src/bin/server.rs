@@ -4,6 +4,7 @@ use mlua::AnyUserData;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 
 use nitr::service::Svc;
 use nitr::userdata::UserData;
@@ -42,7 +43,7 @@ async fn main() -> Result {
     rt.register_cfg_fn(conf_src, db).await?;
     rt.register_http_fn(http_src).await?;
 
-    let rt = Arc::new(rt);
+    let rt = Arc::new(Mutex::new(rt));
 
     loop {
         let (stream, peer_addr) = match listener.accept().await {
