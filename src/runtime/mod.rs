@@ -395,3 +395,88 @@ impl Runtime {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_temp_script(name: &str, content: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("nitr-rt-test-{}-{name}", std::process::id()));
+        std::fs::write(&path, content).expect("write temp script");
+        path
+    }
+
+    fn test_runtime(exec_timeout: Option<Duration>) -> Runtime {
+        Runtime::new_with(RuntimeOpts {
+            libs: StdLib::MATH | StdLib::TABLE | StdLib::STRING,
+            memory_limit: 8 * 1024 * 1024,
+            dev_mode: false,
+            exec_timeout,
+            package_dir: None,
+        })
+        .expect("runtime")
+    }
+
+    #[tokio::test]
+    async fn handler_round_trip() {
+        let path = write_temp_script(
+            "ok.lua",
+            "function(cfg, req) return { status = 200, body = req } end",
+        );
+        let mut rt = test_runtime(Some(Duration::from_secs(5)));
+        rt.register_http_fn(&path).expect("register handler");
+        std::fs::remove_file(&path).ok();
+
+        // The cached coroutine must keep working across calls.
+        for _ in 0..3 {
+            let resp = rt.call_handler("ping").await.expect("call handler");
+            assert_eq!(resp.get::<String>("body").expect("body"), "ping");
+        }
+    }
+
+    #[tokio::test]
+    async fn cpu_bound_loops_hit_the_instruction_hook() {
+        let path = write_temp_script("loop.lua", "function() while true do end end");
+        let mut rt = test_runtime(Some(Duration::from_millis(100)));
+        rt.register_http_fn(&path).expect("register handler");
+
+        let err = rt
+            .call_handler(Value::Nil)
+            .await
+            .expect_err("must time out");
+        assert!(err.to_string().contains("time budget"), "got: {err}");
+
+        // The state must survive and serve the next call after a reset.
+        let ok = write_temp_script("ok2.lua", "function() return { body = 'alive' } end");
+        rt.register_http_fn(&ok).expect("register handler");
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&ok).ok();
+        let resp = rt.call_handler(Value::Nil).await.expect("recovered");
+        assert_eq!(resp.get::<String>("body").expect("body"), "alive");
+    }
+
+    #[tokio::test]
+    async fn config_snapshot_round_trips() {
+        let cfg_script = write_temp_script(
+            "cfg.lua",
+            "function() return { greeting = 'hi', nested = { n = 7 } } end",
+        );
+        let mut source = test_runtime(None);
+        source
+            .register_cfg_fn(&cfg_script, Value::Nil)
+            .await
+            .expect("run config script");
+        std::fs::remove_file(&cfg_script).ok();
+
+        let snapshot = source
+            .cfg_snapshot()
+            .expect("snapshot")
+            .expect("config present");
+        let mut target = test_runtime(None);
+        target.set_cfg_snapshot(&snapshot).expect("inject snapshot");
+        let cfg = target.cfg().expect("cfg table");
+        assert_eq!(cfg.get::<String>("greeting").expect("greeting"), "hi");
+        let nested: Table = cfg.get("nested").expect("nested");
+        assert_eq!(nested.get::<i64>("n").expect("n"), 7);
+    }
+}

@@ -2,106 +2,143 @@
 
 > A Rust web server embedding [Lua](https://www.lua.org/) for fast, efficient and safe dynamic backends.
 
-**STATUS:** Nitr is in early development stage and not ready for production use. Feel free to try it out and contribute.
+**STATUS:** Nitr is in early development and not ready for production use. Feel free to try it out and contribute.
 
 ## Overview
 
-The server aims to provide a flexible and extensible architecture for building dynamic web server backends using [Lua](https://www.lua.org/) as the scripting language.
+Nitr serves HTTP requests with Lua 5.4 scripts. An application is two files: an optional `config.lua` that runs **once** at startup, and a `handler.lua` that runs on **every** request. The server keeps a fixed pool of independent Lua states (one per CPU core by default), so requests execute in parallel without locking, and every script runs under configurable safety limits (restricted stdlib, memory cap, execution timeout).
 
-An application can define a `scripts/config.lua` script file to perform setup at server startup and process HTTP requests via a `scripts/handler.lua` script file.
-
-The setup script data will be shared with the HTTP handler script, allowing to pass data to be re-used on every request.
+Nitr is both a **binary** (`nitr`, configured via `nitr.toml`) and a **library crate** (embed the server and register your own Rust functions as Lua globals).
 
 ## Features
 
-**Note** This is a work in progress, so it might have features partially working or not at all. Also, remember that those may change over time.
+- Pool of Lua states over a multi-thread runtime: one request per state, no global locks, natural backpressure.
+- Safety by default: `io`/`os` excluded from the stdlib (opt-in), 8 MiB memory limit per state, 30 s execution budget enforced by an instruction-count hook (stops `while true do end`) plus an async timeout, `require` confined to the scripts directory, no native Lua modules.
+- Built-in Lua APIs: `json` (encode/decode), `fetch` (HTTP client with timeouts), `template` (minijinja), `conn` (SQLite, runs off the async threads), `dbg` (debug logging).
+- HTTP correctness: binary-safe request/response bodies, multi-value headers (`Set-Cookie`), parsed query strings, graceful shutdown, no Lua tracebacks leaked to clients (unless dev mode).
+- `nitr.toml` configuration with `NITR_*` environment overrides and CLI flags.
+- Dev mode (`--dev`): handler hot reload and error details in responses.
+- Extensible: register custom Rust functions/modules into every Lua state via the crate API.
 
-- Built in Rust for low-level performance, efficiency, and safety.
-- Lua as scripting language to configure and handling HTTP requests ([`mlua`](https://github.com/mlua-rs/mlua/)).
-- Configurable Lua standard library modules.
-- Built-in Rust APIs available in Lua scripts like:
-  - `Request` and `Response` types
-  - HTTP Client (`fetch`)
-  - Template Engine (`jinja` syntax)
-  - JSON encoder/decoder (`serde_json`)
-  - SQLite Driver (`rusqlite`)
-  - Utility functions (`debug`, etc)
-- Lua configuration handler (script to run before server startup)
-- Lua request handler (script to run after server startup on every request)
-- Configuration file in TOML format (`nitr.toml`) to define server settings and Lua modules.
-- Create your own Lua modules and use them in your scripts via the Nitr crate.
+## Quick start (binary)
 
-For tracking the progrees of the project, please refer to the [GitHub issues](https://github.com/joseluisq/nitr/issues) page.
-
-## Configuration Script
-
-This Lua script file is executed once at server startup. It can be used to setup an application before it starts processing HTTP requests.
-
-```lua
--- scripts/config.lua
-function(conn)
-    -- Using the built-in SQLite database connection
-    local sql = ""..
-        "CREATE TABLE IF NOT EXISTS person ("..
-        "    id    INTEGER PRIMARY KEY,"..
-        "    name  TEXT NOT NULL,"..
-        "    data  BLOB"..
-        ")"
-    conn:execute(sql)
-
-    -- Passing custom data to the HTTP handler
-    return {
-        server_time = os.date("%d-%m-%YT%H:%M:%S"),
-    }
-end
+```sh
+cargo run
 ```
 
-## HTTP handler Script
+With no configuration, Nitr listens on `127.0.0.1:3000` and executes `scripts/handler.lua`. Add a `nitr.toml` to change anything (see [Configuration](#configuration)).
 
-This Lua script file is executed for every HTTP request. It can be used to handle requests and return a responses.
-The Lua function will receive the configuration data returned by the setup script and the client HTTP request.
+### The handler script
+
+Runs once per request. It receives the config data and the request, and returns the response:
 
 ```lua
 -- scripts/handler.lua
 function(cfg, req)
-    -- Define a custom response body
-    local body = {
-        message = "Hello, Nitr!",
-        server_time = cfg.server_time,
-        request = {
-            method = req.method,
-            path = req.path,
-            uri = req.uri,
-            query = req.query,
-            headers = req.headers,
-            remote_addr = req.remote_addr,
-        },
-    }
-
-    -- Or use the built-in `fetch` to make an HTTP request
-    local client = fetch("get", "https://httpbin.org/ip", headers)
-    local resp = client:send()
-    local json = resp:json()
-
-    -- Or use the built-in `template` engine
-    body = template:render("my_template.j2", {
-        ["client_ip"] = json["origin"],
-        ["server_time"] = cfg.server_time,
-    })
-
-    -- Return the response specifying the status code, headers, and body
     return {
         status = 200,
         headers = {
             ["Content-Type"] = "application/json",
-            ["X-Req-Method"] = req.method,
-            ["X-Req-Path"] = req.path,
-            ["X-Remote-Addr"] = req.remote_addr,
+            ["Set-Cookie"] = { "a=1", "b=2" },   -- multi-value headers
         },
-        body = body
+        body = json:encode({
+            message = "Hello, Nitr!",
+            path = req.path,
+            name = req.query.name,               -- parsed query string
+            served_since = cfg.started_at,       -- data from config.lua
+        }),
     }
 end
 ```
+
+### The configuration script (optional)
+
+Runs exactly **once** at startup, before requests are served. Use it for setup (e.g. schema migrations); the returned table is passed to the handler on every request. It must return plain data (tables, strings, numbers, booleans) — it is snapshotted and shared with every Lua state.
+
+```lua
+-- scripts/config.lua
+function(conn)
+    conn:execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT)")
+    return { started_at = os.date("%Y-%m-%dT%H:%M:%S") }
+end
+```
+
+## Lua API
+
+### Request (`req`)
+
+| Field / method | Description |
+| --- | --- |
+| `req.method`, `req.path`, `req.remote_addr` | Strings |
+| `req.query` | Table of percent-decoded query parameters |
+| `req.headers` | Table of request headers |
+| `req.uri` | Table: `scheme`, `host`, `port`, `path`, `query`, `authority` |
+| `req:text()`, `req:json()`, `req:read()` | Body as string, decoded JSON, or streamed chunks |
+
+### Response (returned table)
+
+`status` (number, default 200), `headers` (value: string, integer, or array of strings), `body` (string; binary-safe).
+
+### Builtins
+
+Enabled via `builtins` in `nitr.toml` (all by default when their settings are present):
+
+| Global | Description |
+| --- | --- |
+| `json:encode(v)` / `json:decode(s)` | JSON codec (serde) |
+| `fetch(method, url, headers?)` → `client:send()` | HTTP client (shared pool, connect/request timeouts, redirect cap). Response: `.status`, `.headers`, `.url`, `:text()`, `:json()`, `:read()` |
+| `template:render(name, data?)` | minijinja templates from `templates_dir` |
+| `conn:execute/query/query_row/query_one(sql, params?)` | SQLite (`database` file); queries run on a blocking thread pool with a prepared-statement cache |
+| `dbg(value)` | Debug-print a Lua value to the log |
+
+## Configuration
+
+`nitr.toml` (see the [annotated example](nitr.toml)), overridable via `NITR_*` env vars and CLI flags (`--config <path>`, `--dev`). Precedence: flags > env > file > defaults.
+
+```toml
+listen = "127.0.0.1:3000"
+handler_script = "scripts/handler.lua"
+config_script = "scripts/config.lua"    # optional
+templates_dir = "scripts/templates"     # enables `template`
+database = "scripts/file.db"            # enables `conn`
+workers = 4                             # Lua states; default: CPU cores
+dev_mode = false                        # hot reload + error details
+builtins = ["dbg", "fetch", "template", "json", "db"]
+
+[lua]
+stdlib = ["math", "table", "string", "utf8", "coroutine", "package"]  # "io"/"os" are opt-in
+memory_limit = 8388608                  # bytes, per state
+exec_timeout_ms = 30000                 # 0 disables the execution budget
+```
+
+## Library usage
+
+```rust
+use nitr::{Builtins, Server};
+
+#[tokio::main]
+async fn main() -> nitr::Result {
+    Server::builder()
+        .listen(([127, 0, 0, 1], 3000).into())
+        .handler_script("scripts/handler.lua")
+        .builtins(Builtins::JSON | Builtins::FETCH)
+        // Expose your own Rust functions to every Lua state:
+        .setup(|lua| {
+            let greet = lua.create_function(|_, name: String| Ok(format!("Hello, {name}!")))?;
+            lua.globals().set("greet", greet)
+        })
+        .build()
+        .await?
+        .serve() // ctrl-c shuts down gracefully; see serve_with_shutdown()
+        .await
+}
+```
+
+See [examples/hello](examples/hello) (`cargo run --example hello`). For lower-level embedding, `nitr::Runtime` exposes the Lua state, script loading, and the budgeted `call_handler` directly. Errors are a typed `nitr::Error` enum.
+
+## Documentation
+
+Design documents live in [docs/](docs/): [architecture](docs/architecture.md), [crate API](docs/crate-api.md), [configuration](docs/configuration.md), [security model](docs/security.md), [performance](docs/performance.md), and the [roadmap](docs/roadmap.md).
 
 ## Name origins
 

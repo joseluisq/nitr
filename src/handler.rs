@@ -107,3 +107,83 @@ fn error_response(err: &Error, dev_mode: bool) -> Result<HttpResponse> {
         .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .body(Full::new(Bytes::from(body)).boxed())?)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mlua::Lua;
+
+    fn eval_table(lua: &Lua, src: &str) -> LuaTable {
+        lua.load(src).eval().expect("eval response table")
+    }
+
+    async fn body_bytes(resp: HttpResponse) -> Bytes {
+        resp.into_body()
+            .collect()
+            .await
+            .expect("collect")
+            .to_bytes()
+    }
+
+    #[tokio::test]
+    async fn defaults_to_200_and_empty_body() {
+        let lua = Lua::new();
+        let resp = to_response(eval_table(&lua, "{}")).expect("response");
+        assert_eq!(resp.status(), 200);
+        assert!(body_bytes(resp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn preserves_binary_bodies() {
+        let lua = Lua::new();
+        let table = eval_table(
+            &lua,
+            r#"{ status = 201, body = string.char(0, 255, 1) .. "x" }"#,
+        );
+        let resp = to_response(table).expect("response");
+        assert_eq!(resp.status(), 201);
+        assert_eq!(&body_bytes(resp).await[..], &[0, 255, 1, b'x']);
+    }
+
+    #[tokio::test]
+    async fn supports_multi_value_and_integer_headers() {
+        let lua = Lua::new();
+        let table = eval_table(
+            &lua,
+            r#"{
+                headers = {
+                    ["Set-Cookie"] = { "a=1", "b=2" },
+                    ["X-Limit"] = 42,
+                    ["Content-Type"] = "text/plain",
+                },
+            }"#,
+        );
+        let resp = to_response(table).expect("response");
+        let cookies: Vec<_> = resp.headers().get_all("set-cookie").iter().collect();
+        assert_eq!(cookies, ["a=1", "b=2"]);
+        assert_eq!(resp.headers()["x-limit"], "42");
+        assert_eq!(resp.headers()["content-type"], "text/plain");
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_headers_gracefully() {
+        let lua = Lua::new();
+        let bad_name = eval_table(&lua, r#"{ headers = { ["bad name"] = "x" } }"#);
+        assert!(to_response(bad_name).is_err());
+
+        let bad_type = eval_table(&lua, r#"{ headers = { ok = function() end } }"#);
+        assert!(to_response(bad_type).is_err());
+    }
+
+    #[tokio::test]
+    async fn error_responses_hide_details_unless_dev_mode() {
+        let err = Error::Script("secret traceback".into());
+        let prod = error_response(&err, false).expect("prod response");
+        assert_eq!(prod.status(), 500);
+        assert_eq!(&body_bytes(prod).await[..], b"Internal Server Error");
+
+        let dev = error_response(&err, true).expect("dev response");
+        let body = body_bytes(dev).await;
+        assert!(String::from_utf8_lossy(&body).contains("secret traceback"));
+    }
+}

@@ -234,3 +234,101 @@ where
         .parse()
         .map_err(|err| Error::Config(format!("invalid value for {name}: {err}")))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lua::Builtins;
+
+    fn write_temp_config(name: &str, content: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("nitr-test-{}-{name}", std::process::id()));
+        std::fs::write(&path, content).expect("write temp config");
+        path
+    }
+
+    #[test]
+    fn defaults_are_sane() {
+        let cfg = Config::default();
+        assert_eq!(cfg.listen, SocketAddr::from(([127, 0, 0, 1], 3000)));
+        assert_eq!(cfg.handler_script, PathBuf::from("scripts/handler.lua"));
+        assert!(cfg.workers >= 1);
+        assert!(!cfg.dev_mode);
+        // No explicit list enables every builtin.
+        assert_eq!(cfg.builtins().expect("builtins"), Builtins::all());
+        // io/os are opt-in.
+        assert!(!cfg.lua.stdlib.iter().any(|s| s == "io" || s == "os"));
+    }
+
+    #[test]
+    fn parses_a_full_config_file() {
+        let path = write_temp_config(
+            "full.toml",
+            r#"
+                listen = "127.0.0.1:8080"
+                handler_script = "app/handler.lua"
+                database = "app.db"
+                workers = 2
+                dev_mode = true
+                builtins = ["dbg", "json", "db"]
+                [lua]
+                stdlib = ["math", "string", "package"]
+                memory_limit = 1048576
+                exec_timeout_ms = 500
+            "#,
+        );
+        let cfg = Config::from_file(&path).expect("parse config");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(cfg.listen, SocketAddr::from(([127, 0, 0, 1], 8080)));
+        assert!(cfg.dev_mode);
+        assert_eq!(
+            cfg.builtins().expect("builtins"),
+            Builtins::DEBUG | Builtins::JSON | Builtins::DATABASE
+        );
+        let opts = cfg.runtime_opts().expect("runtime opts");
+        assert_eq!(opts.memory_limit, 1048576);
+        assert_eq!(
+            opts.exec_timeout,
+            Some(std::time::Duration::from_millis(500))
+        );
+        assert!(opts.dev_mode);
+        // package.path confinement derives from the handler script location.
+        assert_eq!(opts.package_dir.as_deref(), Some(Path::new("app")));
+    }
+
+    #[test]
+    fn rejects_unknown_fields() {
+        let path = write_temp_config("typo.toml", "memroy_limit = 1\n");
+        let err = Config::from_file(&path).expect_err("typo must fail");
+        std::fs::remove_file(&path).ok();
+        assert!(err.to_string().contains("memroy_limit"));
+    }
+
+    #[test]
+    fn strict_builtins_require_their_settings() {
+        let mut cfg = Config {
+            builtins: Some(vec!["db".into()]),
+            ..Config::default()
+        };
+        assert!(cfg.builtins().is_err());
+        cfg.database = Some(PathBuf::from("x.db"));
+        assert_eq!(cfg.builtins().expect("builtins"), Builtins::DATABASE);
+
+        cfg.builtins = Some(vec!["nope".into()]);
+        assert!(cfg.builtins().is_err());
+    }
+
+    #[test]
+    fn exec_timeout_zero_disables_the_budget() {
+        let mut cfg = Config::default();
+        cfg.lua.exec_timeout_ms = 0;
+        assert_eq!(cfg.runtime_opts().expect("opts").exec_timeout, None);
+    }
+
+    #[test]
+    fn unknown_stdlib_name_fails() {
+        let mut cfg = Config::default();
+        cfg.lua.stdlib.push("ffi".into());
+        assert!(cfg.runtime_opts().is_err());
+    }
+}

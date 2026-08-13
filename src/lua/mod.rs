@@ -53,3 +53,26 @@ impl Builtins {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Builtins;
+
+    #[test]
+    fn config_names_round_trip() {
+        for (name, flag) in [
+            ("dbg", Builtins::DEBUG),
+            ("fetch", Builtins::FETCH),
+            ("template", Builtins::TEMPLATE),
+            ("json", Builtins::JSON),
+            ("db", Builtins::DATABASE),
+        ] {
+            assert_eq!(Builtins::from_config_name(name), Some(flag));
+            assert!(flag.global_name().is_some());
+        }
+        assert_eq!(Builtins::from_config_name("nope"), None);
+        // Combined flags have no single global name.
+        assert_eq!((Builtins::DEBUG | Builtins::JSON).global_name(), None);
+        assert_eq!(Builtins::DATABASE.global_name(), Some("conn"));
+    }
+}

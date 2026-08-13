@@ -107,3 +107,44 @@ pub(crate) fn read_row(
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_lua_params_to_sql_values() {
+        let lua = Lua::new();
+        let table: Table = lua
+            .load(r#"{ 7, 2.5, "text", true }"#)
+            .eval()
+            .expect("params table");
+        let params = params_from_table(Some(&table)).expect("params");
+        assert!(matches!(params[0], SqlValue::Int(7)));
+        assert!(matches!(params[1], SqlValue::Real(f) if f == 2.5));
+        assert!(matches!(&params[2], SqlValue::Text(t) if t == b"text"));
+        assert!(matches!(params[3], SqlValue::Bool(true)));
+        assert!(params_from_table(None).expect("empty").is_empty());
+    }
+
+    #[test]
+    fn rejects_unsupported_param_types() {
+        let lua = Lua::new();
+        let table: Table = lua.load("{ function() end }").eval().expect("params table");
+        assert!(params_from_table(Some(&table)).is_err());
+    }
+
+    #[test]
+    fn row_converts_to_lua_table() {
+        let lua = Lua::new();
+        let row: SqlRow = vec![
+            ("id".into(), SqlValue::Int(1)),
+            ("name".into(), SqlValue::Text(b"Eve".to_vec())),
+            ("data".into(), SqlValue::Null),
+        ];
+        let table = row_to_lua(&lua, row).expect("row table");
+        assert_eq!(table.get::<i64>("id").expect("id"), 1);
+        assert_eq!(table.get::<String>("name").expect("name"), "Eve");
+        assert!(table.get::<Value>("data").expect("data").is_nil());
+    }
+}
