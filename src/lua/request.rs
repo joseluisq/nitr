@@ -12,6 +12,18 @@ impl UserData for LuaRequest {
     fn add_fields<'lua, F: UserDataFields<Self>>(fields: &mut F) {
         fields.add_field_method_get("remote_addr", |_, req| Ok((req.0).to_string()));
         fields.add_field_method_get("method", |_, req| Ok((req.1).method().to_string()));
+        fields.add_field_method_get("path", |_, req| Ok(req.1.uri().path().to_string()));
+        fields.add_field_method_get("query", |lua, req| {
+            // Query string parsed (and percent-decoded) into a table; for
+            // repeated keys the last value wins.
+            let table = lua.create_table()?;
+            if let Some(query) = req.1.uri().query() {
+                for (k, v) in url::form_urlencoded::parse(query.as_bytes()) {
+                    table.set(k.as_ref(), v.as_ref())?;
+                }
+            }
+            Ok(table)
+        });
         fields.add_field_method_get("uri", |lua, req| {
             let table = lua.create_table()?;
             let uri = req.1.uri();

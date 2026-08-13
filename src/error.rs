@@ -1,18 +1,32 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
-// This file is part of Static Web Server.
-// See https://static-web-server.net/ for more information
-// Copyright (C) 2019-present Jose Quintana <joseluisq.net>
+//! Typed error and result types for the Nitr library.
 
-//! Useful error type re-exports based on [anyhow][mod@anyhow].
-//!
+/// Errors returned by the Nitr library.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// An error raised by the Lua runtime or a script.
+    #[error("lua error: {0}")]
+    Lua(#[from] mlua::Error),
 
-/// Just a `anyhow::Result` type alias.
-pub type Result<T = (), E = anyhow::Error> = anyhow::Result<T, E>;
+    /// An invalid or missing configuration value.
+    #[error("configuration error: {0}")]
+    Config(String),
 
-/// Just an `anyhow::Error` type alias.
-pub type Error = anyhow::Error;
+    /// A script file could not be loaded or evaluated.
+    #[error("script error: {0}")]
+    Script(String),
 
-/// Just re-export some `anyhow` stuff.
-pub use anyhow::anyhow;
-pub use anyhow::bail;
-pub use anyhow::Context;
+    /// An I/O error.
+    #[error("i/o error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// An HTTP protocol error.
+    #[error("http error: {0}")]
+    Http(#[from] hyper::http::Error),
+
+    /// The handler exceeded its execution budget.
+    #[error("handler execution timed out")]
+    Timeout,
+}
+
+/// Result type alias used across the Nitr library.
+pub type Result<T = (), E = Error> = std::result::Result<T, E>;

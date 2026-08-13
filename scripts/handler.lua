@@ -1,5 +1,6 @@
 function(cfg, req)
-    require 'scripts.modules.printf'
+    -- `require` resolves relative to the scripts directory
+    require 'modules.printf'
 
     local uri = req.uri
     local body = ""

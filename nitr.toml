@@ -1,0 +1,54 @@
+# Nitr server configuration.
+#
+# Precedence (strongest first): CLI flags (--dev), NITR_* environment
+# variables (e.g. NITR_LISTEN, NITR_WORKERS), this file, built-in defaults.
+# Every setting below is optional; the values shown are the ones this
+# repository uses for development.
+
+# Address the server binds to. Default: "127.0.0.1:3000"
+listen = "127.0.0.1:3000"
+
+# Lua script executed once per request. Default: "scripts/handler.lua"
+handler_script = "scripts/handler.lua"
+
+# Lua script executed once at startup. Its returned table (plain data) is
+# passed to the handler as the first argument on every request.
+# Optional: when absent, the handler receives nil.
+config_script = "scripts/config.lua"
+
+# Directory for the `template` builtin (minijinja). Optional: without it the
+# `template` builtin is unavailable.
+templates_dir = "scripts/templates"
+
+# SQLite database file for the `conn` builtin. Optional: without it the
+# `conn` builtin is unavailable.
+database = "scripts/file.db"
+
+# Number of pooled Lua states (max concurrently executing handlers).
+# Default: number of CPU cores.
+#workers = 4
+
+# Development mode: hot-reload the handler script on change.
+# Default: false (also enabled by the --dev flag).
+dev_mode = true
+
+# Built-in globals exposed to scripts. When omitted, all builtins whose
+# requirements are met are enabled. Valid names: "dbg", "fetch", "template",
+# "json", "db". Listing them explicitly is strict: a listed builtin missing
+# its configuration (e.g. "db" without `database`) fails at startup.
+#builtins = ["dbg", "fetch", "template", "json", "db"]
+
+[lua]
+# Lua standard libraries loaded into every state.
+# Default: ["math", "table", "string", "utf8", "coroutine", "package"]
+# "io" and "os" give scripts ambient filesystem/process access and must be
+# opted into explicitly. The dev scripts use os.date, so "os" is added here.
+stdlib = ["math", "table", "string", "utf8", "coroutine", "package", "os"]
+
+# Per-state Lua memory limit in bytes. Default: 8388608 (8 MiB)
+#memory_limit = 8388608
+
+# Wall-clock budget per handler invocation in milliseconds; 0 disables it.
+# Enforced by an instruction-count hook (stops CPU-bound loops) plus an
+# async timeout (stops slow I/O). Default: 30000
+#exec_timeout_ms = 30000

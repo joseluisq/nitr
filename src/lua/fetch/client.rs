@@ -5,16 +5,24 @@ use hyper::{
     HeaderMap,
 };
 use mlua::{ExternalResult, Function, Lua, Table, UserData, UserDataMethods};
-use reqwest::{Client as HttpClient, Method as HttpMethod, Url};
-// use serde_json::Value as SerdeValue;
+use reqwest::{redirect, Client as HttpClient, Method as HttpMethod, Url};
+use std::time::Duration;
 
-use crate::error::{Context, Result};
-use crate::userdata::response::LuaResponse;
+use crate::lua::response::LuaResponse;
+
+/// How long to wait for a TCP/TLS connection to an upstream.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Total budget per outbound request (connect + request + response body).
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum redirects followed per outbound request.
+const MAX_REDIRECTS: usize = 5;
 
 pub(crate) struct LuaFetch(Arc<HttpClient>, HttpMethod, Url, HeaderMap);
 
 impl UserData for LuaFetch {
-    fn add_methods<'lua, M: UserDataMethods<Self>>(methods: &mut M) {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_async_method_mut("send", |_, args, ()| async move {
             let http_client = args.0.clone();
             let method = args.1.clone();
@@ -26,7 +34,6 @@ impl UserData for LuaFetch {
                 .headers(headers)
                 .send()
                 .await
-                // .and_then(|resp| resp.error_for_status())
                 .into_lua_err()?;
 
             Ok(LuaResponse(resp))
@@ -34,10 +41,28 @@ impl UserData for LuaFetch {
     }
 }
 
+/// Returns the process-wide shared HTTP client, building it on first use.
+/// `reqwest::Client` is internally reference-counted and designed to be
+/// shared; one client means one connection pool across all Lua states.
+fn shared_client() -> mlua::Result<Arc<HttpClient>> {
+    static CLIENT: std::sync::OnceLock<Arc<HttpClient>> = std::sync::OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client.clone());
+    }
+    let client = Arc::new(
+        HttpClient::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .redirect(redirect::Policy::limited(MAX_REDIRECTS))
+            .build()
+            .into_lua_err()?,
+    );
+    Ok(CLIENT.get_or_init(|| client).clone())
+}
+
 /// HTTP fetch function.
-pub(crate) fn create_fetch_fn(lua: &Lua) -> Result<Function> {
-    let http_client = HttpClient::builder().build().into_lua_err()?;
-    let http_client = Arc::new(http_client);
+pub(crate) fn create_fetch_fn(lua: &Lua) -> mlua::Result<Function> {
+    let http_client = shared_client()?;
 
     lua.create_async_function(move |_, args: (String, String, Option<Table>)| {
         let http_client = http_client.clone();
@@ -61,5 +86,4 @@ pub(crate) fn create_fetch_fn(lua: &Lua) -> Result<Function> {
             Ok(LuaFetch(http_client, method, url, headers))
         }
     })
-    .with_context(|| "error fetching the response")
 }

@@ -7,23 +7,23 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 use crate::error::Result;
 use crate::handler;
-use crate::runtime::Runtime;
-use crate::userdata::request::LuaRequest;
+use crate::lua::request::LuaRequest;
+use crate::runtime::RuntimePool;
 use crate::Error;
 
-/// Service that handles incoming requests
+/// Service that handles incoming requests by checking a Lua runtime out of
+/// the pool for the duration of each request.
 pub struct Svc {
-    rt: Arc<Mutex<Runtime>>,
+    pool: Arc<RuntimePool>,
     peer_addr: SocketAddr,
 }
 
 impl Svc {
-    pub fn new(rt: Arc<Mutex<Runtime>>, peer_addr: SocketAddr) -> Self {
-        Self { rt, peer_addr }
+    pub fn new(pool: Arc<RuntimePool>, peer_addr: SocketAddr) -> Self {
+        Self { pool, peer_addr }
     }
 }
 
@@ -33,9 +33,9 @@ impl Service<Request<Incoming>> for Svc {
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
-        let rt = self.rt.clone();
+        let pool = self.pool.clone();
         let req = LuaRequest(self.peer_addr, req);
 
-        Box::pin(async move { handler::handle(&rt, req).await })
+        Box::pin(async move { handler::handle(&pool, req).await })
     }
 }

@@ -1,68 +1,78 @@
-use hyper::server::conn::http1;
-use hyper_util::rt::TokioIo;
-use mlua::AnyUserData;
-use std::path::Path;
-use std::sync::Arc;
-use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use anyhow::{bail, Context as _};
+use std::path::{Path, PathBuf};
 
-use nitr::service::Svc;
-use nitr::userdata::UserData;
-use nitr::{Context, Result, Runtime};
+use nitr::{Config, Server};
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result {
-    let listen_addr = "127.0.0.1:3000";
-    let listener = TcpListener::bind(listen_addr)
-        .await
-        .with_context(|| format!("Unable to listen on {listen_addr}"))?;
+const DEFAULT_CONFIG_FILE: &str = "nitr.toml";
 
-    // TODO: use configuration instead
-    let conf_src = Path::new("scripts/config.lua");
-    let http_src = Path::new("scripts/handler.lua");
+const USAGE: &str = "\
+Usage: nitr [OPTIONS]
 
-    println!("Listening on http://{listen_addr}");
+Options:
+  -c, --config <PATH>  Path to the TOML config file (default: ./nitr.toml)
+      --dev            Enable development mode (hot reload)
+  -h, --help           Print this help message";
 
-    let mut rt = Runtime::new().await?;
+struct Args {
+    config: Option<PathBuf>,
+    dev: bool,
+}
 
-    // TODO: register globals via config
-    rt.register_globals(
-        UserData::NONE
-            | UserData::DEBUG
-            | UserData::FETCH
-            | UserData::TEMPLATE
-            | UserData::JSON
-            | UserData::DATABASE,
-    )
-    .await?;
-
-    let db = rt
-        .get_global::<AnyUserData>(UserData::DATABASE)
-        .with_context(|| "Failed to get Lua database handler")?;
-
-    rt.register_cfg_fn(conf_src, db).await?;
-    rt.register_http_fn(http_src).await?;
-
-    let rt = Arc::new(Mutex::new(rt));
-
-    loop {
-        let (stream, peer_addr) = match listener.accept().await {
-            Ok(x) => x,
-            Err(err) => {
-                eprintln!("Failed to accept connection: {err}");
-                continue;
+fn parse_args() -> anyhow::Result<Args> {
+    let mut args = Args {
+        config: None,
+        dev: false,
+    };
+    let mut iter = std::env::args().skip(1);
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-c" | "--config" => {
+                let path = iter
+                    .next()
+                    .with_context(|| format!("missing value for {arg}"))?;
+                args.config = Some(PathBuf::from(path));
             }
-        };
-
-        let svc = Svc::new(rt.clone(), peer_addr);
-
-        tokio::task::spawn(async move {
-            if let Err(err) = http1::Builder::new()
-                .serve_connection(TokioIo::new(stream), svc)
-                .await
-            {
-                eprintln!("Error serving connection: {err}",);
+            "--dev" => args.dev = true,
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                std::process::exit(0);
             }
-        });
+            _ => bail!("unknown argument `{arg}`\n{USAGE}"),
+        }
     }
+    Ok(args)
+}
+
+fn load_config(args: &Args) -> anyhow::Result<Config> {
+    let mut cfg = match &args.config {
+        Some(path) => Config::from_file(path)?,
+        None => {
+            let default = Path::new(DEFAULT_CONFIG_FILE);
+            if default.is_file() {
+                Config::from_file(default)?
+            } else {
+                Config::default()
+            }
+        }
+    };
+    cfg.apply_env()?;
+    if args.dev {
+        cfg.dev_mode = true;
+    }
+    Ok(cfg)
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    let cfg = load_config(&parse_args()?)?;
+    let server = Server::builder().config(cfg).build().await?;
+    server.serve().await?;
+    Ok(())
 }

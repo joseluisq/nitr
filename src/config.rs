@@ -1,0 +1,236 @@
+//! Server configuration (`nitr.toml`), defaults, and environment overrides.
+
+use serde::Deserialize;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+
+use crate::error::{Error, Result};
+use crate::lua::Builtins;
+use crate::runtime::RuntimeOpts;
+
+/// Default per-state Lua memory limit in bytes.
+const DEFAULT_MEMORY_LIMIT: usize = 8 * 1024 * 1024; // 8 MiB
+
+/// Default wall-clock budget per handler invocation, in milliseconds.
+const DEFAULT_EXEC_TIMEOUT_MS: u64 = 30_000;
+
+/// Server configuration, typically loaded from a `nitr.toml` file.
+///
+/// Precedence (strongest first): CLI flags / builder setters, `NITR_*`
+/// environment variables (see [`apply_env()`](Self::apply_env)), the TOML
+/// file, and finally the built-in defaults.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Config {
+    /// Address the server binds to.
+    pub listen: SocketAddr,
+    /// Lua script executed once per request.
+    pub handler_script: PathBuf,
+    /// Lua script executed once at startup; its returned table is passed to
+    /// the handler on every request.
+    pub config_script: Option<PathBuf>,
+    /// Directory for the `template` builtin.
+    pub templates_dir: Option<PathBuf>,
+    /// SQLite database file for the `conn` builtin.
+    pub database: Option<PathBuf>,
+    /// Number of pooled Lua states. Reserved: takes effect with the runtime
+    /// pool (roadmap phase 3).
+    pub workers: usize,
+    /// Development mode: hot-reload the handler script on change.
+    pub dev_mode: bool,
+    /// Built-in globals exposed to scripts. `None` enables every builtin
+    /// whose requirements are met; an explicit list is strict and fails at
+    /// startup when a listed builtin is missing its configuration
+    /// (e.g. `template` without `templates_dir`).
+    pub builtins: Option<Vec<String>>,
+    /// Lua runtime settings.
+    pub lua: LuaConfig,
+}
+
+/// Lua runtime settings (`[lua]` section).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LuaConfig {
+    /// Lua standard libraries loaded into every state.
+    pub stdlib: Vec<String>,
+    /// Per-state Lua memory limit in bytes.
+    pub memory_limit: usize,
+    /// Wall-clock budget per handler invocation, in milliseconds; `0`
+    /// disables the limit. Enforced by an instruction-count hook (CPU-bound
+    /// loops) and an outer async timeout (slow I/O).
+    pub exec_timeout_ms: u64,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            listen: SocketAddr::from(([127, 0, 0, 1], 3000)),
+            handler_script: PathBuf::from("scripts/handler.lua"),
+            config_script: None,
+            templates_dir: None,
+            database: None,
+            workers: std::thread::available_parallelism().map_or(1, |n| n.get()),
+            dev_mode: false,
+            builtins: None,
+            lua: LuaConfig::default(),
+        }
+    }
+}
+
+impl Default for LuaConfig {
+    fn default() -> Self {
+        Self {
+            // `io` and `os` are deliberately excluded: they give scripts
+            // ambient filesystem/process access. Opt in via `[lua] stdlib`.
+            stdlib: ["math", "table", "string", "utf8", "coroutine", "package"]
+                .map(String::from)
+                .to_vec(),
+            memory_limit: DEFAULT_MEMORY_LIMIT,
+            exec_timeout_ms: DEFAULT_EXEC_TIMEOUT_MS,
+        }
+    }
+}
+
+impl Config {
+    /// Loads the configuration from a TOML file.
+    pub fn from_file(path: &Path) -> Result<Self> {
+        let data = std::fs::read_to_string(path).map_err(|err| {
+            Error::Config(format!(
+                "failed to read the config file {}: {err}",
+                path.display()
+            ))
+        })?;
+        toml::from_str(&data).map_err(|err| {
+            Error::Config(format!(
+                "failed to parse the config file {}: {err}",
+                path.display()
+            ))
+        })
+    }
+
+    /// Applies `NITR_*` environment variable overrides on top of the current
+    /// values: `NITR_LISTEN`, `NITR_HANDLER_SCRIPT`, `NITR_CONFIG_SCRIPT`,
+    /// `NITR_TEMPLATES_DIR`, `NITR_DATABASE`, `NITR_WORKERS`,
+    /// `NITR_DEV_MODE`, `NITR_LUA_MEMORY_LIMIT`, `NITR_LUA_EXEC_TIMEOUT_MS`.
+    pub fn apply_env(&mut self) -> Result {
+        if let Some(v) = env_var("NITR_LISTEN") {
+            self.listen = parse_env("NITR_LISTEN", &v)?;
+        }
+        if let Some(v) = env_var("NITR_HANDLER_SCRIPT") {
+            self.handler_script = PathBuf::from(v);
+        }
+        if let Some(v) = env_var("NITR_CONFIG_SCRIPT") {
+            self.config_script = Some(PathBuf::from(v));
+        }
+        if let Some(v) = env_var("NITR_TEMPLATES_DIR") {
+            self.templates_dir = Some(PathBuf::from(v));
+        }
+        if let Some(v) = env_var("NITR_DATABASE") {
+            self.database = Some(PathBuf::from(v));
+        }
+        if let Some(v) = env_var("NITR_WORKERS") {
+            self.workers = parse_env("NITR_WORKERS", &v)?;
+        }
+        if let Some(v) = env_var("NITR_DEV_MODE") {
+            self.dev_mode = parse_env("NITR_DEV_MODE", &v)?;
+        }
+        if let Some(v) = env_var("NITR_LUA_MEMORY_LIMIT") {
+            self.lua.memory_limit = parse_env("NITR_LUA_MEMORY_LIMIT", &v)?;
+        }
+        if let Some(v) = env_var("NITR_LUA_EXEC_TIMEOUT_MS") {
+            self.lua.exec_timeout_ms = parse_env("NITR_LUA_EXEC_TIMEOUT_MS", &v)?;
+        }
+        Ok(())
+    }
+
+    /// Resolves the configured builtins list into [`Builtins`] flags.
+    ///
+    /// With no explicit list, every builtin is enabled and the ones missing
+    /// their configuration are skipped at registration time. An explicit list
+    /// is strict: unknown names or a listed builtin without its required
+    /// setting fail here.
+    pub fn builtins(&self) -> Result<Builtins> {
+        let Some(names) = &self.builtins else {
+            return Ok(Builtins::all());
+        };
+        let mut builtins = Builtins::empty();
+        for name in names {
+            let builtin = Builtins::from_config_name(name)
+                .ok_or_else(|| Error::Config(format!("unknown builtin `{name}`")))?;
+            if builtin == Builtins::TEMPLATE && self.templates_dir.is_none() {
+                return Err(Error::Config(
+                    "builtin `template` is enabled but `templates_dir` is not set".into(),
+                ));
+            }
+            if builtin == Builtins::DATABASE && self.database.is_none() {
+                return Err(Error::Config(
+                    "builtin `db` is enabled but `database` is not set".into(),
+                ));
+            }
+            builtins |= builtin;
+        }
+        Ok(builtins)
+    }
+
+    /// Builds the [`RuntimeOpts`] derived from this configuration.
+    pub fn runtime_opts(&self) -> Result<RuntimeOpts> {
+        // Lua module loading (`require`) is confined to the directory
+        // containing the handler script.
+        let package_dir = self
+            .handler_script
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        Ok(RuntimeOpts {
+            libs: self.lua.parse_stdlib()?,
+            memory_limit: self.lua.memory_limit,
+            dev_mode: self.dev_mode,
+            exec_timeout: match self.lua.exec_timeout_ms {
+                0 => None,
+                ms => Some(std::time::Duration::from_millis(ms)),
+            },
+            package_dir: Some(package_dir),
+        })
+    }
+}
+
+impl LuaConfig {
+    /// Parses the stdlib names into [`mlua::StdLib`] flags.
+    pub fn parse_stdlib(&self) -> Result<mlua::StdLib> {
+        use mlua::StdLib;
+        let mut libs = StdLib::NONE;
+        for name in &self.stdlib {
+            libs |= match name.as_str() {
+                "coroutine" => StdLib::COROUTINE,
+                "table" => StdLib::TABLE,
+                "io" => StdLib::IO,
+                "os" => StdLib::OS,
+                "string" => StdLib::STRING,
+                "utf8" => StdLib::UTF8,
+                "math" => StdLib::MATH,
+                "package" => StdLib::PACKAGE,
+                "debug" => StdLib::DEBUG,
+                _ => {
+                    return Err(Error::Config(format!(
+                        "unknown Lua standard library `{name}`"
+                    )))
+                }
+            };
+        }
+        Ok(libs)
+    }
+}
+
+fn env_var(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+fn parse_env<T: std::str::FromStr>(name: &str, value: &str) -> Result<T>
+where
+    T::Err: std::fmt::Display,
+{
+    value
+        .parse()
+        .map_err(|err| Error::Config(format!("invalid value for {name}: {err}")))
+}
