@@ -1,0 +1,18 @@
+//! The Nitr HTTP server layer: hyper server and builder, configuration,
+//! and the request/response bridge between HTTP and the Lua runtime.
+
+#![forbid(unsafe_code)]
+#![deny(warnings)]
+#![deny(rust_2018_idioms)]
+#![deny(dead_code)]
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+
+pub(crate) mod config;
+pub(crate) mod handler;
+pub(crate) mod request;
+pub(crate) mod server;
+
+pub mod service;
+
+pub use config::{Config, LuaConfig};
+pub use server::{Server, ServerBuilder};

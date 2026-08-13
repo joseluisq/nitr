@@ -826,26 +826,72 @@ dependencies = [
 name = "nitr"
 version = "0.0.0-beta.1"
 dependencies = [
- "anyhow",
- "async-channel",
- "bitflags",
- "bytes",
- "futures-util",
- "http-body-util",
- "hyper",
- "hyper-util",
- "minijinja",
  "mlua",
+ "nitr-core",
+ "nitr-http",
+ "nitr-lua",
  "reqwest",
- "rusqlite",
- "serde",
+ "serde_json",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "nitr-cli"
+version = "0.0.0-beta.1"
+dependencies = [
+ "anyhow",
+ "nitr",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "nitr-core"
+version = "0.0.0-beta.1"
+dependencies = [
+ "async-channel",
+ "http",
+ "mlua",
  "serde_json",
  "thiserror",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "nitr-http"
+version = "0.0.0-beta.1"
+dependencies = [
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "mlua",
+ "nitr-core",
+ "nitr-lua",
+ "serde",
+ "serde_json",
+ "tokio",
  "toml",
  "tracing",
- "tracing-subscriber",
  "url",
+]
+
+[[package]]
+name = "nitr-lua"
+version = "0.0.0-beta.1"
+dependencies = [
+ "bitflags",
+ "bytes",
+ "minijinja",
+ "mlua",
+ "nitr-core",
+ "reqwest",
+ "rusqlite",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

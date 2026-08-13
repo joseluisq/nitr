@@ -1,0 +1,26 @@
+[package]
+name = "nitr-cli"
+description = "The Nitr command-line server binary."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["dynamic-web-server", "http-server", "lua-server"]
+include = ["src/**/*.rs", "Cargo.toml"]
+publish = true
+
+[[bin]]
+name = "nitr"
+path = "src/main.rs"
+doc = false
+
+[dependencies]
+nitr = { workspace = true }
+
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }

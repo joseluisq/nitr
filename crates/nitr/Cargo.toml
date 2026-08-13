@@ -1,0 +1,34 @@
+[package]
+name = "nitr"
+description = "A Rust web server embedding Lua for fast, efficient and safe dynamic backends."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = [
+    "dynamic-web-server",
+    "http-server",
+    "lua-server"
+]
+include = ["src/**/*.rs", "Cargo.toml"]
+
+[dependencies]
+nitr-core = { workspace = true }
+nitr-http = { workspace = true }
+nitr-lua = { workspace = true }
+
+[dev-dependencies]
+mlua = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+rustc-args = []

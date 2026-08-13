@@ -1,51 +1,50 @@
-[package]
-name = "nitr"
+[workspace]
+resolver = "2"
+members = [
+    "crates/nitr-core",
+    "crates/nitr-lua",
+    "crates/nitr-http",
+    "crates/nitr",
+    "crates/nitr-cli",
+]
+
+[workspace.package]
 version = "0.0.0-beta.1"
 edition = "2021"
 rust-version = "1.82.0"
 authors = ["Jose Quintana <https://joseluisq.net>"]
 license = "MIT OR Apache-2.0"
-description = "A Rust web server embedding Lua for fast, efficient and safe dynamic backends."
 repository = "https://github.com/joseluisq/nitr"
-readme = "README.md"
 homepage = "https://github.com/joseluisq/nitr"
-autotests = true
-autoexamples = true
-keywords = [
-    "dynamic-web-server",
-    "http-server",
-    "lua-server"
-]
-include = [
-    "src/**/*.rs",
-    "build.rs",
-    "Cargo.toml",
-    "README.md",
-    "LICENSE-MIT",
-    "LICENSE-APACHE"
-]
 
-[dependencies]
+[workspace.dependencies]
+# Workspace crates
+nitr-core = { version = "0.0.0-beta.1", path = "crates/nitr-core" }
+nitr-lua = { version = "0.0.0-beta.1", path = "crates/nitr-lua" }
+nitr-http = { version = "0.0.0-beta.1", path = "crates/nitr-http" }
+nitr = { version = "0.0.0-beta.1", path = "crates/nitr" }
+
+# External
+anyhow = "1.0"
+async-channel = "2.3"
+bitflags = "2.9"
 bytes = "1.12"
-mlua = { version = "0.12", features = ["async", "macros", "lua54", "serialize", "vendored", "anyhow", "send"] }
-futures-util = { version = "0.3", default-features = false }
+http = "1.3"
+http-body-util = "0.1.5"
 hyper = { version = "1.11", features = ["full"] }
 hyper-util = { version = "0.1.11", features = ["full"] }
-http-body-util = "0.1.5"
-tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "net", "time", "signal", "sync"] }
-async-channel = "2.3"
-anyhow = "1.0"
-thiserror = "2.0"
-bitflags = "2.9"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+minijinja = { version = "2.24.0", features = ["loader"] }
+mlua = { version = "0.12", features = ["async", "macros", "lua54", "serialize", "vendored", "anyhow", "send"] }
 reqwest = { version = "0.12.15", features = ["json"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.140"
+thiserror = "2.0"
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "net", "time", "signal", "sync"] }
 toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2.5"
-minijinja = { version = "2.24.0", features = ["loader"] }
-rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 # Release with debug symbols, for profiling (perf).
 [profile.profiling]
@@ -62,17 +61,3 @@ opt-level = 3
 panic = "abort"
 rpath = false
 strip = true
-
-[lib]
-name = "nitr"
-path = "src/lib.rs"
-
-[[bin]]
-name = "nitr"
-path = "src/bin/server.rs"
-doc = false
-
-[package.metadata.docs.rs]
-all-features = true
-rustdoc-args = ["--cfg", "docsrs"]
-rustc-args = []

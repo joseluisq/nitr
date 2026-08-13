@@ -1,0 +1,22 @@
+[package]
+name = "nitr-core"
+description = "The resource-controlled Lua runtime at the heart of Nitr: sandboxed states, limits, and the runtime pool."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["lua", "runtime", "sandbox"]
+include = ["src/**/*.rs", "Cargo.toml"]
+
+[dependencies]
+async-channel = { workspace = true }
+http = { workspace = true }
+mlua = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
