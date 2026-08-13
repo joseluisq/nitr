@@ -15,8 +15,12 @@ include = ["src/**/*.rs", "Cargo.toml"]
 [dependencies]
 nitr-core = { workspace = true }
 
+base64 = { workspace = true }
 bitflags = { workspace = true }
 bytes = { workspace = true }
+cookie = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
 minijinja = { workspace = true }
 mlua = { workspace = true }
 reqwest = { workspace = true }

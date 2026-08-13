@@ -199,6 +199,28 @@ fn to_response(lua_resp: LuaTable) -> Result<HttpResponse> {
         })?;
     }
 
+    // Helper-built responses carry a `cookies` builder; each collected
+    // entry becomes its own `Set-Cookie` header.
+    match lua_resp.raw_get::<LuaValue>("cookies")? {
+        LuaValue::Nil => {}
+        LuaValue::UserData(ud) => {
+            let cookies = ud.borrow::<nitr_lua::ResponseCookies>().map_err(|_| {
+                Error::Script("the response `cookies` field is not a cookie builder".into())
+            })?;
+            for value in cookies.values() {
+                let value = HeaderValue::from_str(&value)
+                    .map_err(|_| Error::Script(format!("invalid Set-Cookie value `{value}`")))?;
+                resp.headers_mut().append(hyper::header::SET_COOKIE, value);
+            }
+        }
+        other => {
+            return Err(Error::Script(format!(
+                "invalid `cookies` field of type `{}` in the response table",
+                other.type_name()
+            )))
+        }
+    }
+
     Ok(resp)
 }
 

@@ -1,5 +1,6 @@
 use mlua::{
-    AnyUserData, ExternalResult, Lua, LuaSerdeExt, LuaString, UserData, UserDataMethods, Value,
+    AnyUserData, ExternalResult, Lua, LuaSerdeExt, LuaString, MetaMethod, Table, UserData,
+    UserDataMethods, Value,
 };
 use serde_json::Value as SerdeValue;
 
@@ -17,6 +18,21 @@ impl UserData for LuaJson {
             let v = serde_json::from_slice::<SerdeValue>(&input.as_bytes()).into_lua_err()?;
             lua.to_value(&v)
         });
+
+        // Calling the userdata itself — `json({ ... })` — is the JSON
+        // response helper: it returns a `{status, headers, body}` table.
+        methods.add_meta_method(
+            MetaMethod::Call,
+            |lua, _, (value, status): (Value, Option<u16>)| {
+                let body = serde_json::to_string(&value).into_lua_err()?;
+                let table = crate::http::response_table(lua, status.unwrap_or(200))?;
+                table
+                    .get::<Table>("headers")?
+                    .set("Content-Type", "application/json")?;
+                table.set("body", body)?;
+                Ok(table)
+            },
+        );
     }
 }
 

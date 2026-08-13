@@ -12,9 +12,12 @@ use nitr_core::Result;
 
 pub(crate) mod db;
 pub(crate) mod fetch;
+pub(crate) mod http;
 pub(crate) mod json;
 pub(crate) mod template;
 pub(crate) mod utils;
+
+pub use http::{best_match, RequestCookies, ResponseCookies};
 
 bitflags::bitflags! {
     /// Built-in globals that can be exposed to Lua scripts.
@@ -30,6 +33,9 @@ bitflags::bitflags! {
         const JSON = 1 << 3;
         /// `conn:execute/query/query_row/query_one` SQLite driver.
         const DATABASE = 1 << 4;
+        /// HTTP ergonomics: the `text`/`html`/`redirect`/`status`/`negotiate`
+        /// response helpers and the `http` table (`http.error`).
+        const HTTP = 1 << 5;
     }
 }
 
@@ -44,6 +50,7 @@ impl Builtins {
             Builtins::TEMPLATE => Some("template"),
             Builtins::JSON => Some("json"),
             Builtins::DATABASE => Some("conn"),
+            Builtins::HTTP => Some("http"),
             _ => None,
         }
     }
@@ -57,6 +64,7 @@ impl Builtins {
             "template" => Some(Builtins::TEMPLATE),
             "json" => Some(Builtins::JSON),
             "db" => Some(Builtins::DATABASE),
+            "http" => Some(Builtins::HTTP),
             _ => None,
         }
     }
@@ -97,6 +105,9 @@ pub fn register_builtins(lua: &mlua::Lua, builtins: Builtins, env: &BuiltinsEnv)
                 }
             },
             Builtins::JSON => globals.set(name, json::create_json_fn(lua)?)?,
+            // Registers several globals (`text`, `html`, `redirect`,
+            // `status`, `negotiate`, `http`), not just `http`.
+            Builtins::HTTP => http::register(lua)?,
             Builtins::DATABASE => match &env.database {
                 Some(path) => globals.set(name, db::create_database_fn(lua, path)?)?,
                 None => {
@@ -121,6 +132,7 @@ mod tests {
             ("template", Builtins::TEMPLATE),
             ("json", Builtins::JSON),
             ("db", Builtins::DATABASE),
+            ("http", Builtins::HTTP),
         ] {
             assert_eq!(Builtins::from_config_name(name), Some(flag));
             assert!(flag.global_name().is_some());

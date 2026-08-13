@@ -59,9 +59,34 @@ impl UserData for LuaRequest {
             }
             Ok(table)
         });
+        fields.add_field_method_get("cookies", |_, req| {
+            // All `Cookie` headers, joined so multi-header clients work.
+            let header = req
+                .1
+                .headers()
+                .get_all(hyper::header::COOKIE)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .collect::<Vec<_>>()
+                .join("; ");
+            Ok(nitr_lua::RequestCookies::parse(&header))
+        });
     }
 
     fn add_methods<'lua, M: UserDataMethods<Self>>(methods: &mut M) {
+        // Returns the best match among the given media types for the
+        // request's `Accept` header, or nil when none is acceptable.
+        methods.add_method("accepts", |_, req, offers: mlua::Variadic<String>| {
+            let accept = req
+                .1
+                .headers()
+                .get(hyper::header::ACCEPT)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("*/*");
+            let refs: Vec<&str> = offers.iter().map(String::as_str).collect();
+            Ok(nitr_lua::best_match(accept, &refs).map(|i| offers[i].clone()))
+        });
+
         methods.add_async_method_mut("read", |lua, mut req, ()| async move {
             let reader = req.1.body_mut();
             if let Some(frame) = reader.frame().await {
