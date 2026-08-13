@@ -10,6 +10,7 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::graceful::GracefulShutdown;
 use mlua::AnyUserData;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 
 use crate::app;
 use crate::config::Config;
@@ -34,6 +35,8 @@ type SetupFn = Box<dyn Fn(&mlua::Lua) -> mlua::Result<()> + Send + Sync>;
 pub struct Server {
     cfg: Config,
     pool: Arc<RuntimePool>,
+    /// Streaming-response slots: one permit per live streaming body.
+    streams: Arc<Semaphore>,
 }
 
 /// Builder for [`Server`].
@@ -95,7 +98,7 @@ impl Server {
                     // Small responses must not wait on Nagle's algorithm.
                     let _ = stream.set_nodelay(true);
 
-                    let svc = Svc::new(self.pool.clone(), peer_addr);
+                    let svc = Svc::new(self.pool.clone(), self.streams.clone(), peer_addr);
                     let conn = http1::Builder::new()
                         .timer(TokioTimer::new())
                         .header_read_timeout(HEADER_READ_TIMEOUT)
@@ -234,9 +237,16 @@ impl ServerBuilder {
             runtimes.push(rt);
         }
 
+        // Streaming responses hold a pooled state for their lifetime; by
+        // default keep at least one state free for short requests.
+        let max_streams = cfg
+            .max_streams
+            .unwrap_or_else(|| workers.saturating_sub(1).max(1));
+
         Ok(Server {
             cfg,
             pool: Arc::new(RuntimePool::new(runtimes)),
+            streams: Arc::new(Semaphore::new(max_streams)),
         })
     }
 }

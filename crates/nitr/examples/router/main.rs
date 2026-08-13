@@ -14,6 +14,9 @@
 //! curl -c - 'http://127.0.0.1:3000/login'
 //! curl 'http://127.0.0.1:3000/whoami' -b 'session=<value from /login>'
 //! curl 'http://127.0.0.1:3000/data' -H 'accept: text/html'
+//! curl 'http://127.0.0.1:3000/download'          # streamed CSV (writer)
+//! curl 'http://127.0.0.1:3000/chunks'            # streamed chunks (iterator)
+//! curl -N 'http://127.0.0.1:3000/events'         # Server-Sent Events
 //! ```
 
 use nitr::{Builtins, Server};

@@ -21,6 +21,8 @@ pub use nitr_lua as lua;
 pub use nitr_http::service;
 
 // Re-exports
-pub use nitr_core::{Error, Result, Runtime, RuntimeGuard, RuntimeOpts, RuntimePool};
+pub use nitr_core::{
+    DeadlineHandle, Error, Result, Runtime, RuntimeGuard, RuntimeOpts, RuntimePool,
+};
 pub use nitr_http::{Config, LuaConfig, Server, ServerBuilder};
 pub use nitr_lua::{Builtins, BuiltinsEnv};

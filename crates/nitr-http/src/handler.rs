@@ -5,11 +5,15 @@ use hyper::body::Bytes;
 use hyper::{header, Method, Response, StatusCode};
 use mlua::{Function, LuaString, Table as LuaTable, Value as LuaValue};
 
+use std::sync::Arc;
+use tokio::sync::Semaphore;
+
 use crate::app::{self, AppState, Dispatch};
 use crate::request::LuaRequest;
-use nitr_core::{Error, Result, Runtime, RuntimePool};
+use crate::stream;
+use nitr_core::{Error, Result, Runtime, RuntimeGuard, RuntimePool};
 
-type HttpResponse = Response<BoxBody<Bytes, Infallible>>;
+pub(crate) type HttpResponse = Response<BoxBody<Bytes, Infallible>>;
 
 /// What a request resolves to after Rust-side routing.
 enum Target {
@@ -25,7 +29,11 @@ enum Target {
     MethodNotAllowed(Vec<Method>),
 }
 
-pub(crate) async fn handle(pool: &RuntimePool, mut req: LuaRequest) -> Result<HttpResponse> {
+pub(crate) async fn handle(
+    pool: &RuntimePool,
+    mut req: LuaRequest,
+    streams: Arc<Semaphore>,
+) -> Result<HttpResponse> {
     let mut rt = pool.get().await;
     let dev_mode = rt.dev_mode();
 
@@ -60,14 +68,8 @@ pub(crate) async fn handle(pool: &RuntimePool, mut req: LuaRequest) -> Result<Ht
         }
         Target::CatchAll(handler) => {
             let cfg = rt.cfg().cloned();
-            match rt.call_function(handler, (cfg, req)).await {
-                Ok(lua_resp) => match to_response(lua_resp) {
-                    Ok(resp) => Ok(resp),
-                    Err(err) => {
-                        tracing::error!("invalid handler response: {err}");
-                        error_response(&err, dev_mode)
-                    }
-                },
+            match rt.call_function::<LuaTable>(handler, (cfg, req)).await {
+                Ok(lua_resp) => finish(rt, lua_resp, &streams, dev_mode),
                 Err(err) => {
                     tracing::error!("lua handler error: {err}");
                     error_response(&err, dev_mode)
@@ -83,18 +85,15 @@ pub(crate) async fn handle(pool: &RuntimePool, mut req: LuaRequest) -> Result<Ht
             // The request becomes a Lua value up front so the error handler
             // can receive the same object the handler saw.
             let req_ud = rt.lua().create_userdata(req)?;
-            match rt.call_function(chain, &req_ud).await {
-                Ok(lua_resp) => match to_response(lua_resp) {
-                    Ok(resp) => Ok(resp),
-                    Err(err) => {
-                        tracing::error!("invalid handler response: {err}");
-                        error_response(&err, dev_mode)
-                    }
-                },
+            match rt.call_function::<LuaTable>(chain, &req_ud).await {
+                Ok(lua_resp) => finish(rt, lua_resp, &streams, dev_mode),
                 Err(err) => {
                     tracing::error!("lua handler error: {err}");
                     if let Some(error_fn) = error_fn {
-                        match rt.call_function(error_fn, (err.to_string(), &req_ud)).await {
+                        match rt
+                            .call_function::<LuaTable>(error_fn, (err.to_string(), &req_ud))
+                            .await
+                        {
                             Ok(lua_resp) => match to_response(lua_resp) {
                                 Ok(resp) => return Ok(resp),
                                 Err(err) => {
@@ -107,6 +106,47 @@ pub(crate) async fn handle(pool: &RuntimePool, mut req: LuaRequest) -> Result<Ht
                     error_response(&err, dev_mode)
                 }
             }
+        }
+    }
+}
+
+/// Completes a successful handler call: a function body becomes a
+/// streaming response (moving the runtime into the producer task, subject
+/// to the `max_streams` cap); anything else converts as a static response.
+fn finish(
+    rt: RuntimeGuard,
+    lua_resp: LuaTable,
+    streams: &Arc<Semaphore>,
+    dev_mode: bool,
+) -> Result<HttpResponse> {
+    match lua_resp.raw_get::<LuaValue>("body") {
+        Ok(LuaValue::Function(body_fn)) => {
+            let permit = match streams.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    tracing::warn!("streaming response rejected: max_streams reached");
+                    return plain_response(StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable");
+                }
+            };
+            match stream::stream_response(rt, &lua_resp, body_fn, permit) {
+                Ok(resp) => Ok(resp),
+                Err(err) => {
+                    tracing::error!("invalid streaming response: {err}");
+                    error_response(&err, dev_mode)
+                }
+            }
+        }
+        Ok(_) => match to_response(lua_resp) {
+            Ok(resp) => Ok(resp),
+            Err(err) => {
+                tracing::error!("invalid handler response: {err}");
+                error_response(&err, dev_mode)
+            }
+        },
+        Err(err) => {
+            let err = Error::from(err);
+            tracing::error!("invalid handler response: {err}");
+            error_response(&err, dev_mode)
         }
     }
 }
@@ -147,15 +187,24 @@ fn plain_response(status: StatusCode, body: &'static str) -> Result<HttpResponse
 /// values may be a string or an array of strings (multi-value headers such
 /// as `Set-Cookie`).
 fn to_response(lua_resp: LuaTable) -> Result<HttpResponse> {
+    let body = lua_resp
+        .raw_get::<Option<LuaString>>("body")?
+        .map(|b| Full::new(Bytes::copy_from_slice(&b.as_bytes())).boxed())
+        .unwrap_or_else(|| Empty::<Bytes>::new().boxed());
+    build_response(&lua_resp, body)
+}
+
+/// Builds an HTTP response from the table's status/headers/cookies around
+/// an already-materialized body (static or streaming).
+pub(crate) fn build_response(
+    lua_resp: &LuaTable,
+    body: BoxBody<Bytes, Infallible>,
+) -> Result<HttpResponse> {
     use hyper::header::{HeaderName, HeaderValue};
 
     let status = lua_resp
         .raw_get::<Option<u16>>("status")?
         .unwrap_or(hyper::StatusCode::OK.as_u16());
-    let body = lua_resp
-        .raw_get::<Option<LuaString>>("body")?
-        .map(|b| Full::new(Bytes::copy_from_slice(&b.as_bytes())).boxed())
-        .unwrap_or_else(|| Empty::<Bytes>::new().boxed());
 
     // Invalid status codes surface here.
     let mut resp = Response::builder().status(status).body(body)?;

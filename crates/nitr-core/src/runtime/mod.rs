@@ -1,6 +1,6 @@
 use mlua::{
-    FromLua, Function, HookTriggers, IntoLua, IntoLuaMulti, Lua, LuaOptions, LuaSerdeExt as _,
-    RegistryKey, StdLib, Table, Thread, Value, VmState,
+    FromLua, FromLuaMulti, Function, HookTriggers, IntoLua, IntoLuaMulti, Lua, LuaOptions,
+    LuaSerdeExt as _, RegistryKey, StdLib, Table, Thread, Value, VmState,
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -44,6 +44,30 @@ pub struct Runtime {
     deadline: Arc<AtomicU64>,
     epoch: Instant,
     opts: RuntimeOpts,
+}
+
+/// Grants additional execution budget to a runtime while it produces a
+/// streaming response: each chunk handed to the client resets the
+/// instruction-hook deadline, so the budget applies per chunk-production
+/// slice instead of to the total stream lifetime.
+#[derive(Debug, Clone)]
+pub struct DeadlineHandle {
+    deadline: Arc<AtomicU64>,
+    epoch: Instant,
+    budget: Option<Duration>,
+}
+
+impl DeadlineHandle {
+    /// Grants another full execution budget from now. A no-op when the
+    /// runtime has no execution timeout configured.
+    pub fn extend(&self) {
+        if let Some(budget) = self.budget {
+            self.deadline.store(
+                (self.epoch.elapsed() + budget).as_nanos() as u64,
+                Ordering::Relaxed,
+            );
+        }
+    }
 }
 
 /// Options for configuring the Lua runtime.
@@ -293,11 +317,14 @@ impl Runtime {
         self.call_function(http_fn, (cfg, req)).await
     }
 
-    /// Calls an arbitrary Lua function expected to return a table, under the
-    /// same execution budget as [`call_handler()`](Self::call_handler). The
-    /// function runs on this runtime's cached coroutine so the
-    /// instruction-count hook applies.
-    pub async fn call_function(&mut self, f: Function, args: impl IntoLuaMulti) -> Result<Table> {
+    /// Calls an arbitrary Lua function under the same execution budget as
+    /// [`call_handler()`](Self::call_handler). The function runs on this
+    /// runtime's cached coroutine so the instruction-count hook applies.
+    pub async fn call_function<R: FromLuaMulti>(
+        &mut self,
+        f: Function,
+        args: impl IntoLuaMulti,
+    ) -> Result<R> {
         let thread = self.handler_thread(f)?;
         let result = match self.opts.exec_timeout {
             Some(timeout) => {
@@ -310,17 +337,50 @@ impl Runtime {
                 // execute and the hook cannot fire.
                 tokio::time::timeout(
                     timeout + EXEC_TIMEOUT_GRACE,
-                    thread.clone().into_async::<Table>(args)?,
+                    thread.clone().into_async::<R>(args)?,
                 )
                 .await
                 .map_err(|_| Error::Timeout)?
             }
-            None => thread.clone().into_async::<Table>(args)?.await,
+            None => thread.clone().into_async::<R>(args)?.await,
         };
         // Keep the coroutine for the next request (reset() also recovers
         // errored threads on Lua 5.4).
         self.thread = Some(thread);
         Ok(result?)
+    }
+
+    /// Calls a Lua function under the instruction-hook deadline only — no
+    /// outer async timeout — for long-lived streaming calls. The caller is
+    /// expected to keep granting budget via [`DeadlineHandle::extend()`] as
+    /// chunks are delivered; time suspended in async I/O (e.g. waiting for a
+    /// slow client) is deliberately unbounded.
+    pub async fn call_function_streaming<R: FromLuaMulti>(
+        &mut self,
+        f: Function,
+        args: impl IntoLuaMulti,
+    ) -> Result<R> {
+        let thread = self.handler_thread(f)?;
+        if let Some(timeout) = self.opts.exec_timeout {
+            self.deadline.store(
+                (self.epoch.elapsed() + timeout).as_nanos() as u64,
+                Ordering::Relaxed,
+            );
+        }
+        let result = thread.clone().into_async::<R>(args)?.await;
+        self.thread = Some(thread);
+        Ok(result?)
+    }
+
+    /// A handle for extending this runtime's execution deadline from
+    /// long-lived calls (see
+    /// [`call_function_streaming()`](Self::call_function_streaming)).
+    pub fn deadline_handle(&self) -> DeadlineHandle {
+        DeadlineHandle {
+            deadline: self.deadline.clone(),
+            epoch: self.epoch,
+            budget: self.opts.exec_timeout,
+        }
     }
 
     /// Whether this runtime operates in development mode.

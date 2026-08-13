@@ -37,6 +37,10 @@ pub struct Config {
     /// Number of pooled Lua states. Reserved: takes effect with the runtime
     /// pool (roadmap phase 3).
     pub workers: usize,
+    /// Maximum concurrent streaming responses (each holds a pooled state
+    /// for its whole lifetime). Defaults to `workers - 1` (at least 1) so
+    /// idle streams cannot pin the entire pool.
+    pub max_streams: Option<usize>,
     /// Development mode: hot-reload the handler script on change.
     pub dev_mode: bool,
     /// Built-in globals exposed to scripts. `None` enables every builtin
@@ -71,6 +75,7 @@ impl Default for Config {
             templates_dir: None,
             database: None,
             workers: std::thread::available_parallelism().map_or(1, |n| n.get()),
+            max_streams: None,
             dev_mode: false,
             builtins: None,
             lua: LuaConfig::default(),
@@ -111,7 +116,7 @@ impl Config {
 
     /// Applies `NITR_*` environment variable overrides on top of the current
     /// values: `NITR_LISTEN`, `NITR_HANDLER_SCRIPT`, `NITR_CONFIG_SCRIPT`,
-    /// `NITR_TEMPLATES_DIR`, `NITR_DATABASE`, `NITR_WORKERS`,
+    /// `NITR_TEMPLATES_DIR`, `NITR_DATABASE`, `NITR_WORKERS`, `NITR_MAX_STREAMS`,
     /// `NITR_DEV_MODE`, `NITR_LUA_MEMORY_LIMIT`, `NITR_LUA_EXEC_TIMEOUT_MS`.
     pub fn apply_env(&mut self) -> Result {
         if let Some(v) = env_var("NITR_LISTEN") {
@@ -131,6 +136,9 @@ impl Config {
         }
         if let Some(v) = env_var("NITR_WORKERS") {
             self.workers = parse_env("NITR_WORKERS", &v)?;
+        }
+        if let Some(v) = env_var("NITR_MAX_STREAMS") {
+            self.max_streams = Some(parse_env("NITR_MAX_STREAMS", &v)?);
         }
         if let Some(v) = env_var("NITR_DEV_MODE") {
             self.dev_mode = parse_env("NITR_DEV_MODE", &v)?;

@@ -74,6 +74,43 @@ app:get("/data", function(req)
     })
 end)
 
+-- Streaming (writer callback): chunks reach the client as they are
+-- written; the writer suspends while the client is slow (backpressure).
+app:get("/download", function(req)
+    return {
+        status = 200,
+        headers = { ["Content-Type"] = "text/csv" },
+        body = function(writer)
+            writer:write("id,name\n")
+            for i = 1, 5 do
+                writer:write(string.format("%d,user-%d\n", i, i))
+            end
+        end,
+    }
+end)
+
+-- Streaming (iterator): a coroutine yields one chunk per call.
+app:get("/chunks", function(req)
+    return {
+        body = coroutine.wrap(function()
+            for i = 1, 3 do
+                coroutine.yield("chunk " .. i .. "\n")
+            end
+        end),
+    }
+end)
+
+-- Server-Sent Events: send(event, data) formats the SSE wire protocol;
+-- tables are JSON-encoded automatically.
+app:get("/events", function(req)
+    return sse(function(send)
+        for i = 1, 3 do
+            send("tick", { count = i })
+        end
+        send("done", "bye")
+    end)
+end)
+
 app:on_error(function(err, req)
     dbg(err)
     return http.error(500, { code = "INTERNAL", path = req.path })

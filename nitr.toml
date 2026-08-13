@@ -28,6 +28,11 @@ database = "scripts/file.db"
 # Default: number of CPU cores.
 #workers = 4
 
+# Maximum concurrent streaming responses (each holds a pooled Lua state for
+# its whole lifetime). Default: workers - 1, at least 1, so idle streams
+# cannot pin the entire pool.
+#max_streams = 3
+
 # Development mode: hot-reload the handler script on change.
 # Default: false (also enabled by the --dev flag).
 dev_mode = true

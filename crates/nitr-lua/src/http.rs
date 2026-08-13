@@ -12,7 +12,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use base64::Engine as _;
 use hmac::{Hmac, Mac as _};
 use mlua::{
-    ExternalResult as _, Lua, MetaMethod, ObjectLike as _, Table, UserData, UserDataMethods, Value,
+    ExternalResult as _, Function, Lua, MetaMethod, ObjectLike as _, Table, UserData,
+    UserDataMethods, Value,
 };
 use sha2::Sha256;
 
@@ -71,6 +72,37 @@ pub(crate) fn register(lua: &Lua) -> mlua::Result<()> {
         lua.create_function(|lua, code: u16| response_table(lua, code))?,
     )?;
 
+    // Server-Sent Events: `sse(function(send) ... end)` builds a streaming
+    // response whose body hands the user function a `send(event, data)`
+    // formatter over the raw stream writer.
+    globals.set(
+        "sse",
+        lua.create_function(|lua, handler: Function| {
+            let table = response_table(lua, 200)?;
+            let headers = table.get::<Table>("headers")?;
+            headers.set("Content-Type", "text/event-stream")?;
+            headers.set("Cache-Control", "no-cache")?;
+
+            let body = lua.create_async_function(move |lua, writer: mlua::AnyUserData| {
+                let handler = handler.clone();
+                async move {
+                    let send =
+                        lua.create_async_function(move |_, (event, data): (String, Value)| {
+                            let writer = writer.clone();
+                            async move {
+                                writer
+                                    .call_async_method::<()>("write", format_event(&event, data)?)
+                                    .await
+                            }
+                        })?;
+                    handler.call_async::<()>(send).await
+                }
+            })?;
+            table.set("body", body)?;
+            Ok(table)
+        })?,
+    )?;
+
     globals.set(
         "negotiate",
         lua.create_async_function(|lua, (req, offers): (Value, Table)| async move {
@@ -108,6 +140,24 @@ pub(crate) fn register(lua: &Lua) -> mlua::Result<()> {
     globals.set("http", http)?;
 
     Ok(())
+}
+
+/// Formats one Server-Sent Event: string data is taken verbatim (split
+/// into one `data:` line per newline, per the SSE wire format); any other
+/// value is JSON-encoded.
+fn format_event(event: &str, data: Value) -> mlua::Result<String> {
+    let data = match data {
+        Value::String(s) => s.to_string_lossy().to_string(),
+        other => serde_json::to_string(&other).into_lua_err()?,
+    };
+    let mut out = format!("event: {event}\n");
+    for line in data.split('\n') {
+        out.push_str("data: ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push('\n');
+    Ok(out)
 }
 
 /// Picks the entry of `offers` whose key best matches the request's

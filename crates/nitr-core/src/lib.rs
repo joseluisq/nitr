@@ -15,4 +15,4 @@ mod error;
 mod runtime;
 
 pub use error::{Error, Result};
-pub use runtime::{Runtime, RuntimeGuard, RuntimeOpts, RuntimePool};
+pub use runtime::{DeadlineHandle, Runtime, RuntimeGuard, RuntimeOpts, RuntimePool};

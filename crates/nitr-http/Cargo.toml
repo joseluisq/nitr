@@ -16,6 +16,7 @@ include = ["src/**/*.rs", "Cargo.toml"]
 nitr-core = { workspace = true }
 nitr-lua = { workspace = true }
 
+async-channel = { workspace = true }
 bytes = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
