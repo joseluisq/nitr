@@ -2,37 +2,144 @@ use std::convert::Infallible;
 
 use http_body_util::{combinators::BoxBody, BodyExt as _, Empty, Full};
 use hyper::body::Bytes;
-use hyper::Response;
-use mlua::{LuaString, Table as LuaTable, Value as LuaValue};
+use hyper::{header, Method, Response, StatusCode};
+use mlua::{Function, LuaString, Table as LuaTable, Value as LuaValue};
 
+use crate::app::{self, AppState, Dispatch};
 use crate::request::LuaRequest;
-use nitr_core::RuntimePool;
-use nitr_core::{Error, Result};
+use nitr_core::{Error, Result, Runtime, RuntimePool};
 
 type HttpResponse = Response<BoxBody<Bytes, Infallible>>;
 
-pub(crate) async fn handle(pool: &RuntimePool, req: LuaRequest) -> Result<HttpResponse> {
+/// What a request resolves to after Rust-side routing.
+enum Target {
+    /// Legacy single-function script: called for every request.
+    CatchAll(Function),
+    /// A matched route: the composed middleware+handler chain.
+    Chain {
+        chain: Function,
+        params: Vec<(String, String)>,
+        error_fn: Option<Function>,
+    },
+    NotFound,
+    MethodNotAllowed(Vec<Method>),
+}
+
+pub(crate) async fn handle(pool: &RuntimePool, mut req: LuaRequest) -> Result<HttpResponse> {
     let mut rt = pool.get().await;
     let dev_mode = rt.dev_mode();
 
-    if let Err(err) = rt.http_fn_reload() {
-        tracing::error!("failed to reload the HTTP handler: {err}");
-        return error_response(&err, dev_mode);
-    }
-
-    match rt.call_handler(req).await {
-        Ok(lua_resp) => match to_response(lua_resp) {
-            Ok(resp) => Ok(resp),
-            Err(err) => {
-                tracing::error!("invalid handler response: {err}");
-                error_response(&err, dev_mode)
-            }
-        },
-        Err(err) => {
-            tracing::error!("lua handler error: {err}");
-            error_response(&err, dev_mode)
+    if dev_mode {
+        if let Err(err) = app::reload_if_changed(&rt) {
+            tracing::error!("failed to reload the HTTP handler: {err}");
+            return error_response(&err, dev_mode);
         }
     }
+
+    let target = match resolve(&rt, &req) {
+        Ok(target) => target,
+        Err(err) => {
+            tracing::error!("failed to resolve the request route: {err}");
+            return error_response(&err, dev_mode);
+        }
+    };
+
+    match target {
+        Target::NotFound => plain_response(StatusCode::NOT_FOUND, "Not Found"),
+        Target::MethodNotAllowed(allowed) => {
+            let mut resp = plain_response(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed")?;
+            let allowed = allowed
+                .iter()
+                .map(Method::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            if let Ok(value) = header::HeaderValue::from_str(&allowed) {
+                resp.headers_mut().insert(header::ALLOW, value);
+            }
+            Ok(resp)
+        }
+        Target::CatchAll(handler) => {
+            let cfg = rt.cfg().cloned();
+            match rt.call_function(handler, (cfg, req)).await {
+                Ok(lua_resp) => match to_response(lua_resp) {
+                    Ok(resp) => Ok(resp),
+                    Err(err) => {
+                        tracing::error!("invalid handler response: {err}");
+                        error_response(&err, dev_mode)
+                    }
+                },
+                Err(err) => {
+                    tracing::error!("lua handler error: {err}");
+                    error_response(&err, dev_mode)
+                }
+            }
+        }
+        Target::Chain {
+            chain,
+            params,
+            error_fn,
+        } => {
+            req.2 = params;
+            // The request becomes a Lua value up front so the error handler
+            // can receive the same object the handler saw.
+            let req_ud = rt.lua().create_userdata(req)?;
+            match rt.call_function(chain, &req_ud).await {
+                Ok(lua_resp) => match to_response(lua_resp) {
+                    Ok(resp) => Ok(resp),
+                    Err(err) => {
+                        tracing::error!("invalid handler response: {err}");
+                        error_response(&err, dev_mode)
+                    }
+                },
+                Err(err) => {
+                    tracing::error!("lua handler error: {err}");
+                    if let Some(error_fn) = error_fn {
+                        match rt.call_function(error_fn, (err.to_string(), &req_ud)).await {
+                            Ok(lua_resp) => match to_response(lua_resp) {
+                                Ok(resp) => return Ok(resp),
+                                Err(err) => {
+                                    tracing::error!("invalid error-handler response: {err}")
+                                }
+                            },
+                            Err(err) => tracing::error!("the app error handler failed: {err}"),
+                        }
+                    }
+                    error_response(&err, dev_mode)
+                }
+            }
+        }
+    }
+}
+
+/// Routes the request in Rust against this state's compiled dispatch table.
+fn resolve(rt: &Runtime, req: &LuaRequest) -> Result<Target> {
+    let ud = app::state(rt.lua())?;
+    let state = ud.borrow::<AppState>()?;
+    Ok(match &state.dispatch {
+        Dispatch::CatchAll(f) => Target::CatchAll(f.clone()),
+        Dispatch::App(app) => match app.router.at(req.1.uri().path()) {
+            Ok(matched) => match matched.value.get(req.1.method()) {
+                Some(&idx) => Target::Chain {
+                    chain: app.chains[idx].clone(),
+                    params: matched
+                        .params
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect(),
+                    error_fn: app.error_fn.clone(),
+                },
+                None => Target::MethodNotAllowed(matched.value.keys().cloned().collect()),
+            },
+            Err(_) => Target::NotFound,
+        },
+    })
+}
+
+fn plain_response(status: StatusCode, body: &'static str) -> Result<HttpResponse> {
+    Ok(Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Full::new(Bytes::from_static(body.as_bytes())).boxed())?)
 }
 
 /// Converts the Lua response table `{status, headers, body}` into an HTTP

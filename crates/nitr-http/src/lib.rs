@@ -7,6 +7,7 @@
 #![deny(dead_code)]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
+pub(crate) mod app;
 pub(crate) mod config;
 pub(crate) mod handler;
 pub(crate) mod request;

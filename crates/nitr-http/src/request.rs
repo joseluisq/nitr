@@ -6,8 +6,14 @@ use hyper::Request;
 use mlua::{ExternalResult, LuaSerdeExt, UserData, UserDataFields, UserDataMethods};
 use serde_json::Value as SerdeValue;
 
-/// Wrapper around incoming request that implements UserData.
-pub(crate) struct LuaRequest(pub(crate) SocketAddr, pub(crate) Request<Incoming>);
+/// Wrapper around incoming request that implements UserData. The third
+/// field holds the path parameters captured by the router (empty for the
+/// catch-all handler).
+pub(crate) struct LuaRequest(
+    pub(crate) SocketAddr,
+    pub(crate) Request<Incoming>,
+    pub(crate) Vec<(String, String)>,
+);
 
 impl UserData for LuaRequest {
     fn add_fields<'lua, F: UserDataFields<Self>>(fields: &mut F) {
@@ -22,6 +28,15 @@ impl UserData for LuaRequest {
                 for (k, v) in url::form_urlencoded::parse(query.as_bytes()) {
                     table.set(k.as_ref(), v.as_ref())?;
                 }
+            }
+            Ok(table)
+        });
+        fields.add_field_method_get("params", |lua, req| {
+            // Path parameters captured by the router, e.g. `id` for a route
+            // registered as `/users/:id`.
+            let table = lua.create_table()?;
+            for (k, v) in &req.2 {
+                table.set(k.as_str(), v.as_str())?;
             }
             Ok(table)
         });

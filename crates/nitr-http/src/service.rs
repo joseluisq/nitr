@@ -35,7 +35,7 @@ impl Service<Request<Incoming>> for Svc {
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
         let pool = self.pool.clone();
-        let req = LuaRequest(self.peer_addr, req);
+        let req = LuaRequest(self.peer_addr, req, Vec::new());
 
         Box::pin(async move { handler::handle(&pool, req).await })
     }

@@ -1,0 +1,326 @@
+//! The `nitr.app()` Lua application object: routes and middleware are
+//! collected while the handler script runs, then compiled once per state
+//! into a Rust-side router ([`matchit`]) plus composed handler chains.
+//!
+//! Route matching always happens in Rust; Lua is never invoked for a
+//! request that doesn't match a registered route.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::SystemTime;
+
+use hyper::Method;
+use matchit::Router;
+use mlua::{AnyUserData, Function, Lua, UserData, UserDataMethods, Value, Variadic};
+
+use nitr_core::{Error, Result, Runtime};
+
+/// Named registry slot holding each state's compiled [`AppState`].
+const APP_STATE_KEY: &str = "nitr::app_state";
+
+/// Route-registration method names exposed on the app object.
+const METHOD_NAMES: &[&str] = &["get", "post", "put", "delete", "patch", "head", "options"];
+
+/// Locks the app definition; the mutex exists only to satisfy `Sync` (a
+/// Lua state is single-threaded), so contention/poisoning cannot occur in
+/// practice.
+fn lock(def: &Mutex<AppDef>) -> mlua::Result<std::sync::MutexGuard<'_, AppDef>> {
+    def.lock()
+        .map_err(|_| mlua::Error::RuntimeError("the app definition lock is poisoned".into()))
+}
+
+fn method_of(name: &str) -> Method {
+    match name {
+        "get" => Method::GET,
+        "post" => Method::POST,
+        "put" => Method::PUT,
+        "delete" => Method::DELETE,
+        "patch" => Method::PATCH,
+        "head" => Method::HEAD,
+        "options" => Method::OPTIONS,
+        other => unreachable!("unknown route method name `{other}`"),
+    }
+}
+
+/// A route as registered by the script: zero or more middleware followed by
+/// the handler function (always the last element of `fns`).
+struct RouteDef {
+    method: Method,
+    path: String,
+    fns: Vec<Function>,
+}
+
+/// What the script builds up through `app:get(...)`, `app:use(...)`, etc.
+#[derive(Default)]
+struct AppDef {
+    middleware: Vec<Function>,
+    routes: Vec<RouteDef>,
+    error_fn: Option<Function>,
+}
+
+/// The `nitr.app()` userdata handed to the handler script.
+pub(crate) struct LuaApp(Mutex<AppDef>);
+
+impl UserData for LuaApp {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        for name in METHOD_NAMES {
+            let method = method_of(name);
+            methods.add_method(
+                *name,
+                move |_, this, (path, fns): (String, Variadic<Function>)| {
+                    if fns.is_empty() {
+                        return Err(mlua::Error::RuntimeError(format!(
+                            "app:{name}(\"{path}\", ...) requires a handler function"
+                        )));
+                    }
+                    if !path.starts_with('/') {
+                        return Err(mlua::Error::RuntimeError(format!(
+                            "route path `{path}` must start with `/`"
+                        )));
+                    }
+                    lock(&this.0)?.routes.push(RouteDef {
+                        method: method.clone(),
+                        path,
+                        fns: fns.into_iter().collect(),
+                    });
+                    Ok(())
+                },
+            );
+        }
+
+        methods.add_method("use", |_, this, mw: Function| {
+            let mut def = lock(&this.0)?;
+            // Chains are composed once at load time; allowing `use` after a
+            // route would silently skip that route, so make it an error.
+            if !def.routes.is_empty() {
+                return Err(mlua::Error::RuntimeError(
+                    "app:use() must be called before registering routes".into(),
+                ));
+            }
+            def.middleware.push(mw);
+            Ok(())
+        });
+
+        methods.add_method("on_error", |_, this, f: Function| {
+            lock(&this.0)?.error_fn = Some(f);
+            Ok(())
+        });
+    }
+}
+
+/// The compiled dispatch target of a Lua state.
+pub(crate) enum Dispatch {
+    /// The script returned a plain function: the legacy catch-all handler
+    /// called as `handler(cfg, req)` for every request.
+    CatchAll(Function),
+    /// The script returned a `nitr.app()`: requests are routed in Rust and
+    /// only matching ones reach the composed Lua chains.
+    App(Box<CompiledApp>),
+}
+
+/// The Rust-side router plus the per-route composed Lua chains.
+pub(crate) struct CompiledApp {
+    pub(crate) router: Router<HashMap<Method, usize>>,
+    pub(crate) chains: Vec<Function>,
+    pub(crate) error_fn: Option<Function>,
+}
+
+/// Per-state dispatch state, stored in the Lua registry so it lives and
+/// dies with its state without changing the runtime pool's shape.
+pub(crate) struct AppState {
+    pub(crate) dispatch: Dispatch,
+    script: PathBuf,
+    mtime: Option<SystemTime>,
+}
+
+impl UserData for AppState {}
+
+/// Registers the `nitr` global table (`nitr.app()`; `nitr.cfg` is filled in
+/// by the server once the configuration snapshot is known).
+pub(crate) fn register_nitr_global(lua: &Lua) -> mlua::Result<()> {
+    let nitr = lua.create_table()?;
+    nitr.set(
+        "app",
+        lua.create_function(|_, ()| Ok(LuaApp(Mutex::new(AppDef::default()))))?,
+    )?;
+    lua.globals().set("nitr", nitr)
+}
+
+/// Evaluates the handler script and stores its compiled [`AppState`] in the
+/// Lua registry. Called at startup for every pooled state and again on
+/// dev-mode reloads.
+pub(crate) fn load(rt: &Runtime, script: &Path) -> Result<()> {
+    let mtime = modified(script);
+    let value = rt.eval_script(script)?;
+    let dispatch = compile(value, script)?;
+    let state = rt.lua().create_userdata(AppState {
+        dispatch,
+        script: script.to_path_buf(),
+        mtime,
+    })?;
+    rt.lua().set_named_registry_value(APP_STATE_KEY, state)?;
+    Ok(())
+}
+
+/// The state's [`AppState`] userdata, set by [`load()`].
+pub(crate) fn state(lua: &Lua) -> Result<AnyUserData> {
+    lua.named_registry_value::<AnyUserData>(APP_STATE_KEY)
+        .map_err(|_| Error::Script("no HTTP handler has been loaded".into()))
+}
+
+/// Dev mode: re-evaluates the handler script when its mtime changed since
+/// the last load, replacing this state's dispatch table.
+pub(crate) fn reload_if_changed(rt: &Runtime) -> Result<()> {
+    let ud = state(rt.lua())?;
+    let (script, last) = {
+        let st = ud.borrow::<AppState>()?;
+        (st.script.clone(), st.mtime)
+    };
+    if modified(&script) != last {
+        tracing::debug!("reloading handler script {}", script.display());
+        load(rt, &script)?;
+    }
+    Ok(())
+}
+
+fn modified(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Compiles the script's return value into a [`Dispatch`]: middleware
+/// factories are invoked once here (never per request), and the route set
+/// is validated so conflicts fail at startup instead of at request time.
+fn compile(value: Value, script: &Path) -> Result<Dispatch> {
+    let app_ud = match value {
+        Value::Function(f) => return Ok(Dispatch::CatchAll(f)),
+        Value::UserData(ud) if ud.is::<LuaApp>() => ud,
+        other => {
+            return Err(Error::Script(format!(
+                "the handler script {} must return a function or a nitr.app(), got {}",
+                script.display(),
+                other.type_name()
+            )))
+        }
+    };
+    let app = app_ud.borrow::<LuaApp>()?;
+    let def = lock(&app.0)?;
+    if def.routes.is_empty() {
+        return Err(Error::Script(format!(
+            "the app returned by {} defines no routes",
+            script.display()
+        )));
+    }
+
+    let mut chains = Vec::with_capacity(def.routes.len());
+    // matchit rejects a second insert of the same pattern, so methods for
+    // one pattern are grouped before inserting.
+    let mut patterns: Vec<(String, HashMap<Method, usize>)> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    for route in &def.routes {
+        let idx = chains.len();
+        chains.push(compose(&def.middleware, route)?);
+        let pattern = to_matchit(&route.path)?;
+        let slot = match index.get(&pattern) {
+            Some(&i) => &mut patterns[i].1,
+            None => {
+                index.insert(pattern.clone(), patterns.len());
+                patterns.push((pattern, HashMap::new()));
+                &mut patterns.last_mut().expect("just pushed").1
+            }
+        };
+        if slot.insert(route.method.clone(), idx).is_some() {
+            return Err(Error::Script(format!(
+                "duplicate route `{} {}` in {}",
+                route.method,
+                route.path,
+                script.display()
+            )));
+        }
+    }
+
+    let mut router = Router::new();
+    for (pattern, methods) in patterns {
+        router.insert(&pattern, methods).map_err(|err| {
+            Error::Script(format!(
+                "invalid or conflicting route pattern `{pattern}` in {}: {err}",
+                script.display()
+            ))
+        })?;
+    }
+
+    Ok(Dispatch::App(Box::new(CompiledApp {
+        router,
+        chains,
+        error_fn: def.error_fn.clone(),
+    })))
+}
+
+/// Composes `global middleware → route middleware → handler` into a single
+/// function by calling each middleware factory with its `next` link.
+fn compose(global: &[Function], route: &RouteDef) -> Result<Function> {
+    let (handler, mws) = route
+        .fns
+        .split_last()
+        .expect("route registration requires at least a handler");
+    let mut chain = handler.clone();
+    for mw in mws.iter().rev().chain(global.iter().rev()) {
+        chain = mw.call::<Function>(chain).map_err(|err| {
+            Error::Script(format!(
+                "middleware for route `{} {}` must return a function: {err}",
+                route.method, route.path
+            ))
+        })?;
+    }
+    Ok(chain)
+}
+
+/// Converts the route syntax (`/users/:id` parameters, trailing `*` or
+/// `*name` catch-alls) into matchit's `{id}` / `{*name}` syntax.
+fn to_matchit(path: &str) -> Result<String> {
+    let segments: Vec<&str> = path.split('/').collect();
+    let last = segments.len() - 1;
+    let mut out = Vec::with_capacity(segments.len());
+    for (i, seg) in segments.iter().enumerate() {
+        let seg = *seg;
+        out.push(match seg {
+            "*" if i == last => "{*splat}".to_string(),
+            s if s.starts_with(':') && s.len() > 1 => format!("{{{}}}", &s[1..]),
+            s if s.starts_with('*') && s.len() > 1 && i == last => format!("{{*{}}}", &s[1..]),
+            s if s.starts_with(':') || s.starts_with('*') => {
+                return Err(Error::Script(format!(
+                    "invalid segment `{seg}` in route path `{path}`"
+                )))
+            }
+            s => s.to_string(),
+        });
+    }
+    Ok(out.join("/"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::to_matchit;
+
+    #[test]
+    fn route_syntax_converts_to_matchit() {
+        for (given, expected) in [
+            ("/", "/"),
+            ("/users", "/users"),
+            ("/users/:id", "/users/{id}"),
+            ("/users/:id/posts/:post", "/users/{id}/posts/{post}"),
+            ("/files/*", "/files/{*splat}"),
+            ("/files/*rest", "/files/{*rest}"),
+        ] {
+            assert_eq!(to_matchit(given).expect(given), expected);
+        }
+    }
+
+    #[test]
+    fn invalid_route_segments_are_rejected() {
+        // A bare `:`, and wildcards anywhere but the last segment.
+        for bad in ["/users/:", "/a/*/b", "/a/*rest/b"] {
+            assert!(to_matchit(bad).is_err(), "{bad} must fail");
+        }
+    }
+}

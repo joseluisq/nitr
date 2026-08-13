@@ -11,6 +11,7 @@ use hyper_util::server::graceful::GracefulShutdown;
 use mlua::AnyUserData;
 use tokio::net::TcpListener;
 
+use crate::app;
 use crate::config::Config;
 use crate::service::Svc;
 use nitr_core::{Error, Result};
@@ -29,6 +30,7 @@ type SetupFn = Box<dyn Fn(&mlua::Lua) -> mlua::Result<()> + Send + Sync>;
 /// The Nitr HTTP server: a pool of Lua runtimes behind a shared listener.
 ///
 /// Built via [`Server::builder()`]; run via [`serve()`](Self::serve).
+#[derive(Debug)]
 pub struct Server {
     cfg: Config,
     pool: Arc<RuntimePool>,
@@ -215,7 +217,8 @@ impl ServerBuilder {
             }
             None => None,
         };
-        bootstrap.register_http_fn(&cfg.handler_script)?;
+        set_nitr_cfg(&bootstrap)?;
+        app::load(&bootstrap, &cfg.handler_script)?;
 
         // Remaining states: inject the snapshot instead of re-running the
         // configuration script, so its side effects happen exactly once.
@@ -226,7 +229,8 @@ impl ServerBuilder {
             if let Some(snapshot) = &snapshot {
                 rt.set_cfg_snapshot(snapshot)?;
             }
-            rt.register_http_fn(&cfg.handler_script)?;
+            set_nitr_cfg(&rt)?;
+            app::load(&rt, &cfg.handler_script)?;
             runtimes.push(rt);
         }
 
@@ -244,8 +248,19 @@ fn new_runtime(cfg: &Config, builtins: Builtins, setup_fns: &[SetupFn]) -> Resul
         database: cfg.database.clone(),
     };
     nitr_lua::register_builtins(rt.lua(), builtins, &env)?;
+    app::register_nitr_global(rt.lua())?;
     for setup in setup_fns {
         setup(rt.lua())?;
     }
     Ok(rt)
+}
+
+/// Exposes the state's configuration table to scripts as `nitr.cfg`, so
+/// app-style handlers (which only receive the request) can reach it.
+fn set_nitr_cfg(rt: &Runtime) -> Result {
+    if let Some(cfg) = rt.cfg() {
+        let nitr: mlua::Table = rt.lua().globals().get("nitr")?;
+        nitr.set("cfg", cfg.clone())?;
+    }
+    Ok(())
 }

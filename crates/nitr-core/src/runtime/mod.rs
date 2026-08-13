@@ -289,9 +289,16 @@ impl Runtime {
             .http_fn
             .clone()
             .ok_or_else(|| Error::Script("no HTTP handler has been registered".into()))?;
+        let cfg = self.cfg.clone();
+        self.call_function(http_fn, (cfg, req)).await
+    }
 
-        let thread = self.handler_thread(http_fn)?;
-        let args = (self.cfg.as_ref(), req);
+    /// Calls an arbitrary Lua function expected to return a table, under the
+    /// same execution budget as [`call_handler()`](Self::call_handler). The
+    /// function runs on this runtime's cached coroutine so the
+    /// instruction-count hook applies.
+    pub async fn call_function(&mut self, f: Function, args: impl IntoLuaMulti) -> Result<Table> {
+        let thread = self.handler_thread(f)?;
         let result = match self.opts.exec_timeout {
             Some(timeout) => {
                 self.deadline.store(
@@ -319,6 +326,20 @@ impl Runtime {
     /// Whether this runtime operates in development mode.
     pub fn dev_mode(&self) -> bool {
         self.opts.dev_mode
+    }
+
+    /// Loads and evaluates a Lua script file, returning the resulting value.
+    ///
+    /// This does not interpret the result; callers decide what the script is
+    /// expected to return (e.g. a handler function or an application object).
+    pub fn eval_script(&self, path: &Path) -> Result<Value> {
+        let data = std::fs::read(path).map_err(|err| {
+            Error::Script(format!(
+                "failed to read the Lua script {}: {err}",
+                path.display()
+            ))
+        })?;
+        Ok(self.lua.load(data).eval::<Value>()?)
     }
 
     /// Reloads the Lua HTTP handler function from the file specified in `http_fn_path`.
