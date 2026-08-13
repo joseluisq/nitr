@@ -10,11 +10,12 @@
 pub(crate) mod app;
 pub(crate) mod config;
 pub(crate) mod handler;
+pub(crate) mod protect;
 pub(crate) mod request;
 pub(crate) mod server;
 pub(crate) mod stream;
 
 pub mod service;
 
-pub use config::{Config, LuaConfig};
+pub use config::{Config, LimitsConfig, LuaConfig, RateLimitConfig};
 pub use server::{Server, ServerBuilder};

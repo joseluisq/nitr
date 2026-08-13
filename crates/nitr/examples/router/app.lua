@@ -112,7 +112,7 @@ app:get("/events", function(req)
 end)
 
 app:on_error(function(err, req)
-    dbg(err)
+    log.error("handler failed", { error = err, path = req.path })
     return http.error(500, { code = "INTERNAL", path = req.path })
 end)
 

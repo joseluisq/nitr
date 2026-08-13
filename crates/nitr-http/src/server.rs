@@ -14,6 +14,7 @@ use tokio::sync::Semaphore;
 
 use crate::app;
 use crate::config::Config;
+use crate::protect::Protection;
 use crate::service::Svc;
 use nitr_core::{Error, Result};
 use nitr_core::{Runtime, RuntimePool};
@@ -37,6 +38,8 @@ pub struct Server {
     pool: Arc<RuntimePool>,
     /// Streaming-response slots: one permit per live streaming body.
     streams: Arc<Semaphore>,
+    /// Pre-Lua protection: rate limiting, size limits, request ids.
+    protection: Arc<Protection>,
 }
 
 /// Builder for [`Server`].
@@ -83,10 +86,26 @@ impl Server {
 
         let graceful = GracefulShutdown::new();
         let mut shutdown = std::pin::pin!(shutdown);
+        // Connection cap: the listener stops accepting while at the limit
+        // instead of queueing unbounded connections.
+        let conn_slots = Arc::new(Semaphore::new(self.cfg.limits.max_connections.max(1)));
+        // hyper enforces a floor of 8 KiB on its read buffer.
+        let max_buf_size = self.cfg.limits.max_header_bytes.max(8 * 1024);
 
         loop {
             tokio::select! {
-                accepted = listener.accept() => {
+                accepted = async {
+                    // Wait for a free connection slot before accepting; the
+                    // whole future is dropped (releasing nothing) on
+                    // shutdown. The semaphore is never closed.
+                    let permit = conn_slots
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .expect("connection semaphore is never closed");
+                    (permit, listener.accept().await)
+                } => {
+                    let (permit, accepted) = accepted;
                     let (stream, peer_addr) = match accepted {
                         Ok(x) => x,
                         Err(err) => {
@@ -98,13 +117,21 @@ impl Server {
                     // Small responses must not wait on Nagle's algorithm.
                     let _ = stream.set_nodelay(true);
 
-                    let svc = Svc::new(self.pool.clone(), self.streams.clone(), peer_addr);
+                    let svc = Svc::new(
+                        self.pool.clone(),
+                        self.streams.clone(),
+                        self.protection.clone(),
+                        peer_addr,
+                    );
                     let conn = http1::Builder::new()
                         .timer(TokioTimer::new())
                         .header_read_timeout(HEADER_READ_TIMEOUT)
+                        .max_buf_size(max_buf_size)
                         .serve_connection(TokioIo::new(stream), svc);
                     let conn = graceful.watch(conn);
                     tokio::spawn(async move {
+                        // Held until the connection closes.
+                        let _permit = permit;
                         if let Err(err) = conn.await {
                             tracing::error!("error serving connection: {err}");
                         }
@@ -244,6 +271,7 @@ impl ServerBuilder {
             .unwrap_or_else(|| workers.saturating_sub(1).max(1));
 
         Ok(Server {
+            protection: Arc::new(Protection::new(&cfg)),
             cfg,
             pool: Arc::new(RuntimePool::new(runtimes)),
             streams: Arc::new(Semaphore::new(max_streams)),

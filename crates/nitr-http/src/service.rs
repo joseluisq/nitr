@@ -11,10 +11,12 @@ use hyper::service::Service;
 use hyper::{Request, Response};
 
 use crate::handler;
+use crate::protect::Protection;
 use crate::request::LuaRequest;
 use nitr_core::Error;
 use nitr_core::Result;
 use nitr_core::RuntimePool;
+use tracing::Instrument as _;
 
 /// Service that handles incoming requests by checking a Lua runtime out of
 /// the pool for the duration of each request.
@@ -23,14 +25,22 @@ pub struct Svc {
     /// Streaming-response slots (`max_streams`); a permit is held for each
     /// live streaming body.
     streams: Arc<Semaphore>,
+    /// Pre-Lua protection (rate limiting, size limits) and request ids.
+    protection: Arc<Protection>,
     peer_addr: SocketAddr,
 }
 
 impl Svc {
-    pub fn new(pool: Arc<RuntimePool>, streams: Arc<Semaphore>, peer_addr: SocketAddr) -> Self {
+    pub(crate) fn new(
+        pool: Arc<RuntimePool>,
+        streams: Arc<Semaphore>,
+        protection: Arc<Protection>,
+        peer_addr: SocketAddr,
+    ) -> Self {
         Self {
             pool,
             streams,
+            protection,
             peer_addr,
         }
     }
@@ -44,8 +54,25 @@ impl Service<Request<Incoming>> for Svc {
     fn call(&self, req: Request<Incoming>) -> Self::Future {
         let pool = self.pool.clone();
         let streams = self.streams.clone();
-        let req = LuaRequest(self.peer_addr, req, Vec::new());
+        let protection = self.protection.clone();
+        let id = protection.request_id(&req);
+        // The per-request span: every tracing event below it (including
+        // Lua `log.*` calls) carries the request id, method, and path.
+        let span = tracing::info_span!(
+            "request",
+            id = %id,
+            method = %req.method(),
+            path = %req.uri().path(),
+        );
+        let req = LuaRequest {
+            peer_addr: self.peer_addr,
+            req,
+            params: Vec::new(),
+            id,
+        };
 
-        Box::pin(async move { handler::handle(&pool, req, streams).await })
+        Box::pin(
+            async move { handler::handle(&pool, req, streams, protection).await }.instrument(span),
+        )
     }
 }

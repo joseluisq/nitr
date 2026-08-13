@@ -33,6 +33,26 @@ database = "scripts/file.db"
 # cannot pin the entire pool.
 #max_streams = 3
 
+# Trust an inbound X-Request-ID header (well-formed, <= 64 ASCII chars)
+# instead of generating one. Enable only behind a proxy that sets or
+# sanitizes the header.
+#trust_request_id = false
+
+# Request-size and connection limits, enforced before a request reaches Lua.
+#[limits]
+#max_body_bytes = 1048576    # declared request body cap (413 beyond it)
+#max_header_bytes = 16384    # request header buffer (min 8192)
+#max_uri_bytes = 8192        # request URI cap (414 beyond it)
+#max_connections = 1024      # concurrent TCP connections
+
+# Per-client-IP fixed-window rate limiting (429 + Retry-After beyond the
+# budget). Disabled by default.
+#[rate_limit]
+#enabled = true
+#requests = 100              # allowed requests per window and client IP
+#window = 60                 # window length in seconds
+#trust_forwarded_for = false # key by X-Forwarded-For (only behind a proxy)
+
 # Development mode: hot-reload the handler script on change.
 # Default: false (also enabled by the --dev flag).
 dev_mode = true

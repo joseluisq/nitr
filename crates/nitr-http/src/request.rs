@@ -6,43 +6,46 @@ use hyper::Request;
 use mlua::{ExternalResult, LuaSerdeExt, UserData, UserDataFields, UserDataMethods};
 use serde_json::Value as SerdeValue;
 
-/// Wrapper around incoming request that implements UserData. The third
-/// field holds the path parameters captured by the router (empty for the
-/// catch-all handler).
-pub(crate) struct LuaRequest(
-    pub(crate) SocketAddr,
-    pub(crate) Request<Incoming>,
-    pub(crate) Vec<(String, String)>,
-);
+/// Wrapper around the incoming request that implements UserData.
+pub(crate) struct LuaRequest {
+    pub(crate) peer_addr: SocketAddr,
+    pub(crate) req: Request<Incoming>,
+    /// Path parameters captured by the router (empty for the catch-all).
+    pub(crate) params: Vec<(String, String)>,
+    /// The request id: generated per request (UUIDv7), or taken from a
+    /// trusted inbound `X-Request-ID` header.
+    pub(crate) id: String,
+}
 
 impl UserData for LuaRequest {
     fn add_fields<'lua, F: UserDataFields<Self>>(fields: &mut F) {
-        fields.add_field_method_get("remote_addr", |_, req| Ok((req.0).to_string()));
-        fields.add_field_method_get("method", |_, req| Ok((req.1).method().to_string()));
-        fields.add_field_method_get("path", |_, req| Ok(req.1.uri().path().to_string()));
+        fields.add_field_method_get("remote_addr", |_, req| Ok(req.peer_addr.to_string()));
+        fields.add_field_method_get("method", |_, req| Ok(req.req.method().to_string()));
+        fields.add_field_method_get("path", |_, req| Ok(req.req.uri().path().to_string()));
         fields.add_field_method_get("query", |lua, req| {
             // Query string parsed (and percent-decoded) into a table; for
             // repeated keys the last value wins.
             let table = lua.create_table()?;
-            if let Some(query) = req.1.uri().query() {
+            if let Some(query) = req.req.uri().query() {
                 for (k, v) in url::form_urlencoded::parse(query.as_bytes()) {
                     table.set(k.as_ref(), v.as_ref())?;
                 }
             }
             Ok(table)
         });
+        fields.add_field_method_get("id", |_, req| Ok(req.id.clone()));
         fields.add_field_method_get("params", |lua, req| {
             // Path parameters captured by the router, e.g. `id` for a route
             // registered as `/users/:id`.
             let table = lua.create_table()?;
-            for (k, v) in &req.2 {
+            for (k, v) in &req.params {
                 table.set(k.as_str(), v.as_str())?;
             }
             Ok(table)
         });
         fields.add_field_method_get("uri", |lua, req| {
             let table = lua.create_table()?;
-            let uri = req.1.uri();
+            let uri = req.req.uri();
             table.set("scheme", uri.scheme_str().unwrap_or_default())?;
             table.set("host", uri.host().unwrap_or_default())?;
             table.set("port", uri.port().map_or(0, |v| v.as_u16()))?;
@@ -52,7 +55,7 @@ impl UserData for LuaRequest {
             Ok(table)
         });
         fields.add_field_method_get("headers", |lua, req| {
-            let headers = (req.1).headers();
+            let headers = req.req.headers();
             let table = lua.create_table()?;
             for (k, v) in headers.iter() {
                 table.set(k.as_str(), v.to_str().unwrap_or_default())?;
@@ -62,7 +65,7 @@ impl UserData for LuaRequest {
         fields.add_field_method_get("cookies", |_, req| {
             // All `Cookie` headers, joined so multi-header clients work.
             let header = req
-                .1
+                .req
                 .headers()
                 .get_all(hyper::header::COOKIE)
                 .iter()
@@ -78,7 +81,7 @@ impl UserData for LuaRequest {
         // request's `Accept` header, or nil when none is acceptable.
         methods.add_method("accepts", |_, req, offers: mlua::Variadic<String>| {
             let accept = req
-                .1
+                .req
                 .headers()
                 .get(hyper::header::ACCEPT)
                 .and_then(|v| v.to_str().ok())
@@ -88,7 +91,7 @@ impl UserData for LuaRequest {
         });
 
         methods.add_async_method_mut("read", |lua, mut req, ()| async move {
-            let reader = req.1.body_mut();
+            let reader = req.req.body_mut();
             if let Some(frame) = reader.frame().await {
                 if let Some(bytes) = frame.into_lua_err()?.data_ref() {
                     return Some(lua.create_string(bytes)).transpose();
@@ -98,13 +101,13 @@ impl UserData for LuaRequest {
         });
 
         methods.add_async_method_mut("text", |lua, mut req, ()| async move {
-            let reader = req.1.body_mut();
+            let reader = req.req.body_mut();
             let body = reader.collect().await.into_lua_err()?;
             lua.create_string(body.to_bytes())
         });
 
         methods.add_async_method_mut("json", |lua, mut req, ()| async move {
-            let reader = req.1.body_mut();
+            let reader = req.req.body_mut();
             let collected = reader.collect().await.into_lua_err()?;
             let buf = collected.to_bytes();
             if buf.is_empty() {

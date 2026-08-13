@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 use crate::app::{self, AppState, Dispatch};
+use crate::protect::Protection;
 use crate::request::LuaRequest;
 use crate::stream;
 use nitr_core::{Error, Result, Runtime, RuntimeGuard, RuntimePool};
@@ -29,11 +30,33 @@ enum Target {
     MethodNotAllowed(Vec<Method>),
 }
 
+/// Serves one request: protection checks, dispatch, and the `X-Request-ID`
+/// echo on every response.
 pub(crate) async fn handle(
+    pool: &RuntimePool,
+    req: LuaRequest,
+    streams: Arc<Semaphore>,
+    protection: Arc<Protection>,
+) -> Result<HttpResponse> {
+    let id = req.id.clone();
+    let mut resp = handle_inner(pool, req, streams, protection).await?;
+    if let Ok(value) = header::HeaderValue::from_str(&id) {
+        resp.headers_mut().insert("x-request-id", value);
+    }
+    Ok(resp)
+}
+
+async fn handle_inner(
     pool: &RuntimePool,
     mut req: LuaRequest,
     streams: Arc<Semaphore>,
+    protection: Arc<Protection>,
 ) -> Result<HttpResponse> {
+    // Rust-side protection runs before a Lua state is even checked out.
+    if let Some(rejection) = protection.check(&req) {
+        return rejection;
+    }
+
     let mut rt = pool.get().await;
     let dev_mode = rt.dev_mode();
 
@@ -81,7 +104,7 @@ pub(crate) async fn handle(
             params,
             error_fn,
         } => {
-            req.2 = params;
+            req.params = params;
             // The request becomes a Lua value up front so the error handler
             // can receive the same object the handler saw.
             let req_ud = rt.lua().create_userdata(req)?;
@@ -157,8 +180,8 @@ fn resolve(rt: &Runtime, req: &LuaRequest) -> Result<Target> {
     let state = ud.borrow::<AppState>()?;
     Ok(match &state.dispatch {
         Dispatch::CatchAll(f) => Target::CatchAll(f.clone()),
-        Dispatch::App(app) => match app.router.at(req.1.uri().path()) {
-            Ok(matched) => match matched.value.get(req.1.method()) {
+        Dispatch::App(app) => match app.router.at(req.req.uri().path()) {
+            Ok(matched) => match matched.value.get(req.req.method()) {
                 Some(&idx) => Target::Chain {
                     chain: app.chains[idx].clone(),
                     params: matched
@@ -175,7 +198,7 @@ fn resolve(rt: &Runtime, req: &LuaRequest) -> Result<Target> {
     })
 }
 
-fn plain_response(status: StatusCode, body: &'static str) -> Result<HttpResponse> {
+pub(crate) fn plain_response(status: StatusCode, body: &'static str) -> Result<HttpResponse> {
     Ok(Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")

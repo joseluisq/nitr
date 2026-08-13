@@ -14,6 +14,7 @@ pub(crate) mod db;
 pub(crate) mod fetch;
 pub(crate) mod http;
 pub(crate) mod json;
+pub(crate) mod log;
 pub(crate) mod template;
 pub(crate) mod utils;
 
@@ -36,6 +37,8 @@ bitflags::bitflags! {
         /// HTTP ergonomics: the `text`/`html`/`redirect`/`status`/`negotiate`
         /// response helpers and the `http` table (`http.error`).
         const HTTP = 1 << 5;
+        /// `log.debug/info/warn/error(msg, fields?)` structured logging.
+        const LOG = 1 << 6;
     }
 }
 
@@ -51,6 +54,7 @@ impl Builtins {
             Builtins::JSON => Some("json"),
             Builtins::DATABASE => Some("conn"),
             Builtins::HTTP => Some("http"),
+            Builtins::LOG => Some("log"),
             _ => None,
         }
     }
@@ -65,6 +69,7 @@ impl Builtins {
             "json" => Some(Builtins::JSON),
             "db" => Some(Builtins::DATABASE),
             "http" => Some(Builtins::HTTP),
+            "log" => Some(Builtins::LOG),
             _ => None,
         }
     }
@@ -108,6 +113,7 @@ pub fn register_builtins(lua: &mlua::Lua, builtins: Builtins, env: &BuiltinsEnv)
             // Registers several globals (`text`, `html`, `redirect`,
             // `status`, `negotiate`, `http`), not just `http`.
             Builtins::HTTP => http::register(lua)?,
+            Builtins::LOG => globals.set(name, log::create_log_table(lua)?)?,
             Builtins::DATABASE => match &env.database {
                 Some(path) => globals.set(name, db::create_database_fn(lua, path)?)?,
                 None => {
@@ -133,6 +139,7 @@ mod tests {
             ("json", Builtins::JSON),
             ("db", Builtins::DATABASE),
             ("http", Builtins::HTTP),
+            ("log", Builtins::LOG),
         ] {
             assert_eq!(Builtins::from_config_name(name), Some(flag));
             assert!(flag.global_name().is_some());

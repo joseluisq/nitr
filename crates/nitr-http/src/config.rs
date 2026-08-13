@@ -48,8 +48,71 @@ pub struct Config {
     /// startup when a listed builtin is missing its configuration
     /// (e.g. `template` without `templates_dir`).
     pub builtins: Option<Vec<String>>,
+    /// Trust an inbound `X-Request-ID` header (well-formed, <= 64 ASCII
+    /// chars) instead of generating a fresh id. Enable only behind a proxy
+    /// that sets or sanitizes the header.
+    pub trust_request_id: bool,
+    /// Request-size and connection limits (`[limits]` section).
+    pub limits: LimitsConfig,
+    /// Per-client rate limiting (`[rate_limit]` section).
+    pub rate_limit: RateLimitConfig,
     /// Lua runtime settings.
     pub lua: LuaConfig,
+}
+
+/// Request-size and connection limits (`[limits]` section), enforced in
+/// Rust before a request reaches Lua.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LimitsConfig {
+    /// Maximum declared request body size in bytes (413 beyond it).
+    pub max_body_bytes: u64,
+    /// Maximum request header buffer in bytes (hyper enforces a floor of
+    /// 8 KiB).
+    pub max_header_bytes: usize,
+    /// Maximum request URI length in bytes (414 beyond it).
+    pub max_uri_bytes: usize,
+    /// Maximum concurrent TCP connections; the listener stops accepting
+    /// while at the cap.
+    pub max_connections: usize,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_body_bytes: 1024 * 1024, // 1 MiB
+            max_header_bytes: 16 * 1024, // 16 KiB
+            max_uri_bytes: 8 * 1024,     // 8 KiB
+            max_connections: 1024,
+        }
+    }
+}
+
+/// Per-client-IP fixed-window rate limiting (`[rate_limit]` section).
+/// Disabled by default; rejections answer 429 with a `Retry-After` header.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RateLimitConfig {
+    /// Whether rate limiting is enforced.
+    pub enabled: bool,
+    /// Allowed requests per window and client IP.
+    pub requests: u32,
+    /// Window length in seconds.
+    pub window: u64,
+    /// Key the budget by the first `X-Forwarded-For` entry instead of the
+    /// peer address. Enable only behind a trusted proxy.
+    pub trust_forwarded_for: bool,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            requests: 100,
+            window: 60,
+            trust_forwarded_for: false,
+        }
+    }
 }
 
 /// Lua runtime settings (`[lua]` section).
@@ -78,6 +141,9 @@ impl Default for Config {
             max_streams: None,
             dev_mode: false,
             builtins: None,
+            trust_request_id: false,
+            limits: LimitsConfig::default(),
+            rate_limit: RateLimitConfig::default(),
             lua: LuaConfig::default(),
         }
     }

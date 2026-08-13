@@ -20,6 +20,7 @@ use http_body_util::{BodyExt as _, StreamBody};
 use hyper::body::{Bytes, Frame};
 use mlua::{Function, LuaString, Table as LuaTable, UserData, UserDataMethods, Value};
 use tokio::sync::OwnedSemaphorePermit;
+use tracing::Instrument as _;
 
 use crate::handler::build_response;
 use nitr_core::{DeadlineHandle, Result, RuntimeGuard};
@@ -69,55 +70,58 @@ pub(crate) fn stream_response(
     })?;
     let resp = build_response(lua_resp, StreamBody::new(rx).boxed())?;
 
-    tokio::spawn(async move {
-        // Held for the stream's lifetime; releasing it frees a stream slot.
-        let _permit = permit;
-        match rt
-            .call_function_streaming::<Value>(body_fn.clone(), &writer)
-            .await
-        {
-            // The first call returned a chunk: iterator mode. Emit it and
-            // keep calling until nil, granting budget per chunk.
-            Ok(Value::String(first)) => {
-                let mut chunk = Bytes::copy_from_slice(&first.as_bytes());
-                loop {
-                    if tx.send(Ok(Frame::data(chunk))).await.is_err() {
-                        // Client disconnected: stop pulling chunks.
-                        break;
-                    }
-                    deadline.extend();
-                    match rt
-                        .call_function_streaming::<Option<LuaString>>(body_fn.clone(), ())
-                        .await
-                    {
-                        Ok(Some(next)) => chunk = Bytes::copy_from_slice(&next.as_bytes()),
-                        Ok(None) => break,
-                        Err(err) => {
-                            tracing::error!("streaming iterator failed mid-body: {err}");
+    tokio::spawn(
+        async move {
+            // Held for the stream's lifetime; releasing it frees a stream slot.
+            let _permit = permit;
+            match rt
+                .call_function_streaming::<Value>(body_fn.clone(), &writer)
+                .await
+            {
+                // The first call returned a chunk: iterator mode. Emit it and
+                // keep calling until nil, granting budget per chunk.
+                Ok(Value::String(first)) => {
+                    let mut chunk = Bytes::copy_from_slice(&first.as_bytes());
+                    loop {
+                        if tx.send(Ok(Frame::data(chunk))).await.is_err() {
+                            // Client disconnected: stop pulling chunks.
                             break;
+                        }
+                        deadline.extend();
+                        match rt
+                            .call_function_streaming::<Option<LuaString>>(body_fn.clone(), ())
+                            .await
+                        {
+                            Ok(Some(next)) => chunk = Bytes::copy_from_slice(&next.as_bytes()),
+                            Ok(None) => break,
+                            Err(err) => {
+                                tracing::error!("streaming iterator failed mid-body: {err}");
+                                break;
+                            }
                         }
                     }
                 }
-            }
-            // Writer-callback mode completed normally.
-            Ok(_) => {}
-            Err(err) => {
-                // A disconnect surfacing as a Lua error is normal stream
-                // teardown, not a handler bug.
-                let msg = err.to_string();
-                if msg.contains("client disconnected") {
-                    tracing::debug!("stream cancelled: client disconnected");
-                } else {
-                    tracing::error!("streaming body failed mid-body: {err}");
+                // Writer-callback mode completed normally.
+                Ok(_) => {}
+                Err(err) => {
+                    // A disconnect surfacing as a Lua error is normal stream
+                    // teardown, not a handler bug.
+                    let msg = err.to_string();
+                    if msg.contains("client disconnected") {
+                        tracing::debug!("stream cancelled: client disconnected");
+                    } else {
+                        tracing::error!("streaming body failed mid-body: {err}");
+                    }
                 }
             }
+            // The writer userdata inside the Lua state still holds a sender
+            // clone until the GC collects it, so close the channel explicitly —
+            // this is what ends the response body. The runtime returns to the
+            // pool when `rt` drops.
+            tx.close();
         }
-        // The writer userdata inside the Lua state still holds a sender
-        // clone until the GC collects it, so close the channel explicitly —
-        // this is what ends the response body. The runtime returns to the
-        // pool when `rt` drops.
-        tx.close();
-    });
+        .instrument(tracing::Span::current()),
+    );
 
     Ok(resp)
 }

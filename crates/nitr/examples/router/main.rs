@@ -39,7 +39,7 @@ async fn main() -> nitr::Result {
     Server::builder()
         .listen(([127, 0, 0, 1], port).into())
         .handler_script("crates/nitr/examples/router/app.lua")
-        .builtins(Builtins::DEBUG | Builtins::JSON | Builtins::HTTP)
+        .builtins(Builtins::DEBUG | Builtins::JSON | Builtins::HTTP | Builtins::LOG)
         .build()
         .await?
         .serve()
