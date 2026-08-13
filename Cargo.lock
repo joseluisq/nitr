@@ -824,7 +824,7 @@ dependencies = [
 
 [[package]]
 name = "nitr"
-version = "0.0.0-beta.0"
+version = "0.0.0-beta.1"
 dependencies = [
  "anyhow",
  "async-channel",

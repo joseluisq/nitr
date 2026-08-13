@@ -1,11 +1,11 @@
 [package]
 name = "nitr"
-version = "0.0.0-beta.0"
+version = "0.0.0-beta.1"
 edition = "2021"
 rust-version = "1.82.0"
 authors = ["Jose Quintana <https://joseluisq.net>"]
 license = "MIT OR Apache-2.0"
-description = "A dynamic web server written in Rust with Lua scripting support."
+description = "A Rust web server embedding Lua for fast, efficient and safe dynamic backends."
 repository = "https://github.com/joseluisq/nitr"
 readme = "README.md"
 homepage = "https://github.com/joseluisq/nitr"
