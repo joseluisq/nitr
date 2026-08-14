@@ -13,9 +13,12 @@ pub(crate) mod handler;
 pub(crate) mod protect;
 pub(crate) mod request;
 pub(crate) mod server;
+pub(crate) mod static_files;
 pub(crate) mod stream;
+
+pub mod testing;
 
 pub mod service;
 
-pub use config::{Config, FetchConfig, LimitsConfig, LuaConfig, RateLimitConfig};
+pub use config::{Config, FetchConfig, LimitsConfig, LuaConfig, RateLimitConfig, StaticConfig};
 pub use server::{Server, ServerBuilder};

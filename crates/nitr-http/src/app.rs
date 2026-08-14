@@ -13,6 +13,7 @@ use std::time::SystemTime;
 use hyper::Method;
 use matchit::Router;
 use mlua::{AnyUserData, Function, Lua, UserData, UserDataMethods, Value, Variadic};
+use std::sync::Arc;
 
 use nitr_core::{Error, Result, Runtime};
 
@@ -57,6 +58,7 @@ struct AppDef {
     middleware: Vec<Function>,
     routes: Vec<RouteDef>,
     error_fn: Option<Function>,
+    statics: Vec<crate::static_files::StaticMount>,
 }
 
 /// The `nitr.app()` userdata handed to the handler script.
@@ -106,6 +108,30 @@ impl UserData for LuaApp {
             lock(&this.0)?.error_fn = Some(f);
             Ok(())
         });
+
+        // app:static(mount, dir, opts?): served entirely in Rust; opts is
+        // an optional table { spa = bool, cache_control = "..." }.
+        methods.add_method(
+            "static",
+            |_, this, (mount, dir, opts): (String, String, Option<mlua::Table>)| {
+                let (spa, cache_control) = match opts {
+                    Some(opts) => (
+                        opts.get::<Option<bool>>("spa")?.unwrap_or(false),
+                        opts.get::<Option<String>>("cache_control")?,
+                    ),
+                    None => (false, None),
+                };
+                lock(&this.0)?
+                    .statics
+                    .push(crate::static_files::StaticMount::new(
+                        mount,
+                        dir,
+                        spa,
+                        cache_control,
+                    ));
+                Ok(())
+            },
+        );
     }
 }
 
@@ -130,6 +156,9 @@ pub(crate) struct CompiledApp {
 /// dies with its state without changing the runtime pool's shape.
 pub(crate) struct AppState {
     pub(crate) dispatch: Dispatch,
+    /// Static mounts: the script's `app:static(...)` calls first, then the
+    /// server-level `[static]` configuration.
+    pub(crate) statics: Arc<Vec<crate::static_files::StaticMount>>,
     script: PathBuf,
     mtime: Option<SystemTime>,
 }
@@ -150,12 +179,18 @@ pub(crate) fn register_nitr_global(lua: &Lua) -> mlua::Result<()> {
 /// Evaluates the handler script and stores its compiled [`AppState`] in the
 /// Lua registry. Called at startup for every pooled state and again on
 /// dev-mode reloads.
-pub(crate) fn load(rt: &Runtime, script: &Path) -> Result<()> {
+pub(crate) fn load(
+    rt: &Runtime,
+    script: &Path,
+    base_statics: &[crate::static_files::StaticMount],
+) -> Result<()> {
     let mtime = modified(script);
     let value = rt.eval_script(script)?;
-    let dispatch = compile(value, script)?;
+    let (dispatch, mut statics) = compile(value, script)?;
+    statics.extend_from_slice(base_statics);
     let state = rt.lua().create_userdata(AppState {
         dispatch,
+        statics: Arc::new(statics),
         script: script.to_path_buf(),
         mtime,
     })?;
@@ -171,7 +206,10 @@ pub(crate) fn state(lua: &Lua) -> Result<AnyUserData> {
 
 /// Dev mode: re-evaluates the handler script when its mtime changed since
 /// the last load, replacing this state's dispatch table.
-pub(crate) fn reload_if_changed(rt: &Runtime) -> Result<()> {
+pub(crate) fn reload_if_changed(
+    rt: &Runtime,
+    base_statics: &[crate::static_files::StaticMount],
+) -> Result<()> {
     let ud = state(rt.lua())?;
     let (script, last) = {
         let st = ud.borrow::<AppState>()?;
@@ -179,7 +217,7 @@ pub(crate) fn reload_if_changed(rt: &Runtime) -> Result<()> {
     };
     if modified(&script) != last {
         tracing::debug!("reloading handler script {}", script.display());
-        load(rt, &script)?;
+        load(rt, &script, base_statics)?;
     }
     Ok(())
 }
@@ -191,9 +229,11 @@ fn modified(path: &Path) -> Option<SystemTime> {
 /// Compiles the script's return value into a [`Dispatch`]: middleware
 /// factories are invoked once here (never per request), and the route set
 /// is validated so conflicts fail at startup instead of at request time.
-fn compile(value: Value, script: &Path) -> Result<Dispatch> {
+type Compiled = (Dispatch, Vec<crate::static_files::StaticMount>);
+
+fn compile(value: Value, script: &Path) -> Result<Compiled> {
     let app_ud = match value {
-        Value::Function(f) => return Ok(Dispatch::CatchAll(f)),
+        Value::Function(f) => return Ok((Dispatch::CatchAll(f), Vec::new())),
         Value::UserData(ud) if ud.is::<LuaApp>() => ud,
         other => {
             return Err(Error::Script(format!(
@@ -205,9 +245,9 @@ fn compile(value: Value, script: &Path) -> Result<Dispatch> {
     };
     let app = app_ud.borrow::<LuaApp>()?;
     let def = lock(&app.0)?;
-    if def.routes.is_empty() {
+    if def.routes.is_empty() && def.statics.is_empty() {
         return Err(Error::Script(format!(
-            "the app returned by {} defines no routes",
+            "the app returned by {} defines no routes or static mounts",
             script.display()
         )));
     }
@@ -249,11 +289,14 @@ fn compile(value: Value, script: &Path) -> Result<Dispatch> {
         })?;
     }
 
-    Ok(Dispatch::App(Box::new(CompiledApp {
-        router,
-        chains,
-        error_fn: def.error_fn.clone(),
-    })))
+    Ok((
+        Dispatch::App(Box::new(CompiledApp {
+            router,
+            chains,
+            error_fn: def.error_fn.clone(),
+        })),
+        def.statics.clone(),
+    ))
 }
 
 /// Composes `global middleware → route middleware → handler` into a single

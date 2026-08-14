@@ -1,0 +1,11 @@
+# Paths are relative to the process working directory (the repo root when
+# run via `cargo run -p nitr-cli`).
+listen = "127.0.0.1:3000"
+handler_script = "crates/nitr/examples/app-package/app.lua"
+config_script = "crates/nitr/examples/app-package/config.lua"
+database = "/tmp/nitr-app-package.db"
+tests_dir = "crates/nitr/examples/app-package/tests"
+
+[static]
+dir = "crates/nitr/examples/app-package/public"
+mount = "/"

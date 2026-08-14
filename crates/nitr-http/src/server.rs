@@ -2,7 +2,7 @@
 
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use hyper::server::conn::http1;
@@ -32,10 +32,12 @@ type SetupFn = Box<dyn Fn(&mlua::Lua) -> mlua::Result<()> + Send + Sync>;
 /// The Nitr HTTP server: a pool of Lua runtimes behind a shared listener.
 ///
 /// Built via [`Server::builder()`]; run via [`serve()`](Self::serve).
-#[derive(Debug)]
 pub struct Server {
     cfg: Config,
-    pool: Arc<RuntimePool>,
+    builtins: Builtins,
+    setup_fns: Arc<Vec<SetupFn>>,
+    /// The current pool, swappable as a whole for zero-downtime reloads.
+    pool: Arc<RwLock<Arc<RuntimePool>>>,
     /// Streaming-response slots: one permit per live streaming body.
     streams: Arc<Semaphore>,
     /// Pre-Lua protection: rate limiting, size limits, request ids.
@@ -58,9 +60,43 @@ impl Server {
         ServerBuilder::default()
     }
 
-    /// The pool of Lua runtimes serving requests.
-    pub fn pool(&self) -> &Arc<RuntimePool> {
-        &self.pool
+    /// The pool of Lua runtimes currently serving requests.
+    pub fn pool(&self) -> Arc<RuntimePool> {
+        current_pool(&self.pool)
+    }
+
+    /// An in-process client that dispatches requests through the full
+    /// router/middleware/handler path without binding a socket — the
+    /// foundation for `nitr test` and Rust-level integration tests.
+    pub fn test_client(&self) -> crate::testing::TestClient {
+        crate::testing::TestClient::new(
+            self.pool.clone(),
+            self.streams.clone(),
+            self.protection.clone(),
+        )
+    }
+
+    /// Builds a complete replacement pool (re-running the configuration
+    /// script) and atomically swaps it in; in-flight requests finish on
+    /// the old pool, which is dropped when its last guard returns. On any
+    /// error the old pool stays.
+    async fn reload(&self) {
+        tracing::info!("reload requested: rebuilding the runtime pool");
+        match build_runtimes(&self.cfg, self.builtins, &self.setup_fns).await {
+            Ok(runtimes) => {
+                let fresh = Arc::new(RuntimePool::new(runtimes));
+                match self.pool.write() {
+                    Ok(mut pool) => {
+                        *pool = fresh;
+                        tracing::info!("reload complete: new runtime pool is live");
+                    }
+                    Err(_) => tracing::error!("reload failed: pool lock is poisoned"),
+                }
+            }
+            Err(err) => {
+                tracing::error!("reload failed, keeping the current pool: {err}");
+            }
+        }
     }
 
     /// Serves until `ctrl-c`, then shuts down gracefully.
@@ -81,11 +117,30 @@ impl Server {
         tracing::info!(
             "listening on http://{} with {} Lua state(s)",
             self.cfg.listen,
-            self.pool.size()
+            current_pool(&self.pool).size()
         );
 
         let graceful = GracefulShutdown::new();
         let mut shutdown = std::pin::pin!(shutdown);
+
+        // SIGHUP triggers a zero-downtime pool swap (Unix only; the
+        // channel simply stays silent elsewhere).
+        let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel::<()>(1);
+        #[cfg(unix)]
+        {
+            let tx = reload_tx.clone();
+            tokio::spawn(async move {
+                use tokio::signal::unix::{signal, SignalKind};
+                let Ok(mut hangup) = signal(SignalKind::hangup()) else {
+                    tracing::warn!("failed to install the SIGHUP reload handler");
+                    return;
+                };
+                while hangup.recv().await.is_some() {
+                    let _ = tx.try_send(());
+                }
+            });
+        }
+        let _reload_tx = reload_tx;
         // Connection cap: the listener stops accepting while at the limit
         // instead of queueing unbounded connections.
         let conn_slots = Arc::new(Semaphore::new(self.cfg.limits.max_connections.max(1)));
@@ -137,6 +192,7 @@ impl Server {
                         }
                     });
                 }
+                Some(()) = reload_rx.recv() => self.reload().await,
                 _ = &mut shutdown => break,
             }
         }
@@ -231,52 +287,87 @@ impl ServerBuilder {
             Some(b) => b,
             None => cfg.builtins()?,
         };
-        let workers = cfg.workers.max(1);
-
-        // Bootstrap state: runs the configuration script exactly once.
-        let mut bootstrap = new_runtime(&cfg, builtins, &self.setup_fns)?;
-        let snapshot = match &cfg.config_script {
-            Some(conf_src) => {
-                // Pass the database connection to the config script when available.
-                let db_name = Builtins::DATABASE
-                    .global_name()
-                    .expect("DATABASE is a single builtin flag");
-                let db = bootstrap.get_global::<Option<AnyUserData>>(db_name)?;
-                bootstrap.register_cfg_fn(conf_src, db).await?;
-                bootstrap.cfg_snapshot()?
-            }
-            None => None,
-        };
-        set_nitr_cfg(&bootstrap)?;
-        app::load(&bootstrap, &cfg.handler_script)?;
-
-        // Remaining states: inject the snapshot instead of re-running the
-        // configuration script, so its side effects happen exactly once.
-        let mut runtimes = Vec::with_capacity(workers);
-        runtimes.push(bootstrap);
-        for _ in 1..workers {
-            let mut rt = new_runtime(&cfg, builtins, &self.setup_fns)?;
-            if let Some(snapshot) = &snapshot {
-                rt.set_cfg_snapshot(snapshot)?;
-            }
-            set_nitr_cfg(&rt)?;
-            app::load(&rt, &cfg.handler_script)?;
-            runtimes.push(rt);
-        }
+        let setup_fns = Arc::new(self.setup_fns);
+        let runtimes = build_runtimes(&cfg, builtins, &setup_fns).await?;
 
         // Streaming responses hold a pooled state for their lifetime; by
         // default keep at least one state free for short requests.
         let max_streams = cfg
             .max_streams
-            .unwrap_or_else(|| workers.saturating_sub(1).max(1));
+            .unwrap_or_else(|| cfg.workers.max(1).saturating_sub(1).max(1));
 
         Ok(Server {
             protection: Arc::new(Protection::new(&cfg)),
             cfg,
-            pool: Arc::new(RuntimePool::new(runtimes)),
+            builtins,
+            setup_fns,
+            pool: Arc::new(RwLock::new(Arc::new(RuntimePool::new(runtimes)))),
             streams: Arc::new(Semaphore::new(max_streams)),
         })
     }
+}
+
+impl std::fmt::Debug for Server {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Server")
+            .field("cfg", &self.cfg)
+            .field("builtins", &self.builtins)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The currently-live pool (poisoning is unreachable: the lock is only
+/// held to clone/replace an `Arc`).
+pub(crate) fn current_pool(pool: &Arc<RwLock<Arc<RuntimePool>>>) -> Arc<RuntimePool> {
+    pool.read()
+        .map(|p| p.clone())
+        .unwrap_or_else(|e| e.into_inner().clone())
+}
+
+/// Builds the full set of pooled runtimes: a bootstrap state runs the
+/// configuration script exactly once and its snapshot is injected into the
+/// rest. Also used by reloads, so the configuration script's side effects
+/// run once per (re)build.
+async fn build_runtimes(
+    cfg: &Config,
+    builtins: Builtins,
+    setup_fns: &[SetupFn],
+) -> Result<Vec<Runtime>> {
+    let workers = cfg.workers.max(1);
+    let base_statics = crate::static_files::base_mounts(cfg);
+    let base_statics = base_statics.as_slice();
+
+    // Bootstrap state: runs the configuration script exactly once.
+    let mut bootstrap = new_runtime(cfg, builtins, setup_fns)?;
+    let snapshot = match &cfg.config_script {
+        Some(conf_src) => {
+            // Pass the database connection to the config script when available.
+            let db_name = Builtins::DATABASE
+                .global_name()
+                .expect("DATABASE is a single builtin flag");
+            let db = bootstrap.get_global::<Option<AnyUserData>>(db_name)?;
+            bootstrap.register_cfg_fn(conf_src, db).await?;
+            bootstrap.cfg_snapshot()?
+        }
+        None => None,
+    };
+    set_nitr_cfg(&bootstrap)?;
+    app::load(&bootstrap, &cfg.handler_script, base_statics)?;
+
+    // Remaining states: inject the snapshot instead of re-running the
+    // configuration script, so its side effects happen exactly once.
+    let mut runtimes = Vec::with_capacity(workers);
+    runtimes.push(bootstrap);
+    for _ in 1..workers {
+        let mut rt = new_runtime(cfg, builtins, setup_fns)?;
+        if let Some(snapshot) = &snapshot {
+            rt.set_cfg_snapshot(snapshot)?;
+        }
+        set_nitr_cfg(&rt)?;
+        app::load(&rt, &cfg.handler_script, base_statics)?;
+        runtimes.push(rt);
+    }
+    Ok(runtimes)
 }
 
 fn new_runtime(cfg: &Config, builtins: Builtins, setup_fns: &[SetupFn]) -> Result<Runtime> {

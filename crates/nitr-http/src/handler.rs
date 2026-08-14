@@ -11,6 +11,7 @@ use tokio::sync::Semaphore;
 use crate::app::{self, AppState, Dispatch};
 use crate::protect::Protection;
 use crate::request::LuaRequest;
+use crate::static_files::{self, StaticMount};
 use crate::stream;
 use nitr_core::{Error, Result, Runtime, RuntimeGuard, RuntimePool};
 
@@ -20,6 +21,8 @@ pub(crate) type HttpResponse = Response<BoxBody<Bytes, Infallible>>;
 enum Target {
     /// Legacy single-function script: called for every request.
     CatchAll(Function),
+    /// A static asset resolved by a mount (already served).
+    Static(Result<HttpResponse>),
     /// A matched route: the composed middleware+handler chain.
     Chain {
         chain: Function,
@@ -61,13 +64,13 @@ async fn handle_inner(
     let dev_mode = rt.dev_mode();
 
     if dev_mode {
-        if let Err(err) = app::reload_if_changed(&rt) {
+        if let Err(err) = app::reload_if_changed(&rt, protection.base_statics()) {
             tracing::error!("failed to reload the HTTP handler: {err}");
             return error_response(&err, dev_mode);
         }
     }
 
-    let target = match resolve(&rt, &req) {
+    let target = match resolve(&rt, &req).await {
         Ok(target) => target,
         Err(err) => {
             tracing::error!("failed to resolve the request route: {err}");
@@ -76,6 +79,7 @@ async fn handle_inner(
     };
 
     match target {
+        Target::Static(resp) => resp,
         Target::NotFound => plain_response(StatusCode::NOT_FOUND, "Not Found"),
         Target::MethodNotAllowed(allowed) => {
             let mut resp = plain_response(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed")?;
@@ -174,27 +178,42 @@ fn finish(
     }
 }
 
-/// Routes the request in Rust against this state's compiled dispatch table.
-fn resolve(rt: &Runtime, req: &LuaRequest) -> Result<Target> {
+/// Routes the request in Rust against this state's compiled dispatch
+/// table. Static mounts are consulted after a router miss (and before a
+/// legacy catch-all, which otherwise receives everything).
+async fn resolve(rt: &Runtime, req: &LuaRequest) -> Result<Target> {
     let ud = app::state(rt.lua())?;
-    let state = ud.borrow::<AppState>()?;
-    Ok(match &state.dispatch {
-        Dispatch::CatchAll(f) => Target::CatchAll(f.clone()),
-        Dispatch::App(app) => match app.router.at(req.req.uri().path()) {
-            Ok(matched) => match matched.value.get(req.req.method()) {
-                Some(&idx) => Target::Chain {
-                    chain: app.chains[idx].clone(),
-                    params: matched
-                        .params
-                        .iter()
-                        .map(|(k, v)| (k.to_string(), v.to_string()))
-                        .collect(),
-                    error_fn: app.error_fn.clone(),
+    let (target, statics): (Target, Arc<Vec<StaticMount>>) = {
+        let state = ud.borrow::<AppState>()?;
+        let target = match &state.dispatch {
+            Dispatch::CatchAll(f) => Target::CatchAll(f.clone()),
+            Dispatch::App(app) => match app.router.at(req.req.uri().path()) {
+                Ok(matched) => match matched.value.get(req.req.method()) {
+                    Some(&idx) => Target::Chain {
+                        chain: app.chains[idx].clone(),
+                        params: matched
+                            .params
+                            .iter()
+                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                            .collect(),
+                        error_fn: app.error_fn.clone(),
+                    },
+                    None => Target::MethodNotAllowed(matched.value.keys().cloned().collect()),
                 },
-                None => Target::MethodNotAllowed(matched.value.keys().cloned().collect()),
+                Err(_) => Target::NotFound,
             },
-            Err(_) => Target::NotFound,
-        },
+        };
+        (target, state.statics.clone())
+    };
+
+    Ok(match target {
+        Target::NotFound | Target::CatchAll(_) if !statics.is_empty() => {
+            match static_files::try_serve(&statics, req).await {
+                Some(resp) => Target::Static(resp),
+                None => target,
+            }
+        }
+        other => other,
     })
 }
 

@@ -19,6 +19,7 @@
 pub use nitr_lua as lua;
 
 pub use nitr_http::service;
+pub use nitr_http::testing;
 
 // Re-exports
 pub use nitr_core::{

@@ -58,6 +58,11 @@ pub struct Config {
     pub rate_limit: RateLimitConfig,
     /// Outbound-request policy for the `fetch` builtin (`[fetch]` section).
     pub fetch: FetchConfig,
+    /// Static file serving (`[static]` section).
+    #[serde(rename = "static")]
+    pub static_files: StaticConfig,
+    /// Directory `nitr test` discovers `*.lua` test files in.
+    pub tests_dir: Option<PathBuf>,
     /// Lua runtime settings.
     pub lua: LuaConfig,
 }
@@ -130,6 +135,22 @@ impl FetchConfig {
     }
 }
 
+/// Static file serving (`[static]` section): requests under `mount` are
+/// served from `dir` entirely in Rust, before any Lua dispatch. Scripts
+/// can add further mounts with `app:static(mount, dir, opts?)`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StaticConfig {
+    /// Directory served as static files; unset disables the section.
+    pub dir: Option<PathBuf>,
+    /// URL prefix the directory is mounted at (default `/`).
+    pub mount: Option<String>,
+    /// Serve `index.html` for unknown paths (single-page applications).
+    pub spa: bool,
+    /// `Cache-Control` header value for served files.
+    pub cache_control: Option<String>,
+}
+
 /// Per-client-IP fixed-window rate limiting (`[rate_limit]` section).
 /// Disabled by default; rejections answer 429 with a `Retry-After` header.
 #[derive(Debug, Clone, Deserialize)]
@@ -187,6 +208,8 @@ impl Default for Config {
             limits: LimitsConfig::default(),
             rate_limit: RateLimitConfig::default(),
             fetch: FetchConfig::default(),
+            static_files: StaticConfig::default(),
+            tests_dir: None,
             lua: LuaConfig::default(),
         }
     }

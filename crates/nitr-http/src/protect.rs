@@ -27,6 +27,9 @@ pub(crate) struct Protection {
     max_uri_bytes: usize,
     trust_request_id: bool,
     rate: Option<RateLimiter>,
+    /// Static mounts from the `[static]` configuration, appended to the
+    /// script's own mounts on every (re)load.
+    base_statics: Vec<crate::static_files::StaticMount>,
 }
 
 impl Protection {
@@ -41,15 +44,26 @@ impl Protection {
                 trust_forwarded_for: cfg.rate_limit.trust_forwarded_for,
                 buckets: Mutex::new(HashMap::new()),
             }),
+            base_statics: crate::static_files::base_mounts(cfg),
         }
+    }
+
+    /// The `[static]` mounts merged into every state's dispatch table.
+    pub(crate) fn base_statics(&self) -> &[crate::static_files::StaticMount] {
+        &self.base_statics
     }
 
     /// The id for a request: a trusted, well-formed inbound `X-Request-ID`
     /// when configured, otherwise a fresh UUIDv7 (time-sortable).
     pub(crate) fn request_id(&self, req: &hyper::Request<hyper::body::Incoming>) -> String {
+        self.request_id_for_parts(req.headers())
+    }
+
+    /// [`request_id`](Self::request_id) over bare headers (used by the
+    /// in-process test client, whose body type differs).
+    pub(crate) fn request_id_for_parts(&self, headers: &hyper::HeaderMap) -> String {
         if self.trust_request_id {
-            if let Some(id) = req
-                .headers()
+            if let Some(id) = headers
                 .get("x-request-id")
                 .and_then(|v| v.to_str().ok())
                 .filter(|v| {

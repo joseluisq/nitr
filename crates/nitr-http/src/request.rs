@@ -1,15 +1,20 @@
 use std::net::SocketAddr;
 
+use http_body_util::combinators::BoxBody;
 use http_body_util::BodyExt as _;
-use hyper::body::Incoming;
+use hyper::body::Bytes;
 use hyper::Request;
+
+/// The request body type: boxed so both real (`hyper::body::Incoming`) and
+/// synthetic (test client) bodies flow through the same dispatch.
+pub(crate) type IncomingBody = BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
 use mlua::{ExternalResult, LuaSerdeExt, UserData, UserDataFields, UserDataMethods};
 use serde_json::Value as SerdeValue;
 
 /// Wrapper around the incoming request that implements UserData.
 pub(crate) struct LuaRequest {
     pub(crate) peer_addr: SocketAddr,
-    pub(crate) req: Request<Incoming>,
+    pub(crate) req: Request<IncomingBody>,
     /// Path parameters captured by the router (empty for the catch-all).
     pub(crate) params: Vec<(String, String)>,
     /// The request id: generated per request (UUIDv7), or taken from a

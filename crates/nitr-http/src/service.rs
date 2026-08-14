@@ -21,7 +21,9 @@ use tracing::Instrument as _;
 /// Service that handles incoming requests by checking a Lua runtime out of
 /// the pool for the duration of each request.
 pub struct Svc {
-    pool: Arc<RuntimePool>,
+    /// The swappable pool handle: read per request so reloads apply to
+    /// live keep-alive connections too.
+    pool: Arc<std::sync::RwLock<Arc<RuntimePool>>>,
     /// Streaming-response slots (`max_streams`); a permit is held for each
     /// live streaming body.
     streams: Arc<Semaphore>,
@@ -32,7 +34,7 @@ pub struct Svc {
 
 impl Svc {
     pub(crate) fn new(
-        pool: Arc<RuntimePool>,
+        pool: Arc<std::sync::RwLock<Arc<RuntimePool>>>,
         streams: Arc<Semaphore>,
         protection: Arc<Protection>,
         peer_addr: SocketAddr,
@@ -52,7 +54,7 @@ impl Service<Request<Incoming>> for Svc {
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
-        let pool = self.pool.clone();
+        let pool = crate::server::current_pool(&self.pool);
         let streams = self.streams.clone();
         let protection = self.protection.clone();
         let id = protection.request_id(&req);
@@ -66,7 +68,10 @@ impl Service<Request<Incoming>> for Svc {
         );
         let req = LuaRequest {
             peer_addr: self.peer_addr,
-            req,
+            req: req.map(|body| {
+                use http_body_util::BodyExt as _;
+                body.map_err(|err| Box::new(err) as _).boxed()
+            }),
             params: Vec::new(),
             id,
         };
