@@ -191,7 +191,7 @@ async fn run_tests(cfg: Config) -> anyhow::Result<usize> {
         // A fresh state per file: tests are isolated from each other but
         // share the server (and its database) like real requests do.
         let mut rt = Runtime::new_with(runtime_opts_like(&opts)?)?;
-        nitr::lua::register_builtins(rt.lua(), builtins, &env)?;
+        nitr::stdlib::register_builtins(rt.lua(), builtins, &env)?;
         register_test_global(rt.lua(), client.clone())?;
 
         let name = file

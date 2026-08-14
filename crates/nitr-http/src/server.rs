@@ -19,7 +19,7 @@ use crate::protect::Protection;
 use crate::service::Svc;
 use nitr_core::{Error, Result};
 use nitr_core::{Runtime, RuntimePool};
-use nitr_lua::Builtins;
+use nitr_std::Builtins;
 
 /// How long to read request headers before giving up on a connection.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -256,7 +256,9 @@ impl ServerBuilder {
         self
     }
 
-    /// Built-in globals to expose; overrides the configuration file list.
+    /// Standard library (`nitr.*`) features to expose; overrides the
+    /// `[std] features` list from the configuration file. Without either,
+    /// the minimal default set ([`Builtins::minimal()`]) is enabled.
     pub fn builtins(mut self, builtins: Builtins) -> Self {
         self.builtins = Some(builtins);
         self
@@ -410,12 +412,12 @@ fn new_runtime(
     modules: &[Module],
 ) -> Result<Runtime> {
     let rt = Runtime::new_with(cfg.runtime_opts()?)?;
-    let env = nitr_lua::BuiltinsEnv {
+    let env = nitr_std::BuiltinsEnv {
         templates_dir: cfg.templates_dir.clone(),
         database: cfg.database.clone(),
         fetch: cfg.fetch.options(),
     };
-    nitr_lua::register_builtins(rt.lua(), builtins, &env)?;
+    nitr_std::register_builtins(rt.lua(), builtins, &env)?;
     app::register_nitr_app(rt.lua())?;
     // Extension modules mount after the builtins so a name collision is
     // caught here, at build time.

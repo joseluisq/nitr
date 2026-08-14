@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 use nitr_core::RuntimeOpts;
 use nitr_core::{Error, Result};
-use nitr_lua::Builtins;
+use nitr_std::Builtins;
 
 /// Default per-state Lua memory limit in bytes.
 const DEFAULT_MEMORY_LIMIT: usize = 8 * 1024 * 1024; // 8 MiB
@@ -43,11 +43,12 @@ pub struct Config {
     pub max_streams: Option<usize>,
     /// Development mode: hot-reload the handler script on change.
     pub dev_mode: bool,
-    /// Built-in globals exposed to scripts. `None` enables every builtin
-    /// whose requirements are met; an explicit list is strict and fails at
-    /// startup when a listed builtin is missing its configuration
-    /// (e.g. `template` without `templates_dir`).
-    pub builtins: Option<Vec<String>>,
+    /// Standard library (`nitr.*`) selection (`[std]` section). When the
+    /// feature list is omitted, only the minimal set is enabled; an
+    /// explicit list is strict and fails at startup when a listed feature
+    /// is missing its configuration (e.g. `template` without
+    /// `templates_dir`).
+    pub std: StdConfig,
     /// Trust an inbound `X-Request-ID` header (well-formed, <= 64 ASCII
     /// chars) instead of generating a fresh id. Enable only behind a proxy
     /// that sets or sanitizes the header.
@@ -65,6 +66,24 @@ pub struct Config {
     pub tests_dir: Option<PathBuf>,
     /// Lua runtime settings.
     pub lua: LuaConfig,
+}
+
+/// Standard library selection (`[std]` section): which built-in `nitr.*`
+/// modules are exposed to scripts.
+///
+/// The standard library provides building blocks — scripts opt into the
+/// features they need (or replace them with their own modules). Without an
+/// explicit list only the minimal set is enabled to keep the footprint
+/// small.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StdConfig {
+    /// Enabled standard library features. Valid names: `"dbg"`, `"fetch"`,
+    /// `"template"`, `"json"`, `"db"`, `"http"`, `"log"`, `"crypto"`.
+    /// `None` enables the minimal default set (`json`, `http`, `log`); an
+    /// explicit list is strict — unknown names or a listed feature missing
+    /// its required setting (e.g. `db` without `database`) fail at startup.
+    pub features: Option<Vec<String>>,
 }
 
 /// Request-size and connection limits (`[limits]` section), enforced in
@@ -113,7 +132,7 @@ pub struct FetchConfig {
 
 impl Default for FetchConfig {
     fn default() -> Self {
-        let defaults = nitr_lua::FetchOptions::default();
+        let defaults = nitr_std::FetchOptions::default();
         Self {
             allowed_hosts: defaults.allowed_hosts,
             allow_private_networks: defaults.allow_private_networks,
@@ -125,8 +144,8 @@ impl Default for FetchConfig {
 
 impl FetchConfig {
     /// The runtime policy handed to the `fetch` builtin.
-    pub fn options(&self) -> nitr_lua::FetchOptions {
-        nitr_lua::FetchOptions {
+    pub fn options(&self) -> nitr_std::FetchOptions {
+        nitr_std::FetchOptions {
             allowed_hosts: self.allowed_hosts.clone(),
             allow_private_networks: self.allow_private_networks,
             max_response_bytes: self.max_response_bytes,
@@ -203,7 +222,7 @@ impl Default for Config {
             workers: std::thread::available_parallelism().map_or(1, |n| n.get()),
             max_streams: None,
             dev_mode: false,
-            builtins: None,
+            std: StdConfig::default(),
             trust_request_id: false,
             limits: LimitsConfig::default(),
             rate_limit: RateLimitConfig::default(),
@@ -284,28 +303,29 @@ impl Config {
         Ok(())
     }
 
-    /// Resolves the configured builtins list into [`Builtins`] flags.
+    /// Resolves the configured `[std] features` list into [`Builtins`] flags.
     ///
-    /// With no explicit list, every builtin is enabled and the ones missing
-    /// their configuration are skipped at registration time. An explicit list
-    /// is strict: unknown names or a listed builtin without its required
-    /// setting fail here.
+    /// With no explicit list, the minimal default set
+    /// ([`Builtins::minimal()`]: `json`, `http`, `log`) is enabled to keep
+    /// the standard library lightweight. An explicit list is strict:
+    /// unknown names or a listed feature without its required setting fail
+    /// here.
     pub fn builtins(&self) -> Result<Builtins> {
-        let Some(names) = &self.builtins else {
-            return Ok(Builtins::all());
+        let Some(names) = &self.std.features else {
+            return Ok(Builtins::minimal());
         };
         let mut builtins = Builtins::empty();
         for name in names {
             let builtin = Builtins::from_config_name(name)
-                .ok_or_else(|| Error::Config(format!("unknown builtin `{name}`")))?;
+                .ok_or_else(|| Error::Config(format!("unknown std feature `{name}`")))?;
             if builtin == Builtins::TEMPLATE && self.templates_dir.is_none() {
                 return Err(Error::Config(
-                    "builtin `template` is enabled but `templates_dir` is not set".into(),
+                    "std feature `template` is enabled but `templates_dir` is not set".into(),
                 ));
             }
             if builtin == Builtins::DATABASE && self.database.is_none() {
                 return Err(Error::Config(
-                    "builtin `db` is enabled but `database` is not set".into(),
+                    "std feature `db` is enabled but `database` is not set".into(),
                 ));
             }
             builtins |= builtin;
@@ -379,7 +399,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nitr_lua::Builtins;
+    use nitr_std::Builtins;
 
     fn write_temp_config(name: &str, content: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("nitr-test-{}-{name}", std::process::id()));
@@ -394,8 +414,8 @@ mod tests {
         assert_eq!(cfg.handler_script, PathBuf::from("scripts/handler.lua"));
         assert!(cfg.workers >= 1);
         assert!(!cfg.dev_mode);
-        // No explicit list enables every builtin.
-        assert_eq!(cfg.builtins().expect("builtins"), Builtins::all());
+        // No explicit list enables the minimal default feature set.
+        assert_eq!(cfg.builtins().expect("builtins"), Builtins::minimal());
         // io/os are opt-in.
         assert!(!cfg.lua.stdlib.iter().any(|s| s == "io" || s == "os"));
     }
@@ -410,7 +430,8 @@ mod tests {
                 database = "app.db"
                 workers = 2
                 dev_mode = true
-                builtins = ["dbg", "json", "db"]
+                [std]
+                features = ["dbg", "json", "db"]
                 [lua]
                 stdlib = ["math", "string", "package"]
                 memory_limit = 1048576
@@ -446,16 +467,18 @@ mod tests {
     }
 
     #[test]
-    fn strict_builtins_require_their_settings() {
+    fn strict_std_features_require_their_settings() {
         let mut cfg = Config {
-            builtins: Some(vec!["db".into()]),
+            std: StdConfig {
+                features: Some(vec!["db".into()]),
+            },
             ..Config::default()
         };
         assert!(cfg.builtins().is_err());
         cfg.database = Some(PathBuf::from("x.db"));
         assert_eq!(cfg.builtins().expect("builtins"), Builtins::DATABASE);
 
-        cfg.builtins = Some(vec!["nope".into()]);
+        cfg.std.features = Some(vec!["nope".into()]);
         assert!(cfg.builtins().is_err());
     }
 

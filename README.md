@@ -115,9 +115,9 @@ Every Nitr API is a field of the global `nitr` table; nothing else is registered
 | `nitr.negotiate(req, offers)` | Content negotiation over the `Accept` header (406 when nothing matches) |
 | `nitr.sse(fn)` | Server-Sent Events stream; `fn(send)` calls `send(event, data)` |
 
-### Builtins
+### Standard library
 
-Enabled via `builtins` in `nitr.toml` (all by default when their settings are present):
+The `nitr.*` standard library provides building blocks — enable the features you need via `[std] features` in `nitr.toml` (default: the minimal `json`, `http`, `log` set), or replace them with your own modules:
 
 | Module | Description |
 | --- | --- |
@@ -144,7 +144,10 @@ templates_dir = "scripts/templates"     # enables `nitr.template`
 database = "scripts/file.db"            # enables `nitr.db`
 workers = 4                             # Lua states; default: CPU cores
 dev_mode = false                        # hot reload + error details
-builtins = ["dbg", "fetch", "template", "json", "db", "http", "log", "crypto"]
+
+[std]
+# `nitr.*` standard library features; default: ["json", "http", "log"]
+features = ["dbg", "fetch", "template", "json", "db", "http", "log", "crypto"]
 
 [lua]
 stdlib = ["math", "table", "string", "utf8", "coroutine", "package"]  # "io"/"os" are opt-in

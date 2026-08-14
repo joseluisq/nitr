@@ -77,7 +77,7 @@ impl UserData for LuaRequest {
                 .filter_map(|v| v.to_str().ok())
                 .collect::<Vec<_>>()
                 .join("; ");
-            Ok(nitr_lua::RequestCookies::parse(&header))
+            Ok(nitr_std::RequestCookies::parse(&header))
         });
     }
 
@@ -92,7 +92,7 @@ impl UserData for LuaRequest {
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("*/*");
             let refs: Vec<&str> = offers.iter().map(String::as_str).collect();
-            Ok(nitr_lua::best_match(accept, &refs).map(|i| offers[i].clone()))
+            Ok(nitr_std::best_match(accept, &refs).map(|i| offers[i].clone()))
         });
 
         methods.add_async_method_mut("read", |lua, mut req, ()| async move {

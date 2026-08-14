@@ -57,6 +57,15 @@ bitflags::bitflags! {
 }
 
 impl Builtins {
+    /// The minimal default feature set enabled when the configuration has
+    /// no explicit `[std] features` list: the JSON codec, the HTTP response
+    /// helpers, and structured logging. These need no external resources
+    /// (templates directory, database file, outbound network) and keep the
+    /// standard library lightweight; everything else is opt-in.
+    pub const fn minimal() -> Self {
+        Self::JSON.union(Self::HTTP).union(Self::LOG)
+    }
+
     /// The field name a builtin mounts under on the `nitr` namespace table.
     ///
     /// Returns `None` for combined flags and for builtins that register

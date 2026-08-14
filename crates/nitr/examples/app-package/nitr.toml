@@ -6,6 +6,11 @@ config_script = "crates/nitr/examples/app-package/config.lua"
 database = "/tmp/nitr-app-package.db"
 tests_dir = "crates/nitr/examples/app-package/tests"
 
+# Opt into the `db` standard library feature on top of the minimal
+# defaults (json, http, log).
+[std]
+features = ["json", "http", "log", "db"]
+
 [static]
 dir = "crates/nitr/examples/app-package/public"
 mount = "/"

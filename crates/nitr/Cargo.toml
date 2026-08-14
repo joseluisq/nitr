@@ -19,7 +19,7 @@ include = ["src/**/*.rs", "Cargo.toml"]
 [dependencies]
 nitr-core = { workspace = true }
 nitr-http = { workspace = true }
-nitr-lua = { workspace = true }
+nitr-std = { workspace = true }
 
 [dev-dependencies]
 mlua = { workspace = true }

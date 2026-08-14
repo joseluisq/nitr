@@ -1,6 +1,6 @@
 [package]
-name = "nitr-lua"
-description = "Built-in Lua globals for Nitr: dbg, fetch, template, json, and the SQLite driver."
+name = "nitr-std"
+description = "The built-in `nitr.*` standard library for Nitr: dbg, fetch, template, json, http, log, crypto, and the SQLite driver."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme = "../../README.md"
-keywords = ["lua", "builtins"]
+keywords = ["lua", "stdlib", "builtins"]
 include = ["src/**/*.rs", "Cargo.toml"]
 
 [dependencies]

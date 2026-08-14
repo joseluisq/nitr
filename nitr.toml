@@ -77,12 +77,15 @@ database = "scripts/file.db"
 # Default: false (also enabled by the --dev flag).
 dev_mode = true
 
-# Built-in `nitr.*` modules exposed to scripts. When omitted, all builtins
-# whose requirements are met are enabled. Valid names: "dbg", "fetch",
-# "template", "json", "db", "http", "log", "crypto". Listing them explicitly
-# is strict: a listed builtin missing its configuration (e.g. "db" without
-# `database`) fails at startup.
-#builtins = ["dbg", "fetch", "template", "json", "db", "http", "log", "crypto"]
+# Standard library (`nitr.*`) modules exposed to scripts. The standard
+# library provides building blocks — opt into the features your scripts
+# need (or replace them with your own modules). When the list is omitted,
+# only a minimal set is enabled: "json", "http", "log". Valid names:
+# "dbg", "fetch", "template", "json", "db", "http", "log", "crypto".
+# Listing a feature is strict: a listed feature missing its configuration
+# (e.g. "db" without `database`) fails at startup.
+[std]
+features = ["dbg", "fetch", "template", "json", "db", "http", "log", "crypto"]
 
 [lua]
 # Lua standard libraries loaded into every state.

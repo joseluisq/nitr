@@ -123,6 +123,12 @@ return app
         .handler_script(&handler)
         .config_script(&config)
         .database(&db_path)
+        .builtins(
+            nitr::Builtins::JSON
+                | nitr::Builtins::HTTP
+                | nitr::Builtins::FETCH
+                | nitr::Builtins::DATABASE,
+        )
         .build()
         .await
         .expect("build server");

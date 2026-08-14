@@ -14,7 +14,7 @@ include = ["src/**/*.rs", "Cargo.toml"]
 
 [dependencies]
 nitr-core = { workspace = true }
-nitr-lua = { workspace = true }
+nitr-std = { workspace = true }
 
 async-channel = { workspace = true }
 bytes = { workspace = true }

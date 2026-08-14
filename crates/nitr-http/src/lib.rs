@@ -20,5 +20,7 @@ pub mod testing;
 
 pub mod service;
 
-pub use config::{Config, FetchConfig, LimitsConfig, LuaConfig, RateLimitConfig, StaticConfig};
+pub use config::{
+    Config, FetchConfig, LimitsConfig, LuaConfig, RateLimitConfig, StaticConfig, StdConfig,
+};
 pub use server::{Server, ServerBuilder};

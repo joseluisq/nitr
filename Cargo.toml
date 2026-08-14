@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "crates/nitr-core",
-    "crates/nitr-lua",
+    "crates/nitr-std",
     "crates/nitr-http",
     "crates/nitr",
     "crates/nitr-cli",
@@ -20,7 +20,7 @@ homepage = "https://github.com/joseluisq/nitr"
 [workspace.dependencies]
 # Workspace crates
 nitr-core = { version = "0.0.0-beta.1", path = "crates/nitr-core" }
-nitr-lua = { version = "0.0.0-beta.1", path = "crates/nitr-lua" }
+nitr-std = { version = "0.0.0-beta.1", path = "crates/nitr-std" }
 nitr-http = { version = "0.0.0-beta.1", path = "crates/nitr-http" }
 nitr = { version = "0.0.0-beta.1", path = "crates/nitr" }
 

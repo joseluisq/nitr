@@ -946,7 +946,7 @@ dependencies = [
  "mlua",
  "nitr-core",
  "nitr-http",
- "nitr-lua",
+ "nitr-std",
  "reqwest",
  "serde_json",
  "tokio",
@@ -992,7 +992,7 @@ dependencies = [
  "mime_guess",
  "mlua",
  "nitr-core",
- "nitr-lua",
+ "nitr-std",
  "percent-encoding",
  "serde",
  "serde_json",
@@ -1004,7 +1004,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "nitr-lua"
+name = "nitr-std"
 version = "0.0.0-beta.1"
 dependencies = [
  "argon2",

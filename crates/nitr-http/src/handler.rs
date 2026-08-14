@@ -280,7 +280,7 @@ pub(crate) fn build_response(
     match lua_resp.raw_get::<LuaValue>("cookies")? {
         LuaValue::Nil => {}
         LuaValue::UserData(ud) => {
-            let cookies = ud.borrow::<nitr_lua::ResponseCookies>().map_err(|_| {
+            let cookies = ud.borrow::<nitr_std::ResponseCookies>().map_err(|_| {
                 Error::Script("the response `cookies` field is not a cookie builder".into())
             })?;
             for value in cookies.values() {

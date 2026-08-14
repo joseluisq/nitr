@@ -11,13 +11,13 @@
 //! dependency for applications and embedders:
 //!
 //! - [`nitr-core`](nitr_core) — the sandboxed Lua runtime and pool,
-//! - [`nitr-lua`](lua) — the built-in `nitr.*` standard library
+//! - [`nitr-std`](stdlib) — the built-in `nitr.*` standard library
 //!   (`nitr.json`, `nitr.fetch`, `nitr.db`, …),
 //! - [`nitr-http`](nitr_http) — the hyper server, configuration, and the
 //!   HTTP/Lua bridge.
 
 // Extern crates
-pub use nitr_lua as lua;
+pub use nitr_std as stdlib;
 
 pub use nitr_http::service;
 pub use nitr_http::testing;
@@ -28,6 +28,6 @@ pub use nitr_core::{
     RuntimePool,
 };
 pub use nitr_http::{
-    Config, FetchConfig, LimitsConfig, LuaConfig, RateLimitConfig, Server, ServerBuilder,
+    Config, FetchConfig, LimitsConfig, LuaConfig, RateLimitConfig, Server, ServerBuilder, StdConfig,
 };
-pub use nitr_lua::{Builtins, BuiltinsEnv};
+pub use nitr_std::{Builtins, BuiltinsEnv};
