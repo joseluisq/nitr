@@ -22,6 +22,7 @@ nitr-http = { workspace = true }
 nitr-std = { workspace = true }
 
 [dev-dependencies]
+flate2 = { workspace = true }
 mlua = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }

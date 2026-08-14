@@ -17,6 +17,7 @@ use hyper::body::{Bytes, Frame};
 use hyper::header::{self, HeaderValue};
 use hyper::{Method, Response, StatusCode};
 
+use crate::compress::{Compression, Encoding};
 use crate::handler::HttpResponse;
 use crate::request::LuaRequest;
 use nitr_core::Result;
@@ -99,6 +100,7 @@ pub(crate) fn base_mounts(cfg: &crate::config::Config) -> Vec<StaticMount> {
 pub(crate) async fn try_serve(
     mounts: &[StaticMount],
     req: &LuaRequest,
+    compression: &Compression,
 ) -> Option<Result<HttpResponse>> {
     if mounts.is_empty() || !matches!(*req.req.method(), Method::GET | Method::HEAD) {
         return None;
@@ -120,12 +122,12 @@ pub(crate) async fn try_serve(
             // Unknown path inside an SPA mount falls back to its index.
             if mount.spa {
                 if let Some(index) = resolve(&mount.dir, "index.html").await {
-                    return Some(serve_file(req, mount, &index).await);
+                    return Some(serve_file(req, mount, &index, compression).await);
                 }
             }
             continue;
         };
-        return Some(serve_file(req, mount, &file).await);
+        return Some(serve_file(req, mount, &file, compression).await);
     }
     None
 }
@@ -167,48 +169,34 @@ async fn resolve(dir: &Path, rel: &str) -> Option<PathBuf> {
     canonical.starts_with(&root).then_some(canonical)
 }
 
-/// Serves one resolved file with conditional-request support.
-async fn serve_file(req: &LuaRequest, mount: &StaticMount, path: &Path) -> Result<HttpResponse> {
-    let meta = match tokio::fs::metadata(path).await {
+/// Serves one resolved file: precompressed sidecar selection, conditional
+/// requests, and range requests.
+async fn serve_file(
+    req: &LuaRequest,
+    mount: &StaticMount,
+    path: &Path,
+    compression: &Compression,
+) -> Result<HttpResponse> {
+    // The bytes may come from a sidecar, but the content type always comes
+    // from the *logical* file: `app.js.br` is still JavaScript.
+    let mime = mime_guess::from_path(path).first_or_octet_stream();
+    let (source, encoding) = pick_source(req, path, compression).await;
+
+    let meta = match tokio::fs::metadata(&source).await {
         Ok(meta) => meta,
         Err(err) => {
-            tracing::error!("failed to stat static file {}: {err}", path.display());
+            tracing::error!("failed to stat static file {}: {err}", source.display());
             return not_found();
         }
     };
     let len = meta.len();
     let modified = meta.modified().ok();
+    // Derived from the served bytes, so each encoding is its own
+    // representation with its own validator.
     let etag = etag_for(len, modified);
 
-    // Conditional requests: If-None-Match wins over If-Modified-Since.
     let headers = req.req.headers();
-    let not_modified = match headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|v| v.to_str().ok())
-    {
-        Some(candidates) => candidates
-            .split(',')
-            .any(|candidate| candidate.trim() == etag),
-        None => match (
-            headers
-                .get(header::IF_MODIFIED_SINCE)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| httpdate::parse_http_date(v).ok()),
-            modified,
-        ) {
-            // HTTP dates have second precision; compare truncated.
-            (Some(since), Some(modified)) => secs_since_epoch(modified) <= secs_since_epoch(since),
-            _ => false,
-        },
-    };
-
-    let mut builder = Response::builder().status(if not_modified {
-        StatusCode::NOT_MODIFIED
-    } else {
-        StatusCode::OK
-    });
-    let mime = mime_guess::from_path(path).first_or_octet_stream();
-    builder = builder
+    let mut builder = Response::builder()
         .header(header::CONTENT_TYPE, mime.as_ref())
         .header(header::ETAG, &etag);
     if let Some(modified) = modified {
@@ -219,48 +207,138 @@ async fn serve_file(req: &LuaRequest, mount: &StaticMount, path: &Path) -> Resul
             builder = builder.header(header::CACHE_CONTROL, value);
         }
     }
-
-    if not_modified {
-        return Ok(builder.body(Empty::<Bytes>::new().boxed())?);
+    // A sidecar is looked for on every request, so which bytes come back
+    // genuinely depends on this header — say so, or a shared cache will
+    // hand brotli to a client that cannot read it.
+    builder = builder.header(header::VARY, "accept-encoding");
+    if let Some(encoding) = encoding {
+        builder = builder.header(header::CONTENT_ENCODING, encoding.token());
     }
-    builder = builder.header(header::CONTENT_LENGTH, len);
+
+    if crate::request::is_fresh(
+        headers,
+        Some(&etag),
+        modified.map(|m| secs_since_epoch(m) as i64),
+    ) {
+        return Ok(builder
+            .status(StatusCode::NOT_MODIFIED)
+            .body(Empty::<Bytes>::new().boxed())?);
+    }
+
+    // Ranges are offered on the representation actually being sent, which
+    // is why this comes after the sidecar decision.
+    builder = builder.header(header::ACCEPT_RANGES, "bytes");
+    let range = crate::range::resolve(headers, len, &etag, modified);
+    if range == crate::range::Resolved::Unsatisfiable {
+        return Ok(builder
+            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+            .header(header::CONTENT_RANGE, format!("bytes */{len}"))
+            .body(Empty::<Bytes>::new().boxed())?);
+    }
+    let (start, count) = match range {
+        crate::range::Resolved::Partial { start, end } => {
+            builder = builder
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{len}"));
+            (start, end - start + 1)
+        }
+        _ => {
+            builder = builder.status(StatusCode::OK);
+            (0, len)
+        }
+    };
+
+    builder = builder.header(header::CONTENT_LENGTH, count);
     if *req.req.method() == Method::HEAD {
+        // Answered without touching the file: a HEAD is a question about
+        // the headers.
         return Ok(builder.body(Empty::<Bytes>::new().boxed())?);
     }
 
-    if len <= INLINE_LIMIT {
-        match tokio::fs::read(path).await {
-            Ok(data) => Ok(builder.body(Full::new(Bytes::from(data)).boxed())?),
+    if count <= INLINE_LIMIT {
+        match read_span(&source, start, count).await {
+            Ok(data) => Ok(builder.body(Full::new(data).boxed())?),
             Err(err) => {
-                tracing::error!("failed to read static file {}: {err}", path.display());
+                tracing::error!("failed to read static file {}: {err}", source.display());
                 not_found()
             }
         }
     } else {
-        Ok(builder.body(stream_file(path.to_path_buf()).await?)?)
+        Ok(builder.body(stream_file(source, start, count).await?)?)
     }
 }
 
-/// Streams a large file through a small bounded channel (same shape as
-/// streaming Lua bodies); a read error mid-stream closes the body.
+/// Chooses the bytes to serve: a precompressed sidecar when the client
+/// accepts its coding and the file is actually there, else the file itself.
+///
+/// This runs regardless of the `[compression]` section: a sidecar was
+/// compressed once at build time, so serving it costs nothing and gives a
+/// better ratio than anything done per request.
+async fn pick_source(
+    req: &LuaRequest,
+    path: &Path,
+    compression: &Compression,
+) -> (PathBuf, Option<Encoding>) {
+    let Some(encoding) = compression.negotiate(req.req.headers().get(header::ACCEPT_ENCODING))
+    else {
+        return (path.to_path_buf(), None);
+    };
+    let mut sidecar = path.as_os_str().to_os_string();
+    sidecar.push(".");
+    sidecar.push(encoding.extension());
+    let sidecar = PathBuf::from(sidecar);
+    match tokio::fs::metadata(&sidecar).await {
+        Ok(meta) if meta.is_file() => (sidecar, Some(encoding)),
+        _ => (path.to_path_buf(), None),
+    }
+}
+
+/// Reads `count` bytes starting at `start`.
+async fn read_span(path: &Path, start: u64, count: u64) -> std::io::Result<Bytes> {
+    use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
+
+    let mut file = tokio::fs::File::open(path).await?;
+    if start > 0 {
+        file.seek(std::io::SeekFrom::Start(start)).await?;
+    }
+    let mut buf = Vec::with_capacity(count as usize);
+    file.take(count).read_to_end(&mut buf).await?;
+    Ok(Bytes::from(buf))
+}
+
+/// Streams `count` bytes from `start` through a small bounded channel (same
+/// shape as streaming Lua bodies); a read error mid-stream closes the body.
 async fn stream_file(
     path: PathBuf,
+    start: u64,
+    count: u64,
 ) -> Result<http_body_util::combinators::BoxBody<Bytes, Infallible>> {
-    use tokio::io::AsyncReadExt as _;
+    use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 
-    let mut file = tokio::fs::File::open(&path).await.map_err(|err| {
+    let open = async {
+        let mut file = tokio::fs::File::open(&path).await?;
+        if start > 0 {
+            file.seek(std::io::SeekFrom::Start(start)).await?;
+        }
+        Ok::<_, std::io::Error>(file)
+    };
+    let mut file = open.await.map_err(|err| {
         nitr_core::Error::Io(std::io::Error::new(
             err.kind(),
             format!("failed to open static file {}: {err}", path.display()),
         ))
     })?;
+
     let (tx, rx) = async_channel::bounded::<std::result::Result<Frame<Bytes>, Infallible>>(2);
     tokio::spawn(async move {
+        let mut remaining = count;
         let mut buf = vec![0u8; FILE_CHUNK];
-        loop {
-            match file.read(&mut buf).await {
+        while remaining > 0 {
+            let want = (remaining as usize).min(FILE_CHUNK);
+            match file.read(&mut buf[..want]).await {
                 Ok(0) => break,
                 Ok(n) => {
+                    remaining -= n as u64;
                     let chunk = Bytes::copy_from_slice(&buf[..n]);
                     if tx.send(Ok(Frame::data(chunk))).await.is_err() {
                         break; // client disconnected

@@ -74,6 +74,8 @@ impl Service<Request<Incoming>> for Svc {
             }),
             params: Vec::new(),
             id,
+            // Replaced with the configured bounds by the handler.
+            limits: Default::default(),
         };
 
         Box::pin(

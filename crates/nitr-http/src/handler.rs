@@ -30,6 +30,9 @@ enum Target {
         error_fn: Option<Function>,
     },
     NotFound,
+    /// An `OPTIONS` on a known path with no `options` route: answered with
+    /// `Allow` rather than handed to the application.
+    Options(Vec<Method>),
     MethodNotAllowed(Vec<Method>),
 }
 
@@ -47,8 +50,11 @@ pub(crate) async fn handle(
 ) -> Result<HttpResponse> {
     let id = req.id.clone();
     let dev_mode = protection.dev_mode();
+    // Kept for the response phase, which runs after the request has been
+    // moved into the Lua state.
+    let head = RequestHead::of(&req);
 
-    let served = AssertUnwindSafe(handle_inner(pool, req, streams, protection))
+    let served = AssertUnwindSafe(handle_inner(pool, req, streams, protection.clone()))
         .catch_unwind()
         .await;
 
@@ -65,7 +71,56 @@ pub(crate) async fn handle(
     if let Ok(value) = header::HeaderValue::from_str(&id) {
         resp.headers_mut().insert("x-request-id", value);
     }
+    if let Some(cors) = protection.cors() {
+        cors.apply(&head.headers, resp.headers_mut());
+    }
+    let encoding = protection.compression().negotiate(head.accept_encoding());
+    resp = protection.compression().apply(resp, encoding);
+    // Last: HEAD is defined as GET with the body removed, so it must see
+    // every header the GET would have had, compression included.
+    if head.method == Method::HEAD {
+        resp = strip_body(resp);
+    }
     Ok(resp)
+}
+
+/// The parts of a request the response phase still needs after the request
+/// itself has been handed to Lua.
+struct RequestHead {
+    method: Method,
+    headers: header::HeaderMap,
+}
+
+impl RequestHead {
+    fn of(req: &LuaRequest) -> Self {
+        Self {
+            method: req.req.method().clone(),
+            headers: req.req.headers().clone(),
+        }
+    }
+
+    fn accept_encoding(&self) -> Option<&header::HeaderValue> {
+        self.headers.get(header::ACCEPT_ENCODING)
+    }
+}
+
+/// Drops the body of a `HEAD` response while keeping every header, so the
+/// response is byte-identical to the `GET` apart from the body itself.
+///
+/// The length the `GET` would have reported is pinned into an explicit
+/// `Content-Length` first: hyper derives that header from the body, and an
+/// emptied body would otherwise advertise `0` — a `HEAD` that lies about
+/// the size of the resource it describes.
+fn strip_body(resp: HttpResponse) -> HttpResponse {
+    use hyper::body::Body as _;
+
+    let (mut parts, body) = resp.into_parts();
+    if !parts.headers.contains_key(header::CONTENT_LENGTH) {
+        if let Some(len) = body.size_hint().exact() {
+            parts.headers.insert(header::CONTENT_LENGTH, len.into());
+        }
+    }
+    HttpResponse::from_parts(parts, Empty::<Bytes>::new().boxed())
 }
 
 /// Best-effort text of a panic payload (`panic!("...")` produces a `&str`
@@ -90,9 +145,17 @@ async fn handle_inner(
     if let Some(rejection) = protection.check(&req) {
         return rejection;
     }
+    // A preflight carries no body and calls no handler: answering it here
+    // keeps a pooled Lua state free for a request that needs one.
+    if let Some(cors) = protection.cors() {
+        if let Some(resp) = cors.preflight(&req.req) {
+            return resp;
+        }
+    }
     // `check` only compared the *declared* length; from here the bytes are
     // counted as the handler reads them.
     let oversized = req.limit_body(protection.max_body_bytes());
+    req.limits = protection.form_limits();
 
     // Bounded wait for a state: past the budget the request is shed rather
     // than queued behind an overloaded pool. Nothing Lua-side has run yet,
@@ -113,7 +176,7 @@ async fn handle_inner(
         }
     }
 
-    let target = match resolve(&rt, &req).await {
+    let target = match resolve(&rt, &req, protection.compression()).await {
         Ok(target) => target,
         Err(err) => {
             tracing::error!("failed to resolve the request route: {err}");
@@ -124,16 +187,19 @@ async fn handle_inner(
     match target {
         Target::Static(resp) => resp,
         Target::NotFound => plain_response(StatusCode::NOT_FOUND, "Not Found"),
+        // An `OPTIONS` on a path that exists is a question about the
+        // resource, not a request the application should have to answer;
+        // RFC 9110 wants `Allow`, not `405`.
+        Target::Options(allowed) => {
+            let mut resp = empty_response(StatusCode::NO_CONTENT)?;
+            resp.headers_mut()
+                .insert(header::ALLOW, crate::cors::allow_header(&allowed));
+            Ok(resp)
+        }
         Target::MethodNotAllowed(allowed) => {
             let mut resp = plain_response(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed")?;
-            let allowed = allowed
-                .iter()
-                .map(Method::as_str)
-                .collect::<Vec<_>>()
-                .join(", ");
-            if let Ok(value) = header::HeaderValue::from_str(&allowed) {
-                resp.headers_mut().insert(header::ALLOW, value);
-            }
+            resp.headers_mut()
+                .insert(header::ALLOW, crate::cors::allow_header(&allowed));
             Ok(resp)
         }
         Target::Chain {
@@ -245,24 +311,42 @@ fn finish(
 
 /// Routes the request in Rust against this state's compiled dispatch
 /// table. Static mounts are consulted after a router miss.
-async fn resolve(rt: &Runtime, req: &LuaRequest) -> Result<Target> {
+async fn resolve(
+    rt: &Runtime,
+    req: &LuaRequest,
+    compression: &crate::compress::Compression,
+) -> Result<Target> {
     let ud = app::state(rt.lua())?;
     let (target, statics): (Target, Arc<Vec<StaticMount>>) = {
         let state = ud.borrow::<AppState>()?;
         let app = &state.dispatch.0;
+        let method = req.req.method();
         let target = match app.router.at(req.req.uri().path()) {
-            Ok(matched) => match matched.value.get(req.req.method()) {
-                Some(&idx) => Target::Chain {
-                    chain: app.chains[idx].clone(),
-                    params: matched
-                        .params
-                        .iter()
-                        .map(|(k, v)| (k.to_string(), v.to_string()))
-                        .collect(),
-                    error_fn: app.error_fn.clone(),
-                },
-                None => Target::MethodNotAllowed(matched.value.keys().cloned().collect()),
-            },
+            Ok(matched) => {
+                // `HEAD` is `GET` without the body, so a `GET` route serves
+                // it; the body is dropped once the response is complete.
+                // An explicit `head` route still wins.
+                let route = matched.value.get(method).or_else(|| {
+                    (*method == Method::HEAD)
+                        .then(|| matched.value.get(&Method::GET))
+                        .flatten()
+                });
+                match route {
+                    Some(&idx) => Target::Chain {
+                        chain: app.chains[idx].clone(),
+                        params: matched
+                            .params
+                            .iter()
+                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                            .collect(),
+                        error_fn: app.error_fn.clone(),
+                    },
+                    None if *method == Method::OPTIONS => {
+                        Target::Options(matched.value.keys().cloned().collect())
+                    }
+                    None => Target::MethodNotAllowed(matched.value.keys().cloned().collect()),
+                }
+            }
             Err(_) => Target::NotFound,
         };
         (target, state.statics.clone())
@@ -270,13 +354,21 @@ async fn resolve(rt: &Runtime, req: &LuaRequest) -> Result<Target> {
 
     Ok(match target {
         Target::NotFound if !statics.is_empty() => {
-            match static_files::try_serve(&statics, req).await {
+            match static_files::try_serve(&statics, req, compression).await {
                 Some(resp) => Target::Static(resp),
                 None => target,
             }
         }
         other => other,
     })
+}
+
+/// A response with no body at all (not even a zero-length one), for the
+/// statuses where a body is forbidden.
+pub(crate) fn empty_response(status: StatusCode) -> Result<HttpResponse> {
+    Ok(Response::builder()
+        .status(status)
+        .body(Empty::<Bytes>::new().boxed())?)
 }
 
 pub(crate) fn plain_response(status: StatusCode, body: &'static str) -> Result<HttpResponse> {
@@ -291,11 +383,38 @@ pub(crate) fn plain_response(status: StatusCode, body: &'static str) -> Result<H
 /// values may be a string or an array of strings (multi-value headers such
 /// as `Set-Cookie`).
 fn to_response(lua_resp: LuaTable) -> Result<HttpResponse> {
-    let body = lua_resp
-        .raw_get::<Option<LuaString>>("body")?
+    let body = lua_resp.raw_get::<Option<LuaString>>("body")?;
+    let len = body.as_ref().map_or(0, |b| b.as_bytes().len());
+    let body = body
         .map(|b| Full::new(Bytes::copy_from_slice(&b.as_bytes())).boxed())
         .unwrap_or_else(|| Empty::<Bytes>::new().boxed());
-    build_response(&lua_resp, body)
+    let resp = build_response(&lua_resp, body)?;
+    reject_forbidden_body(resp.status(), len)?;
+    Ok(resp)
+}
+
+/// Rejects a response whose status forbids a body.
+///
+/// A `204` or `304` carrying bytes is not a cosmetic problem: the framing
+/// rules say there is no body there, so a client that believes the status
+/// reads those bytes as the start of the *next* response on a keep-alive
+/// connection. Better to fail the response than desynchronize the
+/// connection.
+fn reject_forbidden_body(status: StatusCode, len: usize) -> Result {
+    if len == 0 {
+        return Ok(());
+    }
+    if status == StatusCode::NO_CONTENT
+        || status == StatusCode::NOT_MODIFIED
+        || status.is_informational()
+    {
+        return Err(Error::Script(format!(
+            "a {status} response must not carry a body ({len} bytes given): \
+             the status says there is nothing to read, and a client that \
+             believes it would parse the body as the next response"
+        )));
+    }
+    Ok(())
 }
 
 /// Builds an HTTP response from the table's status/headers/cookies around

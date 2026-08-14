@@ -61,6 +61,10 @@ pub struct Config {
     pub fetch: FetchConfig,
     /// Graceful-shutdown timing (`[shutdown]` section).
     pub shutdown: ShutdownConfig,
+    /// Response compression (`[compression]` section).
+    pub compression: CompressionConfig,
+    /// Cross-origin resource sharing (`[cors]` section).
+    pub cors: CorsConfig,
     /// Static file serving (`[static]` section).
     #[serde(rename = "static")]
     pub static_files: StaticConfig,
@@ -109,6 +113,16 @@ pub struct LimitsConfig {
     /// so an overloaded server answers quickly instead of queueing work
     /// nobody is still waiting for.
     pub pool_wait_ms: u64,
+    /// Maximum number of parts in a `multipart/form-data` body.
+    pub max_form_parts: usize,
+    /// Maximum size of a single non-file form field, in bytes. Fields
+    /// become Lua strings, so this bounds what a request can push into a
+    /// state's heap.
+    pub max_field_bytes: u64,
+    /// Maximum size of a single uploaded file, in bytes. Files stream to
+    /// disk in Rust and never enter the Lua heap, so this is far larger
+    /// than [`max_field_bytes`](Self::max_field_bytes).
+    pub max_file_bytes: u64,
 }
 
 impl Default for LimitsConfig {
@@ -122,6 +136,9 @@ impl Default for LimitsConfig {
             // rather than sheds, short enough that a saturated server fails
             // fast instead of accumulating doomed requests.
             pool_wait_ms: 5_000,
+            max_form_parts: 64,
+            max_field_bytes: 64 * 1024,       // 64 KiB
+            max_file_bytes: 10 * 1024 * 1024, // 10 MiB
         }
     }
 }
@@ -218,6 +235,70 @@ pub struct StaticConfig {
     pub cache_control: Option<String>,
 }
 
+/// Response compression (`[compression]` section).
+///
+/// Off by default: compression turns a CPU-cheap server into a
+/// CPU-spending one, and that should be a decision, not a surprise. One
+/// line enables it. Precompressed sidecars (`app.js.br` next to `app.js`)
+/// are served regardless of this section — they cost nothing at runtime.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CompressionConfig {
+    /// Whether responses are compressed on the fly.
+    pub enabled: bool,
+    /// Algorithms offered, best first. Valid names: `"br"`, `"gzip"`.
+    pub algorithms: Vec<String>,
+    /// Responses smaller than this are sent uncompressed: below roughly a
+    /// packet, compression costs more than it saves.
+    pub min_size: u64,
+    /// Content types to compress. A trailing `*` matches a prefix, so
+    /// `"text/*"` covers every text subtype. Already-compressed types
+    /// (images, video, archives) are skipped even when listed.
+    pub types: Vec<String>,
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            algorithms: vec!["br".into(), "gzip".into()],
+            min_size: 1024,
+            types: [
+                "text/*",
+                "application/json",
+                "application/javascript",
+                "application/xml",
+                "image/svg+xml",
+            ]
+            .map(String::from)
+            .to_vec(),
+        }
+    }
+}
+
+/// Cross-origin resource sharing (`[cors]` section).
+///
+/// Enforced in Rust: a preflight never reaches a Lua state, and the policy
+/// is auditable in one place instead of spread across middleware.
+/// Disabled until `origins` is set.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CorsConfig {
+    /// Allowed origins, or `["*"]` for any. Unset disables CORS entirely.
+    pub origins: Option<Vec<String>>,
+    /// Methods allowed on cross-origin requests.
+    pub methods: Option<Vec<String>>,
+    /// Request headers a preflight may approve.
+    pub headers: Option<Vec<String>>,
+    /// Response headers scripts on other origins may read.
+    pub expose_headers: Option<Vec<String>>,
+    /// Allow credentialed requests (cookies, `Authorization`). Cannot be
+    /// combined with `origins = ["*"]`.
+    pub credentials: bool,
+    /// How long (seconds) a browser may cache a preflight result.
+    pub max_age: Option<u64>,
+}
+
 /// Per-client-IP fixed-window rate limiting (`[rate_limit]` section).
 /// Disabled by default; rejections answer 429 with a `Retry-After` header.
 #[derive(Debug, Clone, Deserialize)]
@@ -276,6 +357,8 @@ impl Default for Config {
             rate_limit: RateLimitConfig::default(),
             fetch: FetchConfig::default(),
             shutdown: ShutdownConfig::default(),
+            compression: CompressionConfig::default(),
+            cors: CorsConfig::default(),
             static_files: StaticConfig::default(),
             tests_dir: None,
             lua: LuaConfig::default(),
@@ -318,7 +401,7 @@ impl Config {
     /// values: `NITR_LISTEN`, `NITR_HANDLER_SCRIPT`, `NITR_CONFIG_SCRIPT`,
     /// `NITR_TEMPLATES_DIR`, `NITR_DATABASE`, `NITR_WORKERS`, `NITR_MAX_STREAMS`,
     /// `NITR_DEV_MODE`, `NITR_LUA_MEMORY_LIMIT`, `NITR_LUA_EXEC_TIMEOUT_MS`,
-    /// `NITR_POOL_WAIT_MS`, `NITR_SHUTDOWN_GRACE`.
+    /// `NITR_POOL_WAIT_MS`, `NITR_SHUTDOWN_GRACE`, `NITR_COMPRESSION`.
     pub fn apply_env(&mut self) -> Result {
         if let Some(v) = env_var("NITR_LISTEN") {
             self.listen = parse_env("NITR_LISTEN", &v)?;
@@ -355,6 +438,38 @@ impl Config {
         }
         if let Some(v) = env_var("NITR_SHUTDOWN_GRACE") {
             self.shutdown.grace = parse_env("NITR_SHUTDOWN_GRACE", &v)?;
+        }
+        if let Some(v) = env_var("NITR_COMPRESSION") {
+            self.compression.enabled = parse_env("NITR_COMPRESSION", &v)?;
+        }
+        Ok(())
+    }
+
+    /// Rejects configurations that parse but cannot be honored.
+    ///
+    /// Called once at startup so a contradiction is a loud failure rather
+    /// than a subtle runtime surprise — a browser silently ignoring a
+    /// header combination is much harder to debug than a refused boot.
+    pub(crate) fn validate(&self) -> Result {
+        let any_origin = self
+            .cors
+            .origins
+            .as_ref()
+            .is_some_and(|o| o.iter().any(|o| o == "*"));
+        if any_origin && self.cors.credentials {
+            return Err(Error::Config(
+                "[cors] origins = [\"*\"] cannot be combined with credentials = true: \
+                 browsers reject `Access-Control-Allow-Origin: *` on a credentialed \
+                 request. List the allowed origins explicitly."
+                    .into(),
+            ));
+        }
+        for name in &self.compression.algorithms {
+            if !matches!(name.as_str(), "br" | "gzip") {
+                return Err(Error::Config(format!(
+                    "unknown [compression] algorithm `{name}`: expected \"br\" or \"gzip\""
+                )));
+            }
         }
         Ok(())
     }

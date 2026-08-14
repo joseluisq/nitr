@@ -81,6 +81,8 @@ impl TestClient {
             req,
             params: Vec::new(),
             id,
+            // Replaced with the configured bounds by the handler.
+            limits: Default::default(),
         };
 
         let pool = current_pool(&self.pool);

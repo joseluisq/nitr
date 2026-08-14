@@ -137,6 +137,35 @@ pub(crate) fn register(lua: &Lua, nitr: &Table) -> mlua::Result<()> {
         })?,
     )?;
 
+    // nitr.etag(value) — a validator for a dynamic response.
+    //
+    // Static files get conditional requests for free; dynamic ones cannot,
+    // because only the application knows what identifies a resource. This
+    // turns whatever it names — a row version, an updated_at, a rendered
+    // body — into a well-formed entity tag, so `req:fresh()` has something
+    // exact to compare against.
+    nitr.set(
+        "etag",
+        lua.create_function(|lua, (value, weak): (Value, Option<bool>)| {
+            let bytes = match &value {
+                Value::String(s) => s.as_bytes().to_vec(),
+                Value::Integer(n) => n.to_string().into_bytes(),
+                Value::Number(n) => n.to_string().into_bytes(),
+                other => serde_json::to_vec(other).into_lua_err()?,
+            };
+            // Hashed rather than embedded verbatim: the input may contain
+            // anything, and a header value may not.
+            let digest = <Sha256 as sha2::Digest>::digest(&bytes);
+            let tag = digest[..8].iter().fold(String::new(), |mut acc, byte| {
+                use std::fmt::Write as _;
+                let _ = write!(acc, "{byte:02x}");
+                acc
+            });
+            let prefix = if weak.unwrap_or(false) { "W/" } else { "" };
+            lua.create_string(format!("{prefix}\"{tag}\""))
+        })?,
+    )?;
+
     Ok(())
 }
 

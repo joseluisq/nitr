@@ -49,6 +49,34 @@ database = "scripts/file.db"
 #pool_wait_ms = 5000         # how long a request waits for a free Lua state
                              # before it is shed with 503 + Retry-After;
                              # 0 waits forever
+#max_form_parts = 64         # parts allowed in a multipart/form-data body
+#max_field_bytes = 65536     # per non-file form field; these become Lua
+                             # strings, so this bounds the state's heap
+#max_file_bytes = 10485760   # per uploaded file; files stream to disk in
+                             # Rust and never enter the Lua heap. Raise
+                             # `max_body_bytes` too — it bounds the whole
+                             # request, uploads included.
+
+# Response compression. Off by default: it trades the server's CPU for
+# bandwidth, and that should be a decision rather than a surprise.
+# Precompressed sidecars (`app.js.br` next to `app.js`) are served whenever
+# they exist, regardless of this section — they cost nothing at runtime.
+#[compression]
+#enabled = true
+#algorithms = ["br", "gzip"]  # offered best-first; the server's order wins
+#min_size = 1024              # below this, compressing costs more than it saves
+#types = ["text/*", "application/json", "application/javascript"]
+
+# Cross-origin resource sharing, enforced in Rust: a preflight is answered
+# without reaching a Lua state. Disabled until `origins` is set.
+#[cors]
+#origins = ["https://app.example.com"]  # or ["*"] for a public API
+#methods = ["GET", "POST"]
+#headers = ["content-type", "authorization"]
+#expose_headers = ["x-request-id"]
+#credentials = false          # cannot be combined with origins = ["*"];
+                              # the server refuses to start if it is
+#max_age = 86400              # seconds a browser may cache the preflight
 
 # Graceful shutdown. On SIGTERM/SIGINT the server stops accepting, stops
 # reporting ready, lets in-flight work finish, and only then exits. A drain

@@ -30,6 +30,12 @@ pub(crate) struct Protection {
     /// How long a request may wait for a Lua state before it is shed.
     pool_wait: Duration,
     rate: Option<RateLimiter>,
+    /// Body-parsing bounds handed to each request.
+    form: crate::request::FormLimits,
+    /// The compiled `[cors]` policy; `None` when CORS is not configured.
+    cors: Option<crate::cors::Cors>,
+    /// The compiled `[compression]` policy.
+    compression: crate::compress::Compression,
     /// Static mounts from the `[static]` configuration, appended to the
     /// script's own mounts on every (re)load.
     base_statics: Vec<crate::static_files::StaticMount>,
@@ -49,8 +55,30 @@ impl Protection {
                 trust_forwarded_for: cfg.rate_limit.trust_forwarded_for,
                 buckets: Mutex::new(HashMap::new()),
             }),
+            form: crate::request::FormLimits {
+                max_parts: cfg.limits.max_form_parts.max(1),
+                max_field_bytes: cfg.limits.max_field_bytes,
+                max_file_bytes: cfg.limits.max_file_bytes,
+            },
+            cors: crate::cors::Cors::new(&cfg.cors),
+            compression: crate::compress::Compression::new(&cfg.compression),
             base_statics: crate::static_files::base_mounts(cfg),
         }
+    }
+
+    /// The compiled CORS policy, or `None` when CORS is not configured.
+    pub(crate) fn cors(&self) -> Option<&crate::cors::Cors> {
+        self.cors.as_ref()
+    }
+
+    /// The compiled compression policy.
+    pub(crate) fn compression(&self) -> &crate::compress::Compression {
+        &self.compression
+    }
+
+    /// Body-parsing bounds handed to each request.
+    pub(crate) fn form_limits(&self) -> crate::request::FormLimits {
+        self.form
     }
 
     /// The `[static]` mounts merged into every state's dispatch table.

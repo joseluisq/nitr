@@ -17,14 +17,17 @@ nitr-core = { workspace = true }
 nitr-std = { workspace = true }
 
 async-channel = { workspace = true }
+brotli = { workspace = true }
 futures-util = { workspace = true }
 bytes = { workspace = true }
+flate2 = { workspace = true }
 http-body-util = { workspace = true }
 httpdate = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 matchit = { workspace = true }
 mime_guess = { workspace = true }
+multer = { workspace = true }
 mlua = { workspace = true }
 percent-encoding = { workspace = true }
 serde = { workspace = true }

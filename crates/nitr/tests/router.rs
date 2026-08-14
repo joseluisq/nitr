@@ -138,7 +138,9 @@ async fn routes_middleware_and_errors_end_to_end() {
         .await
         .expect("DELETE /users/42");
     assert_eq!(resp.status(), 405);
-    assert_eq!(resp.headers()["allow"], "GET");
+    // HEAD and OPTIONS are advertised because Nitr answers them itself,
+    // without the route having to be registered.
+    assert_eq!(resp.headers()["allow"], "GET, HEAD, OPTIONS");
 
     // 404 for an unregistered path: Lua is never invoked.
     let resp = client

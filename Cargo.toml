@@ -30,8 +30,12 @@ argon2 = "0.5"
 async-channel = "2.3"
 base64 = "0.22"
 bitflags = "2.9"
+# `default-features = false` drops the C/ffi and std-alloc extras; the pure
+# Rust encoder is all the response compressor needs.
+brotli = { version = "8.0", default-features = false, features = ["std"] }
 bytes = "1.12"
 cookie = "0.18"
+flate2 = "1.1"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 getrandom = "0.2"
 hmac = "0.12"
@@ -44,6 +48,7 @@ hyper-util = { version = "0.1.11", features = ["full"] }
 matchit = "0.8"
 mime_guess = "2.0"
 minijinja = { version = "2.24.0", features = ["loader"] }
+multer = "3.1"
 percent-encoding = "2.3"
 mlua = { version = "0.12", features = ["async", "macros", "lua54", "serialize", "vendored", "anyhow", "send"] }
 reqwest = { version = "0.12.15", features = ["json"] }

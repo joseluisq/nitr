@@ -18,7 +18,8 @@ Nitr is both a **binary** (`nitr`, configured via `nitr.toml`) and a **library c
 - **Safety by default**: `io`/`os` excluded from the stdlib (opt-in), 8 MiB memory limit per state, 30 s execution budget enforced by an instruction-count hook (stops `while true do end`) plus an async timeout, `require` confined to the scripts directory, no native Lua modules.
 - **One namespaced standard library:** `nitr.json`, `nitr.fetch` (HTTP client with SSRF policy), `nitr.template` (minijinja), `nitr.db` (SQLite, runs off the async threads), `nitr.log`, `nitr.crypto`/`nitr.auth`, `nitr.dbg`.
 - **Rust-side routing (`nitr.app()`):** path parameters, middleware chains composed once at load, per-app error handler, 404/405 answered without entering Lua.
-- **HTTP correctness:** binary-safe request/response bodies, multi-value headers (`Set-Cookie`), parsed query strings, graceful shutdown, no Lua tracebacks leaked to clients (unless dev mode).
+- **HTTP correctness:** binary-safe request/response bodies, multi-value headers (`Set-Cookie`), parsed query strings, `HEAD`/`OPTIONS` answered without a route, conditional requests, graceful shutdown, no Lua tracebacks leaked to clients (unless dev mode).
+- **The rest of HTTP, in Rust:** range requests (`206`/`416`, `If-Range`), response compression (brotli/gzip plus precompressed `.br`/`.gz` sidecars), CORS policy with preflights answered before Lua runs, `req:form()` for urlencoded bodies, and `req:multipart()` uploads that stream to disk without ever entering the Lua heap.
 - **Easy configuration:** `nitr.toml` configuration with `NITR_*` environment overrides and CLI flags.
 - **Dev mode (`--dev`)**: handler hot reload and error details in responses.
 - **Extensible:** `ServerBuilder::module("name", ...)` mounts a Rust table at `nitr.name` in every Lua state, third-party extension crates need no fork.

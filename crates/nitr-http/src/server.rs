@@ -368,6 +368,9 @@ impl ServerBuilder {
     /// compiles the handler. Fails fast on any configuration or script error.
     pub async fn build(self) -> Result<Server> {
         let cfg = self.cfg;
+        // A contradictory policy fails the boot rather than surfacing later
+        // as a header combination a browser quietly ignores.
+        cfg.validate()?;
         let builtins = match self.builtins {
             Some(b) => b,
             None => cfg.builtins()?,
