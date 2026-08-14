@@ -969,6 +969,7 @@ dependencies = [
  "bitflags",
  "bytes",
  "cookie",
+ "futures-util",
  "hmac",
  "minijinja",
  "mlua",
@@ -979,6 +980,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

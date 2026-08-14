@@ -56,6 +56,8 @@ pub struct Config {
     pub limits: LimitsConfig,
     /// Per-client rate limiting (`[rate_limit]` section).
     pub rate_limit: RateLimitConfig,
+    /// Outbound-request policy for the `fetch` builtin (`[fetch]` section).
+    pub fetch: FetchConfig,
     /// Lua runtime settings.
     pub lua: LuaConfig,
 }
@@ -84,6 +86,46 @@ impl Default for LimitsConfig {
             max_header_bytes: 16 * 1024, // 16 KiB
             max_uri_bytes: 8 * 1024,     // 8 KiB
             max_connections: 1024,
+        }
+    }
+}
+
+/// Outbound-request policy for the `fetch` builtin (`[fetch]` section).
+/// By default, requests to loopback/private/link-local addresses are
+/// refused (SSRF protection) and every redirect hop is re-checked.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FetchConfig {
+    /// When set, only these exact host names may be fetched.
+    pub allowed_hosts: Option<Vec<String>>,
+    /// Allow requests to private/loopback/link-local addresses.
+    pub allow_private_networks: bool,
+    /// Maximum response body accumulated by `resp:text()`/`resp:json()`.
+    pub max_response_bytes: u64,
+    /// Maximum concurrent requests per `await_all(...)` call.
+    pub max_concurrent: usize,
+}
+
+impl Default for FetchConfig {
+    fn default() -> Self {
+        let defaults = nitr_lua::FetchOptions::default();
+        Self {
+            allowed_hosts: defaults.allowed_hosts,
+            allow_private_networks: defaults.allow_private_networks,
+            max_response_bytes: defaults.max_response_bytes,
+            max_concurrent: defaults.max_concurrent,
+        }
+    }
+}
+
+impl FetchConfig {
+    /// The runtime policy handed to the `fetch` builtin.
+    pub fn options(&self) -> nitr_lua::FetchOptions {
+        nitr_lua::FetchOptions {
+            allowed_hosts: self.allowed_hosts.clone(),
+            allow_private_networks: self.allow_private_networks,
+            max_response_bytes: self.max_response_bytes,
+            max_concurrent: self.max_concurrent.max(1),
         }
     }
 }
@@ -144,6 +186,7 @@ impl Default for Config {
             trust_request_id: false,
             limits: LimitsConfig::default(),
             rate_limit: RateLimitConfig::default(),
+            fetch: FetchConfig::default(),
             lua: LuaConfig::default(),
         }
     }

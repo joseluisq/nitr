@@ -24,5 +24,7 @@ pub use nitr_http::service;
 pub use nitr_core::{
     DeadlineHandle, Error, Result, Runtime, RuntimeGuard, RuntimeOpts, RuntimePool,
 };
-pub use nitr_http::{Config, LimitsConfig, LuaConfig, RateLimitConfig, Server, ServerBuilder};
+pub use nitr_http::{
+    Config, FetchConfig, LimitsConfig, LuaConfig, RateLimitConfig, Server, ServerBuilder,
+};
 pub use nitr_lua::{Builtins, BuiltinsEnv};

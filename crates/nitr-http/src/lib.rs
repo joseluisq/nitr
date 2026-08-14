@@ -17,5 +17,5 @@ pub(crate) mod stream;
 
 pub mod service;
 
-pub use config::{Config, LimitsConfig, LuaConfig, RateLimitConfig};
+pub use config::{Config, FetchConfig, LimitsConfig, LuaConfig, RateLimitConfig};
 pub use server::{Server, ServerBuilder};

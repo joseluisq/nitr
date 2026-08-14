@@ -18,6 +18,7 @@ pub(crate) mod log;
 pub(crate) mod template;
 pub(crate) mod utils;
 
+pub use fetch::FetchOptions;
 pub use http::{best_match, RequestCookies, ResponseCookies};
 
 bitflags::bitflags! {
@@ -83,6 +84,8 @@ pub struct BuiltinsEnv {
     pub templates_dir: Option<PathBuf>,
     /// SQLite database file the `conn` builtin connects to.
     pub database: Option<PathBuf>,
+    /// Outbound-request policy for the `fetch` builtin.
+    pub fetch: FetchOptions,
 }
 
 /// Registers the selected **built-in** globals (`dbg`, `fetch`, `template`,
@@ -100,7 +103,12 @@ pub fn register_builtins(lua: &mlua::Lua, builtins: Builtins, env: &BuiltinsEnv)
         };
         match builtin {
             Builtins::DEBUG => globals.set(name, utils::create_debug_fn(lua)?)?,
-            Builtins::FETCH => globals.set(name, fetch::create_fetch_fn(lua)?)?,
+            // Also registers `await_all` for concurrent requests.
+            Builtins::FETCH => {
+                let opts = std::sync::Arc::new(env.fetch.clone());
+                globals.set(name, fetch::create_fetch_fn(lua, opts.clone())?)?;
+                globals.set("await_all", fetch::create_await_all_fn(lua, opts)?)?;
+            }
             Builtins::TEMPLATE => match &env.templates_dir {
                 Some(dir) => globals.set(name, template::create_template_fn(lua, dir)?)?,
                 None => {

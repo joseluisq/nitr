@@ -53,6 +53,15 @@ database = "scripts/file.db"
 #window = 60                 # window length in seconds
 #trust_forwarded_for = false # key by X-Forwarded-For (only behind a proxy)
 
+# Outbound-request policy for the `fetch` builtin. By default requests to
+# loopback/private/link-local addresses are refused (SSRF protection) and
+# every redirect hop is re-checked against this policy.
+#[fetch]
+#allowed_hosts = ["api.example.com"] # exact-host allow-list (all hops)
+#allow_private_networks = false      # permit loopback/RFC1918 targets
+#max_response_bytes = 8388608        # cap on resp:text()/resp:json() bodies
+#max_concurrent = 8                  # max requests per await_all(...)
+
 # Development mode: hot-reload the handler script on change.
 # Default: false (also enabled by the --dev flag).
 dev_mode = true

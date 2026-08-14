@@ -31,6 +31,7 @@ base64 = "0.22"
 bitflags = "2.9"
 bytes = "1.12"
 cookie = "0.18"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 hmac = "0.12"
 sha2 = "0.10"
 http = "1.3"

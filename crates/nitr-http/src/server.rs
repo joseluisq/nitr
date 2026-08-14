@@ -284,6 +284,7 @@ fn new_runtime(cfg: &Config, builtins: Builtins, setup_fns: &[SetupFn]) -> Resul
     let env = nitr_lua::BuiltinsEnv {
         templates_dir: cfg.templates_dir.clone(),
         database: cfg.database.clone(),
+        fetch: cfg.fetch.options(),
     };
     nitr_lua::register_builtins(rt.lua(), builtins, &env)?;
     app::register_nitr_global(rt.lua())?;

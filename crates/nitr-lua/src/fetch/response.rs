@@ -3,15 +3,41 @@ use mlua::{ExternalResult, LuaSerdeExt, UserData, UserDataFields, UserDataMethod
 use reqwest::Response;
 use serde_json::Value as SerdeValue;
 
-pub(crate) struct LuaResponse(pub(crate) Response);
+pub(crate) struct LuaResponse {
+    resp: Response,
+    /// Cap on the body size accumulated by `text()`/`json()`.
+    max_bytes: u64,
+}
+
+impl LuaResponse {
+    pub(crate) fn new(resp: Response, max_bytes: u64) -> Self {
+        Self { resp, max_bytes }
+    }
+}
+
+/// Reads the whole body into memory, enforcing the response-size cap.
+async fn collect_body(resp: &mut LuaResponse) -> mlua::Result<bytes::Bytes> {
+    let len = resp.resp.content_length().unwrap_or_default() as usize;
+    let mut buf = BytesMut::with_capacity(len.min(resp.max_bytes as usize));
+    while let Some(chunk) = resp.resp.chunk().await.into_lua_err()? {
+        if (buf.len() + chunk.len()) as u64 > resp.max_bytes {
+            return Err(mlua::Error::RuntimeError(format!(
+                "response body exceeds fetch.max_response_bytes ({} bytes)",
+                resp.max_bytes
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf.freeze())
+}
 
 impl UserData for LuaResponse {
     fn add_fields<'lua, F: UserDataFields<Self>>(fields: &mut F) {
-        fields.add_field_method_get("status", |_, resp| Ok(resp.0.status().as_u16()));
+        fields.add_field_method_get("status", |_, resp| Ok(resp.resp.status().as_u16()));
 
         fields.add_field_method_get("url", |lua, resp| {
             let table = lua.create_table()?;
-            let url = resp.0.url();
+            let url = resp.resp.url();
 
             table
                 .set("scheme", url.scheme().to_string())
@@ -34,7 +60,7 @@ impl UserData for LuaResponse {
         });
 
         fields.add_field_method_get("headers", |lua, resp| {
-            let headers = resp.0.headers();
+            let headers = resp.resp.headers();
             let table = lua.create_table().into_lua_err()?;
             for (k, v) in headers.iter() {
                 table
@@ -44,39 +70,31 @@ impl UserData for LuaResponse {
             Ok(table)
         });
 
-        fields.add_field_method_get("content_length", |_, resp| Ok(resp.0.content_length()));
+        fields.add_field_method_get("content_length", |_, resp| Ok(resp.resp.content_length()));
     }
 
     fn add_methods<'lua, M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_async_method_mut("read", |lua, mut resp, ()| async move {
-            if let Some(chunk) = resp.0.chunk().await.into_lua_err()? {
+            if let Some(chunk) = resp.resp.chunk().await.into_lua_err()? {
                 return Some(lua.create_string(chunk)).transpose();
             }
             Ok(None)
         });
 
         methods.add_async_method_mut("json", |lua, mut resp, ()| async move {
-            let len = resp.0.content_length().unwrap_or_default() as usize;
-            let mut buf = BytesMut::with_capacity(len);
-            while let Some(b) = resp.0.chunk().await.into_lua_err()? {
-                buf.extend_from_slice(&b);
-            }
+            let buf = collect_body(&mut resp).await?;
             if buf.is_empty() {
                 return Err(mlua::Error::external(
                     "Unexpected end of JSON input, probably response body is empty or already consumed",
                 ));
             }
-            let json = serde_json::from_slice::<SerdeValue>(&buf.freeze()).into_lua_err()?;
+            let json = serde_json::from_slice::<SerdeValue>(&buf).into_lua_err()?;
             lua.to_value(&json)
         });
 
         methods.add_async_method_mut("text", |lua, mut resp, ()| async move {
-            let len = resp.0.content_length().unwrap_or_default() as usize;
-            let mut buf = BytesMut::with_capacity(len);
-            while let Some(b) = resp.0.chunk().await.into_lua_err()? {
-                buf.extend_from_slice(&b);
-            }
-            lua.create_string(buf.freeze())
+            let buf = collect_body(&mut resp).await?;
+            lua.create_string(buf)
         });
     }
 }
