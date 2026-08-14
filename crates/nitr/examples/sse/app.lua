@@ -1,14 +1,15 @@
--- Server-Sent Events: sse(fn) builds a streaming text/event-stream
+-- Server-Sent Events: nitr.sse(fn) builds a streaming text/event-stream
 -- response; send(event, data) writes one event (tables are JSON-encoded).
 --
--- `sleep` is a custom Rust global registered by main.rs via setup() — it
--- suspends this state's coroutine on the tokio timer, so the pacing costs
--- no execution budget and blocks nothing.
+-- `nitr.time` is a custom Rust module registered by main.rs via
+-- ServerBuilder::module() — nitr.time.sleep(ms) suspends this state's
+-- coroutine on the tokio timer, so the pacing costs no execution budget
+-- and blocks nothing.
 
 local app = nitr.app()
 
 app:get("/", function(req)
-    return html([[
+    return nitr.html([[
 <!doctype html>
 <ul id="log"></ul>
 <script>
@@ -25,10 +26,10 @@ app:get("/", function(req)
 end)
 
 app:get("/events", function(req)
-    return sse(function(send)
+    return nitr.sse(function(send)
         for i = 1, 5 do
             send("tick", { count = i })
-            sleep(1)
+            nitr.time.sleep(1000)
         end
         send("done", "stream finished")
     end)

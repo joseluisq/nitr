@@ -1,6 +1,6 @@
-//! API aggregation + transactions: `await_all` fans out concurrent
-//! `fetch` requests (here against the server's own endpoints), and
-//! `conn:transaction` groups SQLite statements atomically.
+//! API aggregation + transactions: `nitr.await_all` fans out concurrent
+//! `nitr.fetch` requests (here against the server's own endpoints), and
+//! `nitr.db:transaction` groups SQLite statements atomically.
 //!
 //! The fetch policy refuses private/loopback targets by default (SSRF
 //! protection); this example opts in because it aggregates itself over
@@ -11,7 +11,7 @@
 //! ```sh
 //! cargo run --example aggregate
 //!
-//! curl 'http://127.0.0.1:3000/dashboard'      # await_all over /api/*
+//! curl 'http://127.0.0.1:3000/dashboard'      # nitr.await_all over /api/*
 //! curl -X POST 'http://127.0.0.1:3000/transfer?from=alice&to=bob&amount=30'
 //! curl 'http://127.0.0.1:3000/accounts'
 //! curl -X POST 'http://127.0.0.1:3000/transfer?from=alice&to=bob&amount=9999'

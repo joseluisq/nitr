@@ -10,7 +10,7 @@ const APP_SCRIPT: &str = r#"
 local app = nitr.app()
 
 app:get("/plain", function(req)
-    return text("plain")
+    return nitr.text("plain")
 end)
 
 app:get("/stream", function(req)
@@ -39,7 +39,7 @@ app:get("/iterator", function(req)
 end)
 
 app:get("/events", function(req)
-    return sse(function(send)
+    return nitr.sse(function(send)
         send("message", { hello = "world" })
         send("tick", "line1\nline2")
     end)

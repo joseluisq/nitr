@@ -9,6 +9,7 @@ use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::graceful::GracefulShutdown;
 use mlua::AnyUserData;
+use nitr_core::ModuleFn;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 
@@ -26,8 +27,12 @@ const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long to wait for in-flight requests on shutdown.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
-/// A closure that customizes each pooled Lua state (custom globals/modules).
+/// A closure that customizes each pooled Lua state (advanced escape hatch;
+/// prefer [`ServerBuilder::module()`] for extensions).
 type SetupFn = Box<dyn Fn(&mlua::Lua) -> mlua::Result<()> + Send + Sync>;
+
+/// A named Rust extension module, mounted at `nitr.<name>` in every state.
+type Module = (String, Arc<ModuleFn>);
 
 /// The Nitr HTTP server: a pool of Lua runtimes behind a shared listener.
 ///
@@ -36,6 +41,7 @@ pub struct Server {
     cfg: Config,
     builtins: Builtins,
     setup_fns: Arc<Vec<SetupFn>>,
+    modules: Arc<Vec<Module>>,
     /// The current pool, swappable as a whole for zero-downtime reloads.
     pool: Arc<RwLock<Arc<RuntimePool>>>,
     /// Streaming-response slots: one permit per live streaming body.
@@ -52,6 +58,7 @@ pub struct ServerBuilder {
     cfg: Config,
     builtins: Option<Builtins>,
     setup_fns: Vec<SetupFn>,
+    modules: Vec<Module>,
 }
 
 impl Server {
@@ -82,7 +89,7 @@ impl Server {
     /// error the old pool stays.
     async fn reload(&self) {
         tracing::info!("reload requested: rebuilding the runtime pool");
-        match build_runtimes(&self.cfg, self.builtins, &self.setup_fns).await {
+        match build_runtimes(&self.cfg, self.builtins, &self.setup_fns, &self.modules).await {
             Ok(runtimes) => {
                 let fresh = Arc::new(RuntimePool::new(runtimes));
                 match self.pool.write() {
@@ -267,9 +274,32 @@ impl ServerBuilder {
         self
     }
 
+    /// Registers a Rust extension module: the closure runs once per pooled
+    /// state (and again on every reload) and its returned table is mounted
+    /// at `nitr.<name>`, next to the builtins. Registration fails at build
+    /// time when the name collides with a builtin or another module.
+    ///
+    /// ```ignore
+    /// Server::builder().module("greet", |lua| {
+    ///     let t = lua.create_table()?;
+    ///     t.set("hello", lua.create_function(|_, name: String| {
+    ///         Ok(format!("Hello, {name}!"))
+    ///     })?)?;
+    ///     Ok(t)
+    /// })
+    /// ```
+    pub fn module<F>(mut self, name: impl Into<String>, f: F) -> Self
+    where
+        F: Fn(&mlua::Lua) -> mlua::Result<mlua::Table> + Send + Sync + 'static,
+    {
+        self.modules.push((name.into(), Arc::new(f)));
+        self
+    }
+
     /// Registers a closure that customizes each pooled Lua state — the
-    /// extension point for custom globals/modules. It runs once per state,
-    /// before the configuration script and handler are loaded.
+    /// low-level escape hatch behind [`module()`](Self::module). It runs
+    /// once per state, before the configuration script and handler are
+    /// loaded.
     pub fn setup<F>(mut self, f: F) -> Self
     where
         F: Fn(&mlua::Lua) -> mlua::Result<()> + Send + Sync + 'static,
@@ -288,7 +318,8 @@ impl ServerBuilder {
             None => cfg.builtins()?,
         };
         let setup_fns = Arc::new(self.setup_fns);
-        let runtimes = build_runtimes(&cfg, builtins, &setup_fns).await?;
+        let modules = Arc::new(self.modules);
+        let runtimes = build_runtimes(&cfg, builtins, &setup_fns, &modules).await?;
 
         // Streaming responses hold a pooled state for their lifetime; by
         // default keep at least one state free for short requests.
@@ -301,6 +332,7 @@ impl ServerBuilder {
             cfg,
             builtins,
             setup_fns,
+            modules,
             pool: Arc::new(RwLock::new(Arc::new(RuntimePool::new(runtimes)))),
             streams: Arc::new(Semaphore::new(max_streams)),
         })
@@ -332,20 +364,21 @@ async fn build_runtimes(
     cfg: &Config,
     builtins: Builtins,
     setup_fns: &[SetupFn],
+    modules: &[Module],
 ) -> Result<Vec<Runtime>> {
     let workers = cfg.workers.max(1);
     let base_statics = crate::static_files::base_mounts(cfg);
     let base_statics = base_statics.as_slice();
 
     // Bootstrap state: runs the configuration script exactly once.
-    let mut bootstrap = new_runtime(cfg, builtins, setup_fns)?;
+    let mut bootstrap = new_runtime(cfg, builtins, setup_fns, modules)?;
     let snapshot = match &cfg.config_script {
         Some(conf_src) => {
             // Pass the database connection to the config script when available.
             let db_name = Builtins::DATABASE
-                .global_name()
+                .nitr_name()
                 .expect("DATABASE is a single builtin flag");
-            let db = bootstrap.get_global::<Option<AnyUserData>>(db_name)?;
+            let db = nitr_core::nitr_table(bootstrap.lua())?.get::<Option<AnyUserData>>(db_name)?;
             bootstrap.register_cfg_fn(conf_src, db).await?;
             bootstrap.cfg_snapshot()?
         }
@@ -359,7 +392,7 @@ async fn build_runtimes(
     let mut runtimes = Vec::with_capacity(workers);
     runtimes.push(bootstrap);
     for _ in 1..workers {
-        let mut rt = new_runtime(cfg, builtins, setup_fns)?;
+        let mut rt = new_runtime(cfg, builtins, setup_fns, modules)?;
         if let Some(snapshot) = &snapshot {
             rt.set_cfg_snapshot(snapshot)?;
         }
@@ -370,7 +403,12 @@ async fn build_runtimes(
     Ok(runtimes)
 }
 
-fn new_runtime(cfg: &Config, builtins: Builtins, setup_fns: &[SetupFn]) -> Result<Runtime> {
+fn new_runtime(
+    cfg: &Config,
+    builtins: Builtins,
+    setup_fns: &[SetupFn],
+    modules: &[Module],
+) -> Result<Runtime> {
     let rt = Runtime::new_with(cfg.runtime_opts()?)?;
     let env = nitr_lua::BuiltinsEnv {
         templates_dir: cfg.templates_dir.clone(),
@@ -378,7 +416,12 @@ fn new_runtime(cfg: &Config, builtins: Builtins, setup_fns: &[SetupFn]) -> Resul
         fetch: cfg.fetch.options(),
     };
     nitr_lua::register_builtins(rt.lua(), builtins, &env)?;
-    app::register_nitr_global(rt.lua())?;
+    app::register_nitr_app(rt.lua())?;
+    // Extension modules mount after the builtins so a name collision is
+    // caught here, at build time.
+    for (name, module) in modules {
+        rt.register_module(name, module.as_ref())?;
+    }
     for setup in setup_fns {
         setup(rt.lua())?;
     }

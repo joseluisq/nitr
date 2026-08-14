@@ -1,5 +1,5 @@
 //! End-to-end tests for phase-5 observability + protection: request ids
-//! (generated and trusted), the `log` builtin, rate limiting, and the
+//! (generated and trusted), the `nitr.log` builtin, rate limiting, and the
 //! URI/body size limits.
 
 use std::net::SocketAddr;
@@ -9,12 +9,12 @@ const APP_SCRIPT: &str = r#"
 local app = nitr.app()
 
 app:get("/", function(req)
-    log.info("handling request", { path = req.path })
-    return json({ id = req.id })
+    nitr.log.info("handling request", { path = req.path })
+    return nitr.json({ id = req.id })
 end)
 
 app:post("/upload", function(req)
-    return text("ok")
+    return nitr.text("ok")
 end)
 
 return app

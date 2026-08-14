@@ -135,15 +135,10 @@ impl UserData for LuaApp {
     }
 }
 
-/// The compiled dispatch target of a Lua state.
-pub(crate) enum Dispatch {
-    /// The script returned a plain function: the legacy catch-all handler
-    /// called as `handler(cfg, req)` for every request.
-    CatchAll(Function),
-    /// The script returned a `nitr.app()`: requests are routed in Rust and
-    /// only matching ones reach the composed Lua chains.
-    App(Box<CompiledApp>),
-}
+/// The compiled dispatch target of a Lua state: the `nitr.app()` returned
+/// by the handler script — requests are routed in Rust and only matching
+/// ones reach the composed Lua chains.
+pub(crate) struct Dispatch(pub(crate) Box<CompiledApp>);
 
 /// The Rust-side router plus the per-route composed Lua chains.
 pub(crate) struct CompiledApp {
@@ -165,15 +160,15 @@ pub(crate) struct AppState {
 
 impl UserData for AppState {}
 
-/// Registers the `nitr` global table (`nitr.app()`; `nitr.cfg` is filled in
-/// by the server once the configuration snapshot is known).
-pub(crate) fn register_nitr_global(lua: &Lua) -> mlua::Result<()> {
-    let nitr = lua.create_table()?;
+/// Mounts `nitr.app()` on the shared `nitr` namespace table (`nitr.cfg` is
+/// filled in by the server once the configuration snapshot is known).
+pub(crate) fn register_nitr_app(lua: &Lua) -> Result<()> {
+    let nitr = nitr_core::nitr_table(lua)?;
     nitr.set(
         "app",
         lua.create_function(|_, ()| Ok(LuaApp(Mutex::new(AppDef::default()))))?,
     )?;
-    lua.globals().set("nitr", nitr)
+    Ok(())
 }
 
 /// Evaluates the handler script and stores its compiled [`AppState`] in the
@@ -233,11 +228,12 @@ type Compiled = (Dispatch, Vec<crate::static_files::StaticMount>);
 
 fn compile(value: Value, script: &Path) -> Result<Compiled> {
     let app_ud = match value {
-        Value::Function(f) => return Ok((Dispatch::CatchAll(f), Vec::new())),
         Value::UserData(ud) if ud.is::<LuaApp>() => ud,
+        // Plain-function handlers (the pre-`nitr.app()` style) are gone:
+        // one standard way to build an application, checked at load time.
         other => {
             return Err(Error::Script(format!(
-                "the handler script {} must return a function or a nitr.app(), got {}",
+                "the handler script {} must return a nitr.app(), got {}",
                 script.display(),
                 other.type_name()
             )))
@@ -290,7 +286,7 @@ fn compile(value: Value, script: &Path) -> Result<Compiled> {
     }
 
     Ok((
-        Dispatch::App(Box::new(CompiledApp {
+        Dispatch(Box::new(CompiledApp {
             router,
             chains,
             error_fn: def.error_fn.clone(),

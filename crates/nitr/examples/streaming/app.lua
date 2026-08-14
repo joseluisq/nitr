@@ -15,7 +15,7 @@ app:get("/report.csv", function(req)
         },
         body = function(writer)
             writer:write("id,name,score\n")
-            -- Imagine rows coming from conn:query(...) here: each row is
+            -- Imagine rows coming from nitr.db:query(...) here: each row is
             -- written as it is produced, never accumulated.
             for i = 1, 1000 do
                 writer:write(string.format("%d,user-%d,%d\n", i, i, i * 7 % 100))

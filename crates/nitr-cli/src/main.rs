@@ -236,8 +236,8 @@ fn runtime_opts_like(opts: &nitr::RuntimeOpts) -> anyhow::Result<nitr::RuntimeOp
     })
 }
 
-/// The `test` global for test scripts: `test.request(method, path, opts?)`
-/// with opts `{ headers = {...}, body = "..." }` returning
+/// Mounts `nitr.test` for test scripts: `nitr.test.request(method, path,
+/// opts?)` with opts `{ headers = {...}, body = "..." }` returning
 /// `{ status, headers, body }`.
 fn register_test_global(lua: &mlua::Lua, client: nitr::testing::TestClient) -> anyhow::Result<()> {
     let test = lua.create_table()?;
@@ -279,7 +279,7 @@ fn register_test_global(lua: &mlua::Lua, client: nitr::testing::TestClient) -> a
             },
         )?,
     )?;
-    lua.globals().set("test", test)?;
+    nitr::nitr_table(lua)?.set("test", test)?;
     Ok(())
 }
 
@@ -322,18 +322,18 @@ const INIT_APP_LUA: &str = r#"local app = nitr.app()
 
 app:use(function(next)
     return function(req)
-        log.info("request", { path = req.path })
+        nitr.log.info("request", { path = req.path })
         return next(req)
     end
 end)
 
 app:get("/api/hello", function(req)
-    return json({ hello = req.query.name or "world" })
+    return nitr.json({ hello = req.query.name or "world" })
 end)
 
 app:on_error(function(err, req)
-    log.error("handler failed", { error = err })
-    return http.error(500, { code = "INTERNAL" })
+    nitr.log.error("handler failed", { error = err })
+    return nitr.error(500, { code = "INTERNAL" })
 end)
 
 return app
@@ -345,10 +345,10 @@ const INIT_INDEX_HTML: &str = r#"<!doctype html>
 "#;
 
 const INIT_TEST_LUA: &str = r#"-- Run with: nitr test
-local resp = test.request("GET", "/api/hello?name=nitr")
+local resp = nitr.test.request("GET", "/api/hello?name=nitr")
 assert(resp.status == 200, "expected 200, got " .. resp.status)
-assert(json:decode(resp.body).hello == "nitr", "unexpected body: " .. resp.body)
+assert(nitr.json:decode(resp.body).hello == "nitr", "unexpected body: " .. resp.body)
 
-local resp = test.request("GET", "/")
+local resp = nitr.test.request("GET", "/")
 assert(resp.status == 200, "static index should be served")
 "#;

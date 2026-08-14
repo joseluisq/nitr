@@ -11,7 +11,8 @@
 //! dependency for applications and embedders:
 //!
 //! - [`nitr-core`](nitr_core) — the sandboxed Lua runtime and pool,
-//! - [`nitr-lua`](lua) — the built-in Lua globals (`dbg`, `fetch`, …),
+//! - [`nitr-lua`](lua) — the built-in `nitr.*` standard library
+//!   (`nitr.json`, `nitr.fetch`, `nitr.db`, …),
 //! - [`nitr-http`](nitr_http) — the hyper server, configuration, and the
 //!   HTTP/Lua bridge.
 
@@ -23,7 +24,8 @@ pub use nitr_http::testing;
 
 // Re-exports
 pub use nitr_core::{
-    DeadlineHandle, Error, Result, Runtime, RuntimeGuard, RuntimeOpts, RuntimePool,
+    mount, nitr_table, DeadlineHandle, Error, ModuleFn, Result, Runtime, RuntimeGuard, RuntimeOpts,
+    RuntimePool,
 };
 pub use nitr_http::{
     Config, FetchConfig, LimitsConfig, LuaConfig, RateLimitConfig, Server, ServerBuilder,

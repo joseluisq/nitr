@@ -1,4 +1,4 @@
-//! Observability + protection: structured logging from Lua (`log.*`),
+//! Observability + protection: structured logging from Lua (`nitr.log.*`),
 //! request ids on every response, per-client rate limiting, and
 //! request-size limits — all enforced in Rust before Lua runs.
 //!

@@ -1,26 +1,26 @@
--- API aggregation with await_all + atomic updates with transactions.
+-- API aggregation with nitr.await_all + atomic updates with transactions.
 
 local app = nitr.app()
 
 -- Two "upstream" APIs (in real life: other services).
 app:get("/api/profile", function(req)
-    return json({ user = "ada", plan = "pro" })
+    return nitr.json({ user = "ada", plan = "pro" })
 end)
 
 app:get("/api/stats", function(req)
-    return json({ visits = 42, likes = 7 })
+    return nitr.json({ visits = 42, likes = 7 })
 end)
 
 -- The BFF endpoint: both upstreams are fetched concurrently; total wall
--- time is the slower of the two, not their sum. fetch(...) builds an
--- unsent request handle; await_all sends them together.
+-- time is the slower of the two, not their sum. nitr.fetch(...) builds an
+-- unsent request handle; nitr.await_all sends them together.
 app:get("/dashboard", function(req)
     local base = "http://" .. req.headers.host
-    local profile, stats = await_all(
-        fetch("GET", base .. "/api/profile"),
-        fetch("GET", base .. "/api/stats", { timeout = 5 })
+    local profile, stats = nitr.await_all(
+        nitr.fetch("GET", base .. "/api/profile"),
+        nitr.fetch("GET", base .. "/api/stats", { timeout = 5 })
     )
-    return json({
+    return nitr.json({
         app = nitr.cfg.app_name,
         profile = profile:json(),
         stats = stats:json(),
@@ -28,7 +28,7 @@ app:get("/dashboard", function(req)
 end)
 
 app:get("/accounts", function(req)
-    return json(conn:query("SELECT name, balance FROM accounts ORDER BY name"))
+    return nitr.json(nitr.db:query("SELECT name, balance FROM accounts ORDER BY name"))
 end)
 
 -- Atomic transfer: both UPDATEs commit together or not at all. The
@@ -39,7 +39,7 @@ app:post("/transfer", function(req)
 
     local reason
     local ok = pcall(function()
-        conn:transaction(function(tx)
+        nitr.db:transaction(function(tx)
             tx:execute("UPDATE accounts SET balance = balance - ? WHERE name = ?", { amount, from })
             local row = tx:query_row("SELECT balance FROM accounts WHERE name = ?", { from })
             if row.balance < 0 then
@@ -51,15 +51,15 @@ app:post("/transfer", function(req)
     end)
 
     if not ok then
-        return http.error(409, { code = "TRANSFER_FAILED", reason = reason or "internal" })
+        return nitr.error(409, { code = "TRANSFER_FAILED", reason = reason or "internal" })
     end
-    log.info("transfer done", { from = from, to = to, amount = amount })
-    return json({ ok = true })
+    nitr.log.info("transfer done", { from = from, to = to, amount = amount })
+    return nitr.json({ ok = true })
 end)
 
 app:on_error(function(err, req)
-    log.error("handler failed", { error = err, path = req.path })
-    return http.error(500, { code = "INTERNAL" })
+    nitr.log.error("handler failed", { error = err, path = req.path })
+    return nitr.error(500, { code = "INTERNAL" })
 end)
 
 return app

@@ -32,7 +32,7 @@ async fn static_files_and_spa_end_to_end() {
 local app = nitr.app()
 app:static("/", "{site}")
 app:static("/spa", "{spa}", {{ spa = true }})
-app:get("/api/ping", function(req) return json({{ pong = true }}) end)
+app:get("/api/ping", function(req) return nitr.json({{ pong = true }}) end)
 return app
 "#,
         site = site.display(),
@@ -142,10 +142,10 @@ async fn test_client_dispatches_in_process() {
         r#"
         local app = nitr.app()
         app:get("/hello/:name", function(req)
-            return json({ hello = req.params.name, ua = req.headers["user-agent"] })
+            return nitr.json({ hello = req.params.name, ua = req.headers["user-agent"] })
         end)
         app:post("/echo", function(req)
-            return text(req:text(), 201)
+            return nitr.text(req:text(), 201)
         end)
         return app
         "#,

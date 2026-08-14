@@ -1,4 +1,5 @@
-//! Minimal Nitr embedding: a Lua-scripted backend with a custom Rust global.
+//! Minimal Nitr embedding: a Lua-scripted backend with a custom Rust
+//! extension module mounted at `nitr.hello`.
 //!
 //! Run from the repository root:
 //!
@@ -18,14 +19,25 @@ async fn main() -> nitr::Result {
         )
         .init();
 
+    // `PORT=8080 cargo run --example hello` overrides the default port.
+    let port = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(3000);
+
     Server::builder()
-        .listen(([127, 0, 0, 1], 3000).into())
+        .listen(([127, 0, 0, 1], port).into())
         .handler_script("crates/nitr/examples/hello/handler.lua")
         .builtins(Builtins::DEBUG | Builtins::JSON)
-        // Expose a custom Rust function to every Lua state.
-        .setup(|lua| {
-            let greet = lua.create_function(|_, name: String| Ok(format!("Hello, {name}!")))?;
-            lua.globals().set("greet", greet)
+        // A Rust extension module: the returned table is mounted at
+        // `nitr.hello` in every pooled Lua state, next to the builtins.
+        .module("hello", |lua| {
+            let t = lua.create_table()?;
+            t.set(
+                "greet",
+                lua.create_function(|_, name: String| Ok(format!("Hello, {name}!")))?,
+            )?;
+            Ok(t)
         })
         .build()
         .await?

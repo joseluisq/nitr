@@ -1,37 +1,38 @@
-function(conn)
-    -- Using database connection
-    local sql = ""..
-        "CREATE TABLE IF NOT EXISTS users ("..
-        "    id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,"..
-        "    name TEXT NOT NULL,"..
-        "    age INTEGER NOT NULL"..
-        ")"
-    conn:execute(sql)
-    conn:execute("DELETE FROM users")
-    conn:execute("INSERT INTO users (name, age) VALUES ('Eve', 30), ('Bob', 25), ('Diana', 15);")
-    -- Querying some data
-    local users = conn:query("SELECT * FROM users WHERE age > ?", { 20 })
+-- Development configuration script: runs exactly once at startup; its
+-- returned table (plain data) is snapshotted into every Lua state and
+-- exposed to handlers as `nitr.cfg`. The database connection is passed in
+-- as the only argument.
+function(db)
+    -- Seed some data through the SQLite connection.
+    db:execute("" ..
+        "CREATE TABLE IF NOT EXISTS users (" ..
+        "    id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT," ..
+        "    name TEXT NOT NULL," ..
+        "    age INTEGER NOT NULL" ..
+        ")")
+    db:execute("DELETE FROM users")
+    db:execute("INSERT INTO users (name, age) VALUES ('Eve', 30), ('Bob', 25), ('Diana', 15);")
+    local users = db:query("SELECT * FROM users WHERE age > ?", { 20 })
 
-    -- Using Fetch HTTP client
-    local headers = {
-        ["X-Req-Method"] = "GET",
-        ["X-Remote-Addr"] = "78.54.98.17",
-    }
-    local resp = fetch("get", "https://httpbin.org/ip", headers):send()
-    print("Response status: " .. resp.status)
+    -- Outbound HTTP via `nitr.fetch` (guarded: startup must not depend on
+    -- the network being reachable in development).
+    local status = 0
+    local ok, resp = pcall(function()
+        return nitr.fetch("get", "https://httpbin.org/ip", {
+            headers = { ["X-Req-Method"] = "GET" },
+            timeout = 5,
+        }):send()
+    end)
+    if ok then
+        status = resp.status
+        print("Response status: " .. resp.status)
+    else
+        print("fetch skipped: " .. tostring(resp))
+    end
 
-    -- Read Response body in chunks
-    print("Response body: ")
-    repeat
-        local chunk = resp:read()
-        if chunk then
-            print(chunk)
-        end
-    until not chunk
-
-    -- Passing custom data to the HTTP handler
+    -- Passing custom data to the HTTP handlers (`nitr.cfg`).
     return {
-        status = resp.status,
+        status = status,
         users = users,
         server_time = os.date("%d-%m-%YT%H:%M:%S"),
     }

@@ -21,28 +21,34 @@ async fn serves_lua_handlers_end_to_end() {
     let handler = write_temp_script(
         "handler.lua",
         r#"
-        function(cfg, req)
-            if req.path == "/binary" then
-                return {
-                    status = 200,
-                    headers = { ["Set-Cookie"] = { "a=1", "b=2" } },
-                    body = string.char(0, 255) .. "end",
-                }
-            end
-            if req.path == "/boom" then
-                error("kaboom")
-            end
+        local app = nitr.app()
+
+        app:get("/binary", function(req)
+            return {
+                status = 200,
+                headers = { ["Set-Cookie"] = { "a=1", "b=2" } },
+                body = string.char(0, 255) .. "end",
+            }
+        end)
+
+        app:get("/boom", function(req)
+            error("kaboom")
+        end)
+
+        app:get("/hello", function(req)
             return {
                 status = 200,
                 headers = { ["Content-Type"] = "application/json" },
-                body = json:encode({
+                body = nitr.json:encode({
                     path = req.path,
                     name = req.query.name,
                     greeting = greet(req.query.name or "world"),
-                    from_cfg = cfg.motto,
+                    from_cfg = nitr.cfg.motto,
                 }),
             }
-        end
+        end)
+
+        return app
         "#,
     );
     let config = write_temp_script(

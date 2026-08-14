@@ -1,4 +1,4 @@
-//! End-to-end tests for phase 6: `await_all` concurrency, fetch options,
+//! End-to-end tests for phase 6: `nitr.await_all` concurrency, `nitr.fetch` options,
 //! SSRF policy (default-deny, allow-list), policy-checked redirects, and
 //! SQLite transactions (commit, rollback, savepoint nesting).
 
@@ -27,21 +27,21 @@ async fn await_all_fetch_options_redirects_and_transactions() {
 local BASE = "http://{addr}"
 local app = nitr.app()
 
-app:get("/api/a", function(req) return json({{ name = "a" }}) end)
-app:get("/api/b", function(req) return json({{ name = "b" }}) end)
+app:get("/api/a", function(req) return nitr.json({{ name = "a" }}) end)
+app:get("/api/b", function(req) return nitr.json({{ name = "b" }}) end)
 
 -- Concurrent aggregation of two local endpoints.
 app:get("/combined", function(req)
-    local ra, rb = await_all(
-        fetch("GET", BASE .. "/api/a"),
-        fetch("GET", BASE .. "/api/b")
+    local ra, rb = nitr.await_all(
+        nitr.fetch("GET", BASE .. "/api/a"),
+        nitr.fetch("GET", BASE .. "/api/b")
     )
-    return json({{ first = ra:json().name, second = rb:json().name }})
+    return nitr.json({{ first = ra:json().name, second = rb:json().name }})
 end)
 
 -- Echo endpoint + a fetch using the options table.
 app:post("/echo", function(req)
-    return json({{
+    return nitr.json({{
         x = req.query.x,
         ct = req.headers["content-type"],
         body = req:json(),
@@ -49,38 +49,38 @@ app:post("/echo", function(req)
 end)
 
 app:get("/opts", function(req)
-    local resp = fetch("POST", BASE .. "/echo", {{
+    local resp = nitr.fetch("POST", BASE .. "/echo", {{
         query = {{ x = "42" }},
         json = {{ n = 7 }},
         timeout = 5,
     }}):send()
-    return json(resp:json())
+    return nitr.json(resp:json())
 end)
 
 -- Redirects are followed by the client (up to 5 hops), re-checked per hop.
-app:get("/redir", function(req) return redirect("/target") end)
-app:get("/target", function(req) return text("landed") end)
+app:get("/redir", function(req) return nitr.redirect("/target") end)
+app:get("/target", function(req) return nitr.text("landed") end)
 app:get("/follow", function(req)
-    local resp = fetch("GET", BASE .. "/redir"):send()
-    return json({{ status = resp.status, body = resp:text() }})
+    local resp = nitr.fetch("GET", BASE .. "/redir"):send()
+    return nitr.json({{ status = resp.status, body = resp:text() }})
 end)
 
 -- Transactions: commit, rollback on error, savepoint nesting.
 app:get("/tx", function(req)
-    conn:execute("DELETE FROM t")
+    nitr.db:execute("DELETE FROM t")
 
-    conn:transaction(function(tx)
+    nitr.db:transaction(function(tx)
         tx:execute("INSERT INTO t (v) VALUES (?)", {{ "committed" }})
     end)
 
     local ok = pcall(function()
-        conn:transaction(function(tx)
+        nitr.db:transaction(function(tx)
             tx:execute("INSERT INTO t (v) VALUES (?)", {{ "rolled-back" }})
             error("boom")
         end)
     end)
 
-    conn:transaction(function(tx)
+    nitr.db:transaction(function(tx)
         tx:execute("INSERT INTO t (v) VALUES (?)", {{ "outer" }})
         pcall(function()
             tx:transaction(function(tx2)
@@ -90,10 +90,10 @@ app:get("/tx", function(req)
         end)
     end)
 
-    local rows = conn:query("SELECT v FROM t ORDER BY v")
+    local rows = nitr.db:query("SELECT v FROM t ORDER BY v")
     local values = {{}}
     for i, row in ipairs(rows) do values[i] = row.v end
-    return json({{ failed_tx_ok = ok, values = values }})
+    return nitr.json({{ failed_tx_ok = ok, values = values }})
 end)
 
 return app
@@ -135,7 +135,7 @@ return app
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
 
-    // await_all preserves argument order.
+    // nitr.await_all preserves argument order.
     let body: serde_json::Value = client
         .get(format!("{base}/combined"))
         .send()
@@ -202,9 +202,9 @@ local app = nitr.app()
 
 app:get("/try", function(req)
     local ok, err = pcall(function()
-        return fetch("GET", req.query.url):send()
+        return nitr.fetch("GET", req.query.url):send()
     end)
-    return json({ ok = ok, err = ok and "" or tostring(err) })
+    return nitr.json({ ok = ok, err = ok and "" or tostring(err) })
 end)
 
 return app

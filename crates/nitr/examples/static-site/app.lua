@@ -12,7 +12,7 @@ app:static("/assets", ROOT .. "/assets", {
 })
 
 app:get("/api/time", function(req)
-    return json({ now = os and os.time and os.time() or "os disabled" })
+    return nitr.json({ now = os and os.time and os.time() or "os disabled" })
 end)
 
 return app

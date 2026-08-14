@@ -1,135 +1,62 @@
-function(cfg, req)
-    -- `require` resolves relative to the scripts directory
-    require 'modules.printf'
+-- Development handler: a small tour of the `nitr.*` standard library.
+-- Every Nitr API lives on the `nitr` namespace table; the script returns
+-- the application built with `nitr.app()`.
 
-    local uri = req.uri
-    local body = ""
+-- `require` resolves relative to the scripts directory.
+require 'modules.printf'
 
-    print("Config: ")
-    dbg(cfg)
+local app = nitr.app()
 
-    local sql = ""..
-        "CREATE TABLE IF NOT EXISTS person ("..
-        "    id    INTEGER PRIMARY KEY,"..
-        "    name  TEXT NOT NULL,"..
-        "    data  BLOB"..
-        ")"
-    local affected = conn:execute(sql)
-    print("Affected rows: " .. affected)
-
-    -- Access Request data
-    print("Server datetime: " .. os.date("%d-%m-%YT%H:%M:%S"))
-    print("Request remote_addr: " .. req.remote_addr)
-    print("Request method: " .. req.method)
-
-    -- Access Request URI data
-    print("Request URI:")
-    print(" scheme: " .. uri.scheme)
-    print(" authority: " .. uri.authority)
-    print(" host: " .. uri.host)
-    print(" port: " .. uri.port)
-    print(" query: " .. uri.query)
-    print(" path: " .. uri.path)
-
-    if uri.path == "/" then
-        -- Access Request headers
-        print("Request headers:")
-        if req.headers then
-            for k, v in pairs(req.headers) do
-            print(" " .. k .. " = " .. v)
-            end
-        end
-
-        -- Read the whole Request body at once
-        -- local data = req:text()
-        -- dbg(data)
-
-        -- Read the whole Request body as JSON
-        -- local json = req:json()
-        -- dbg(json["origin"])
-
-        -- Read Request body in chunks
-        repeat
-            local chunk = req:read()
-            if chunk then
-                dbg(chunk)
-            end
-        until not chunk
-
-        local headers = {
-            ["X-Req-Method"] = req.method,
-            ["X-Req-Path"] = req.path,
-            ["X-Remote-Addr"] = req.remote_addr,
-        }
-
-        -- Using Fetch HTTP client
-        local client = fetch("get", "https://httpbin.org/ip", headers)
-        local resp = client:send()
-
-        -- Access Response data
-        print("Response status: " .. resp.status)
-
-        -- Access Request URL data
-        print("Request URL:")
-        print(" scheme: " .. resp.url.scheme)
-        print(" authority: " .. resp.url.authority)
-        print(" host: " .. resp.url.host)
-        print(" port: " .. resp.url.port)
-        print(" query: " .. resp.url.query)
-        print(" path: " .. resp.url.path)
-
-        -- Access Response headers
-        print("Response headers:")
-        if resp.headers then
-            for k, v in pairs(resp.headers) do
-                print(" " .. k .. " = " .. v)
-            end
-        end
-
-        -- Read the whole Response body at once
-        -- local data = resp:text()
-        -- dbg(data)
-
-        -- Read Response body in chunks
-        print("Response body chunks:")
-        repeat
-            local chunk = resp:read()
-            if chunk then
-                dbg(chunk)
-            end
-        until not chunk
-
-        -- Read the whole Response body as JSON
-        -- local json = resp:json()
-        -- dbg(json["origin"])
-
-        -- Using template rendering
-        -- body = template:render("response.j2", {
-        --     ["remote_addr"] = req.remote_addr,
-        --     ["datetime"] = os.date("%d-%m-%YT%H:%M:%S"),
-        -- })
-
-        -- Decode a JSON string into a Lua table
-        local s = "{\"current_time\":\"" .. os.date("%d-%m-%YT%H:%M:%S") .. "\"}"
-        -- local s = [[{"current_time":"]] .. os.date("%d-%m-%YT%H:%M:%S") .. [["}]]
-        local obj = json:decode(s)
-        print(obj["current_time"])
-        
-        -- Encode a Lua table to JSON string
-        body = json:encode(obj)
-    else
-        body = "Hello from Lua! (custom path)\n"
-        -- printf('[info] Custom path request: ' .. path)
+-- Global middleware: runs for every matched route.
+app:use(function(next)
+    return function(req)
+        nitr.log.info("request", { method = req.method, path = req.path })
+        return next(req)
     end
+end)
 
-    return {
-        status = 200,
-        headers = {
-            ["Content-Type"] = "application/json",
-            ["X-Req-Method"] = req.method,
-            ["X-Req-Path"] = req.path,
-            ["X-Remote-Addr"] = req.remote_addr,
-        },
-        body = body
-    }
-end
+app:get("/", function(req)
+    -- The configuration script's snapshot is available as `nitr.cfg`.
+    nitr.dbg(nitr.cfg)
+
+    -- SQLite through `nitr.db` (runs off the async threads).
+    nitr.db:execute(
+        "CREATE TABLE IF NOT EXISTS person (" ..
+        "    id    INTEGER PRIMARY KEY," ..
+        "    name  TEXT NOT NULL," ..
+        "    data  BLOB" ..
+        ")")
+
+    -- JSON codec: `nitr.json:decode` / `nitr.json:encode`.
+    local obj = nitr.json:decode('{"current_time":"' .. os.date("%d-%m-%YT%H:%M:%S") .. '"}')
+    printf("[info] decoded current_time: %s", obj.current_time)
+
+    -- Called as a function, `nitr.json(value)` builds the JSON response.
+    return nitr.json({
+        message = "Hello from Lua!",
+        method = req.method,
+        remote_addr = req.remote_addr,
+        current_time = obj.current_time,
+    })
+end)
+
+app:get("/users", function(req)
+    -- Data seeded by the configuration script (scripts/config.lua).
+    return nitr.json({ users = nitr.cfg.users, seeded_at = nitr.cfg.server_time })
+end)
+
+app:get("/hello/:name", function(req)
+    -- Template rendering via minijinja (`templates_dir` in nitr.toml).
+    local body = nitr.template:render("response.j2", {
+        remote_addr = req.remote_addr,
+        datetime = os.date("%d-%m-%YT%H:%M:%S"),
+    })
+    return nitr.html(body)
+end)
+
+app:on_error(function(err, req)
+    nitr.log.error("handler failed", { error = err, path = req.path })
+    return nitr.error(500, { code = "INTERNAL" })
+end)
+
+return app

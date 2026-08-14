@@ -1,6 +1,6 @@
 use mlua::{
-    FromLua, FromLuaMulti, Function, HookTriggers, IntoLua, IntoLuaMulti, Lua, LuaOptions,
-    LuaSerdeExt as _, RegistryKey, StdLib, Table, Thread, Value, VmState,
+    FromLuaMulti, Function, HookTriggers, IntoLuaMulti, Lua, LuaOptions, LuaSerdeExt as _,
+    RegistryKey, StdLib, Table, Thread, Value, VmState,
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,14 +27,13 @@ const HOOK_INSTRUCTION_INTERVAL: u32 = 4000;
 const EXEC_TIMEOUT_GRACE: Duration = Duration::from_millis(100);
 
 /// The Lua runtime that provides an interface to execute Lua scripts and manage Lua state.
-/// It allows for registering global functions, configuration scripts, and HTTP handlers.
+/// It allows for registering Rust extension modules on the `nitr` namespace,
+/// running a configuration script, and calling Lua functions under the
+/// state's execution budget.
 #[derive(Debug)]
 pub struct Runtime {
     lua: Lua,
     cfg: Option<Table>,
-    http_fn: Option<Function>,
-    http_fn_key: Option<RegistryKey>,
-    http_fn_path: Option<PathBuf>,
     /// Cached handler coroutine, reset and reused across requests to avoid
     /// per-request thread allocation and hook installation.
     thread: Option<Thread>,
@@ -135,9 +134,6 @@ impl Runtime {
         Ok(Self {
             lua,
             cfg: None,
-            http_fn: None,
-            http_fn_key: None,
-            http_fn_path: None,
             thread: None,
             deadline: Arc::new(AtomicU64::new(u64::MAX)),
             epoch: Instant::now(),
@@ -145,13 +141,20 @@ impl Runtime {
         })
     }
 
-    /// It sets a custom global Lua variable with the specified key and value.
+    /// Registers a Rust extension module: the closure runs now (and its
+    /// result is a table by Lua module convention), mounted at
+    /// `nitr.<name>`. Fails when the name is already taken, so extensions
+    /// cannot shadow builtins or each other.
     ///
-    /// For registering the built-in globals (`dbg`, `fetch`, `json`, …), see
-    /// `register_builtins()` in the `nitr-lua` crate.
-    pub fn set_global<V: IntoLua>(&self, key: impl IntoLua, value: V) -> Result {
-        self.lua.globals().set(key, value)?;
-        Ok(())
+    /// This is the embedding-side extension point; HTTP applications use
+    /// `ServerBuilder::module()` in the `nitr-http` crate, which applies
+    /// the closure to every pooled state.
+    pub fn register_module<F>(&self, name: &str, f: F) -> Result
+    where
+        F: Fn(&Lua) -> mlua::Result<Table>,
+    {
+        let value = f(&self.lua)?;
+        crate::ns::mount(&self.lua, name, value)
     }
 
     /// It sets the Lua configuration function that will be called at server startup.
@@ -177,54 +180,10 @@ impl Runtime {
         Ok(())
     }
 
-    /// It sets the Lua HTTP handler function that will be called on every HTTP request.
-    ///
-    /// It loads the Lua script from the path and evaluates it to allocate the function,
-    /// but it's not invoked immediately. It will be called on every request.
-    pub fn register_http_fn(&mut self, http_src: &Path) -> Result {
-        let meta = std::fs::metadata(http_src).map_err(|err| {
-            Error::Script(format!(
-                "failed to read HTTP handler file metadata for {}: {err}",
-                http_src.display()
-            ))
-        })?;
-
-        if meta.is_file() {
-            self.http_fn_path = Some(http_src.to_owned());
-        } else {
-            return Err(Error::Script(format!(
-                "HTTP handler path {} is not a regular file",
-                http_src.display()
-            )));
-        }
-
-        let data = std::fs::read(http_src).map_err(|err| {
-            Error::Script(format!(
-                "failed to read the Lua HTTP handler file {}: {err}",
-                http_src.display()
-            ))
-        })?;
-
-        let key = self.lua.load(data).eval::<RegistryKey>()?;
-        let http_fn = self.lua.registry_value::<Function>(&key)?;
-        self.http_fn_key = Some(key);
-
-        self.http_fn = Some(http_fn);
-        Ok(())
-    }
-
-    /// The underlying Lua state, for advanced customization such as
-    /// registering custom globals or modules.
+    /// The underlying Lua state, for advanced customization beyond
+    /// [`register_module()`](Self::register_module).
     pub fn lua(&self) -> &Lua {
         &self.lua
-    }
-
-    /// Get a global Lua variable by key.
-    ///
-    /// Note that this function can also access a **built-in** global.
-    pub fn get_global<V: FromLua>(&mut self, key: impl IntoLua) -> Result<V> {
-        let value = self.lua.globals().get::<V>(key)?;
-        Ok(value)
     }
 
     /// The Lua configuration table that is returned after the script handler is invoked.
@@ -265,12 +224,8 @@ impl Runtime {
         }
     }
 
-    /// The Lua HTTP handler function that will be called for each HTTP request.
-    pub fn http_fn(&self) -> Option<&Function> {
-        self.http_fn.as_ref()
-    }
-
-    /// Returns the cached handler coroutine reset to `http_fn`, creating it
+    /// Returns the cached handler coroutine reset to the given function,
+    /// creating it
     /// (and installing the execution-deadline hook once) when necessary.
     ///
     /// The handler runs in its own coroutine so the hook can be attached to
@@ -304,22 +259,11 @@ impl Runtime {
         Ok(thread)
     }
 
-    /// Calls the registered HTTP handler with the given request under the
-    /// configured execution budget ([`RuntimeOpts::exec_timeout`]): an
-    /// instruction-count hook stops CPU-bound overruns and an outer async
-    /// timeout stops slow I/O ([`Error::Timeout`]).
-    pub async fn call_handler(&mut self, req: impl IntoLua) -> Result<Table> {
-        let http_fn = self
-            .http_fn
-            .clone()
-            .ok_or_else(|| Error::Script("no HTTP handler has been registered".into()))?;
-        let cfg = self.cfg.clone();
-        self.call_function(http_fn, (cfg, req)).await
-    }
-
-    /// Calls an arbitrary Lua function under the same execution budget as
-    /// [`call_handler()`](Self::call_handler). The function runs on this
-    /// runtime's cached coroutine so the instruction-count hook applies.
+    /// Calls a Lua function under the configured execution budget
+    /// ([`RuntimeOpts::exec_timeout`]): an instruction-count hook stops
+    /// CPU-bound overruns and an outer async timeout stops slow I/O
+    /// ([`Error::Timeout`]). The function runs on this runtime's cached
+    /// coroutine so the instruction-count hook applies.
     pub async fn call_function<R: FromLuaMulti>(
         &mut self,
         f: Function,
@@ -401,38 +345,6 @@ impl Runtime {
         })?;
         Ok(self.lua.load(data).eval::<Value>()?)
     }
-
-    /// Reloads the Lua HTTP handler function from the file specified in `http_fn_path`.
-    pub fn http_fn_reload(&mut self) -> Result<()> {
-        // TODO: group all those fields in a struct
-        if !self.opts.dev_mode
-            || self.http_fn.is_none()
-            || self.http_fn_key.is_none()
-            || self.http_fn_path.is_none()
-        {
-            return Ok(());
-        }
-
-        let http_fn_path = self.http_fn_path.as_ref().unwrap();
-        tracing::debug!("reloading http handler from {}", http_fn_path.display());
-
-        let data = std::fs::read(http_fn_path).map_err(|err| {
-            Error::Script(format!(
-                "failed to read the Lua HTTP handler file {}: {err}",
-                http_fn_path.display()
-            ))
-        })?;
-
-        let http_fn = self.lua.load(data).eval::<Function>()?;
-        let mut existing_key = self.http_fn_key.take().unwrap();
-        self.lua
-            .replace_registry_value(&mut existing_key, http_fn)?;
-        let http_fn = self.lua.registry_value::<Function>(&existing_key)?;
-        self.http_fn = Some(http_fn);
-        self.http_fn_key = Some(existing_key);
-
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -456,42 +368,73 @@ mod tests {
         .expect("runtime")
     }
 
+    fn eval_function(rt: &Runtime, src: &str) -> Function {
+        rt.lua().load(src).eval().expect("eval handler function")
+    }
+
     #[tokio::test]
-    async fn handler_round_trip() {
-        let path = write_temp_script(
-            "ok.lua",
-            "function(cfg, req) return { status = 200, body = req } end",
-        );
+    async fn function_calls_round_trip() {
         let mut rt = test_runtime(Some(Duration::from_secs(5)));
-        rt.register_http_fn(&path).expect("register handler");
-        std::fs::remove_file(&path).ok();
+        let f = eval_function(
+            &rt,
+            "return function(req) return { status = 200, body = req } end",
+        );
 
         // The cached coroutine must keep working across calls.
         for _ in 0..3 {
-            let resp = rt.call_handler("ping").await.expect("call handler");
+            let resp = rt
+                .call_function::<Table>(f.clone(), "ping")
+                .await
+                .expect("call function");
             assert_eq!(resp.get::<String>("body").expect("body"), "ping");
         }
     }
 
     #[tokio::test]
     async fn cpu_bound_loops_hit_the_instruction_hook() {
-        let path = write_temp_script("loop.lua", "function() while true do end end");
         let mut rt = test_runtime(Some(Duration::from_millis(100)));
-        rt.register_http_fn(&path).expect("register handler");
+        let looping = eval_function(&rt, "return function() while true do end end");
 
         let err = rt
-            .call_handler(Value::Nil)
+            .call_function::<Table>(looping, Value::Nil)
             .await
             .expect_err("must time out");
         assert!(err.to_string().contains("time budget"), "got: {err}");
 
         // The state must survive and serve the next call after a reset.
-        let ok = write_temp_script("ok2.lua", "function() return { body = 'alive' } end");
-        rt.register_http_fn(&ok).expect("register handler");
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_file(&ok).ok();
-        let resp = rt.call_handler(Value::Nil).await.expect("recovered");
+        let ok = eval_function(&rt, "return function() return { body = 'alive' } end");
+        let resp = rt
+            .call_function::<Table>(ok, Value::Nil)
+            .await
+            .expect("recovered");
         assert_eq!(resp.get::<String>("body").expect("body"), "alive");
+    }
+
+    #[test]
+    fn modules_mount_under_nitr_and_reject_collisions() {
+        let rt = test_runtime(None);
+        rt.register_module("greet", |lua| {
+            let t = lua.create_table()?;
+            t.set(
+                "hello",
+                lua.create_function(|_, name: String| Ok(format!("hi {name}")))?,
+            )?;
+            Ok(t)
+        })
+        .expect("register module");
+
+        let out: String = rt
+            .lua()
+            .load("return nitr.greet.hello('nitr')")
+            .eval()
+            .expect("call module");
+        assert_eq!(out, "hi nitr");
+
+        // A second mount under the same name must fail loudly.
+        let err = rt
+            .register_module("greet", |lua| lua.create_table())
+            .expect_err("collision");
+        assert!(err.to_string().contains("already exists"), "got: {err}");
     }
 
     #[tokio::test]

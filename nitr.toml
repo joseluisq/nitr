@@ -12,16 +12,16 @@ listen = "127.0.0.1:3000"
 handler_script = "scripts/handler.lua"
 
 # Lua script executed once at startup. Its returned table (plain data) is
-# passed to the handler as the first argument on every request.
-# Optional: when absent, the handler receives nil.
+# snapshotted into every state and exposed to handlers as `nitr.cfg`.
+# Optional: when absent, `nitr.cfg` is nil.
 config_script = "scripts/config.lua"
 
-# Directory for the `template` builtin (minijinja). Optional: without it the
-# `template` builtin is unavailable.
+# Directory for the `nitr.template` builtin (minijinja). Optional: without
+# it the `nitr.template` builtin is unavailable.
 templates_dir = "scripts/templates"
 
-# SQLite database file for the `conn` builtin. Optional: without it the
-# `conn` builtin is unavailable.
+# SQLite database file for the `nitr.db` builtin. Optional: without it the
+# `nitr.db` builtin is unavailable.
 database = "scripts/file.db"
 
 # Number of pooled Lua states (max concurrently executing handlers).
@@ -53,14 +53,14 @@ database = "scripts/file.db"
 #window = 60                 # window length in seconds
 #trust_forwarded_for = false # key by X-Forwarded-For (only behind a proxy)
 
-# Outbound-request policy for the `fetch` builtin. By default requests to
+# Outbound-request policy for the `nitr.fetch` builtin. By default requests to
 # loopback/private/link-local addresses are refused (SSRF protection) and
 # every redirect hop is re-checked against this policy.
 #[fetch]
 #allowed_hosts = ["api.example.com"] # exact-host allow-list (all hops)
 #allow_private_networks = false      # permit loopback/RFC1918 targets
 #max_response_bytes = 8388608        # cap on resp:text()/resp:json() bodies
-#max_concurrent = 8                  # max requests per await_all(...)
+#max_concurrent = 8                  # max requests per nitr.await_all(...)
 
 # Static file serving (Rust-side: ETag/Last-Modified/304, content types,
 # traversal protection). Scripts can add mounts with app:static(...).
@@ -77,11 +77,12 @@ database = "scripts/file.db"
 # Default: false (also enabled by the --dev flag).
 dev_mode = true
 
-# Built-in globals exposed to scripts. When omitted, all builtins whose
-# requirements are met are enabled. Valid names: "dbg", "fetch", "template",
-# "json", "db". Listing them explicitly is strict: a listed builtin missing
-# its configuration (e.g. "db" without `database`) fails at startup.
-#builtins = ["dbg", "fetch", "template", "json", "db"]
+# Built-in `nitr.*` modules exposed to scripts. When omitted, all builtins
+# whose requirements are met are enabled. Valid names: "dbg", "fetch",
+# "template", "json", "db", "http", "log", "crypto". Listing them explicitly
+# is strict: a listed builtin missing its configuration (e.g. "db" without
+# `database`) fails at startup.
+#builtins = ["dbg", "fetch", "template", "json", "db", "http", "log", "crypto"]
 
 [lua]
 # Lua standard libraries loaded into every state.

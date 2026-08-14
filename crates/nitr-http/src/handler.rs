@@ -8,7 +8,7 @@ use mlua::{Function, LuaString, Table as LuaTable, Value as LuaValue};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
-use crate::app::{self, AppState, Dispatch};
+use crate::app::{self, AppState};
 use crate::protect::Protection;
 use crate::request::LuaRequest;
 use crate::static_files::{self, StaticMount};
@@ -19,8 +19,6 @@ pub(crate) type HttpResponse = Response<BoxBody<Bytes, Infallible>>;
 
 /// What a request resolves to after Rust-side routing.
 enum Target {
-    /// Legacy single-function script: called for every request.
-    CatchAll(Function),
     /// A static asset resolved by a mount (already served).
     Static(Result<HttpResponse>),
     /// A matched route: the composed middleware+handler chain.
@@ -92,16 +90,6 @@ async fn handle_inner(
                 resp.headers_mut().insert(header::ALLOW, value);
             }
             Ok(resp)
-        }
-        Target::CatchAll(handler) => {
-            let cfg = rt.cfg().cloned();
-            match rt.call_function::<LuaTable>(handler, (cfg, req)).await {
-                Ok(lua_resp) => finish(rt, lua_resp, &streams, dev_mode),
-                Err(err) => {
-                    tracing::error!("lua handler error: {err}");
-                    error_response(&err, dev_mode)
-                }
-            }
         }
         Target::Chain {
             chain,
@@ -179,35 +167,32 @@ fn finish(
 }
 
 /// Routes the request in Rust against this state's compiled dispatch
-/// table. Static mounts are consulted after a router miss (and before a
-/// legacy catch-all, which otherwise receives everything).
+/// table. Static mounts are consulted after a router miss.
 async fn resolve(rt: &Runtime, req: &LuaRequest) -> Result<Target> {
     let ud = app::state(rt.lua())?;
     let (target, statics): (Target, Arc<Vec<StaticMount>>) = {
         let state = ud.borrow::<AppState>()?;
-        let target = match &state.dispatch {
-            Dispatch::CatchAll(f) => Target::CatchAll(f.clone()),
-            Dispatch::App(app) => match app.router.at(req.req.uri().path()) {
-                Ok(matched) => match matched.value.get(req.req.method()) {
-                    Some(&idx) => Target::Chain {
-                        chain: app.chains[idx].clone(),
-                        params: matched
-                            .params
-                            .iter()
-                            .map(|(k, v)| (k.to_string(), v.to_string()))
-                            .collect(),
-                        error_fn: app.error_fn.clone(),
-                    },
-                    None => Target::MethodNotAllowed(matched.value.keys().cloned().collect()),
+        let app = &state.dispatch.0;
+        let target = match app.router.at(req.req.uri().path()) {
+            Ok(matched) => match matched.value.get(req.req.method()) {
+                Some(&idx) => Target::Chain {
+                    chain: app.chains[idx].clone(),
+                    params: matched
+                        .params
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect(),
+                    error_fn: app.error_fn.clone(),
                 },
-                Err(_) => Target::NotFound,
+                None => Target::MethodNotAllowed(matched.value.keys().cloned().collect()),
             },
+            Err(_) => Target::NotFound,
         };
         (target, state.statics.clone())
     };
 
     Ok(match target {
-        Target::NotFound | Target::CatchAll(_) if !statics.is_empty() => {
+        Target::NotFound if !statics.is_empty() => {
             match static_files::try_serve(&statics, req).await {
                 Some(resp) => Target::Static(resp),
                 None => target,

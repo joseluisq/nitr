@@ -1,6 +1,7 @@
-//! HTTP ergonomics for Lua handlers: response helpers (`text`, `html`,
-//! `redirect`, `status`, `http.error`), request/response cookies with
-//! HMAC-SHA256 signed variants, and content negotiation (`negotiate`).
+//! HTTP ergonomics for Lua handlers: response helpers (`nitr.text`,
+//! `nitr.html`, `nitr.redirect`, `nitr.status`, `nitr.error`),
+//! request/response cookies with HMAC-SHA256 signed variants, and content
+//! negotiation (`nitr.negotiate`).
 //!
 //! Helpers build plain `{status, headers, body}` response tables — they are
 //! sugar, not a new type — plus a `cookies` builder consumed by the server
@@ -33,12 +34,11 @@ fn set_content_type(table: &Table, value: &str) -> mlua::Result<()> {
     table.get::<Table>("headers")?.set("Content-Type", value)
 }
 
-/// Registers the HTTP ergonomics globals: `text`, `html`, `redirect`,
-/// `status`, `negotiate`, and the `http` table (`http.error`).
-pub(crate) fn register(lua: &Lua) -> mlua::Result<()> {
-    let globals = lua.globals();
-
-    globals.set(
+/// Registers the HTTP ergonomics helpers on the `nitr` namespace table:
+/// `nitr.text`, `nitr.html`, `nitr.redirect`, `nitr.status`,
+/// `nitr.negotiate`, `nitr.sse`, and `nitr.error`.
+pub(crate) fn register(lua: &Lua, nitr: &Table) -> mlua::Result<()> {
+    nitr.set(
         "text",
         lua.create_function(|lua, (body, status): (mlua::LuaString, Option<u16>)| {
             let table = response_table(lua, status.unwrap_or(200))?;
@@ -48,7 +48,7 @@ pub(crate) fn register(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
-    globals.set(
+    nitr.set(
         "html",
         lua.create_function(|lua, (body, status): (mlua::LuaString, Option<u16>)| {
             let table = response_table(lua, status.unwrap_or(200))?;
@@ -58,7 +58,7 @@ pub(crate) fn register(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
-    globals.set(
+    nitr.set(
         "redirect",
         lua.create_function(|lua, (location, status): (String, Option<u16>)| {
             let table = response_table(lua, status.unwrap_or(302))?;
@@ -67,7 +67,7 @@ pub(crate) fn register(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
-    globals.set(
+    nitr.set(
         "status",
         lua.create_function(|lua, code: u16| response_table(lua, code))?,
     )?;
@@ -75,7 +75,7 @@ pub(crate) fn register(lua: &Lua) -> mlua::Result<()> {
     // Server-Sent Events: `sse(function(send) ... end)` builds a streaming
     // response whose body hands the user function a `send(event, data)`
     // formatter over the raw stream writer.
-    globals.set(
+    nitr.set(
         "sse",
         lua.create_function(|lua, handler: Function| {
             let table = response_table(lua, 200)?;
@@ -103,15 +103,14 @@ pub(crate) fn register(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
-    globals.set(
+    nitr.set(
         "negotiate",
         lua.create_async_function(|lua, (req, offers): (Value, Table)| async move {
             negotiate(&lua, req, offers).await
         })?,
     )?;
 
-    let http = lua.create_table()?;
-    http.set(
+    nitr.set(
         "error",
         lua.create_function(|lua, (code, body): (u16, Option<Value>)| {
             let table = response_table(lua, code)?;
@@ -129,7 +128,7 @@ pub(crate) fn register(lua: &Lua) -> mlua::Result<()> {
                 }
                 Some(other) => {
                     return Err(mlua::Error::RuntimeError(format!(
-                        "http.error body must be a string or a table, got {}",
+                        "nitr.error body must be a string or a table, got {}",
                         other.type_name()
                     )))
                 }
@@ -137,7 +136,6 @@ pub(crate) fn register(lua: &Lua) -> mlua::Result<()> {
             Ok(table)
         })?,
     )?;
-    globals.set("http", http)?;
 
     Ok(())
 }

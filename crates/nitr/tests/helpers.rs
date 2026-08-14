@@ -1,5 +1,5 @@
 //! End-to-end tests for the phase-3 HTTP ergonomics: response helpers,
-//! `http.error`, plain and signed cookies, and content negotiation.
+//! `nitr.error`, plain and signed cookies, and content negotiation.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -9,31 +9,31 @@ local SECRET = "s3cret"
 local app = nitr.app()
 
 app:get("/text", function(req)
-    return text("plain body")
+    return nitr.text("plain body")
 end)
 
 app:get("/html", function(req)
-    return html("<p>hi</p>", 202)
+    return nitr.html("<p>hi</p>", 202)
 end)
 
 app:get("/json", function(req)
-    return json({ n = 7 })
+    return nitr.json({ n = 7 })
 end)
 
 app:get("/redirect", function(req)
-    return redirect("/text")
+    return nitr.redirect("/text")
 end)
 
 app:get("/nocontent", function(req)
-    return status(204)
+    return nitr.status(204)
 end)
 
 app:get("/teapot", function(req)
-    return http.error(418, { code = "TEAPOT" })
+    return nitr.error(418, { code = "TEAPOT" })
 end)
 
 app:get("/set", function(req)
-    local res = text("ok")
+    local res = nitr.text("ok")
     res.cookies:set("plain", "v1", { path = "/", http_only = true })
     res.cookies:set("extra", "v2")
     res.cookies:set_signed("session", "user-42", SECRET, { same_site = "Strict" })
@@ -41,7 +41,7 @@ app:get("/set", function(req)
 end)
 
 app:get("/read", function(req)
-    return json({
+    return nitr.json({
         plain = req.cookies.plain,
         verified = req.cookies:verify("session", SECRET),
         forged = req.cookies:verify("plain", SECRET),
@@ -49,14 +49,14 @@ app:get("/read", function(req)
 end)
 
 app:get("/negotiate", function(req)
-    return negotiate(req, {
-        ["application/json"] = function(r) return json({ kind = "json" }) end,
-        ["text/html"] = function(r) return html("<p>html</p>") end,
+    return nitr.negotiate(req, {
+        ["application/json"] = function(r) return nitr.json({ kind = "json" }) end,
+        ["text/html"] = function(r) return nitr.html("<p>html</p>") end,
     })
 end)
 
 app:get("/accepts", function(req)
-    return text(req:accepts("text/html", "application/json") or "none")
+    return nitr.text(req:accepts("text/html", "application/json") or "none")
 end)
 
 return app
@@ -98,7 +98,7 @@ async fn helpers_cookies_and_negotiation_end_to_end() {
         .build()
         .expect("client");
 
-    // text() / html() with optional status / callable json() helper.
+    // nitr.text() / nitr.html() with optional status / callable nitr.json() helper.
     let resp = client
         .get(format!("{base}/text"))
         .send()
@@ -125,7 +125,7 @@ async fn helpers_cookies_and_negotiation_end_to_end() {
     let body: serde_json::Value = resp.json().await.expect("json body");
     assert_eq!(body["n"], 7);
 
-    // redirect() and status().
+    // nitr.redirect() and nitr.status().
     let resp = client
         .get(format!("{base}/redirect"))
         .send()
@@ -141,7 +141,7 @@ async fn helpers_cookies_and_negotiation_end_to_end() {
         .expect("status(204)");
     assert_eq!(resp.status(), 204);
 
-    // http.error with a JSON body.
+    // nitr.error with a JSON body.
     let resp = client
         .get(format!("{base}/teapot"))
         .send()
@@ -194,7 +194,7 @@ async fn helpers_cookies_and_negotiation_end_to_end() {
     let body: serde_json::Value = resp.json().await.expect("tampered body");
     assert!(body["verified"].is_null());
 
-    // negotiate() picks by Accept header.
+    // nitr.negotiate() picks by Accept header.
     let resp = client
         .get(format!("{base}/negotiate"))
         .header("accept", "text/html")

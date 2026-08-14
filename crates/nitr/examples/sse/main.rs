@@ -1,6 +1,6 @@
-//! Server-Sent Events: a live ticker paced by a custom Rust `sleep`
-//! global, injected through the `setup()` extension point — the same
-//! mechanism used for any custom Rust/Lua binding.
+//! Server-Sent Events: a live ticker paced by a custom Rust `time`
+//! module, mounted at `nitr.time` through the `module()` extension
+//! point — the same mechanism used for any custom Rust/Lua binding.
 //!
 //! Run from the repository root:
 //!
@@ -33,14 +33,20 @@ async fn main() -> nitr::Result {
         .listen(([127, 0, 0, 1], port).into())
         .handler_script("crates/nitr/examples/sse/app.lua")
         .builtins(Builtins::JSON | Builtins::HTTP)
-        // A custom async global: `sleep(seconds)` suspends the Lua
-        // coroutine on the tokio timer without blocking the runtime.
-        .setup(|lua| {
-            let sleep = lua.create_async_function(|_, secs: f64| async move {
-                tokio::time::sleep(Duration::from_secs_f64(secs)).await;
-                Ok(())
-            })?;
-            lua.globals().set("sleep", sleep)
+        // A custom Rust module: the returned table is mounted at
+        // `nitr.time` in every pooled Lua state, so handlers call
+        // `nitr.time.sleep(ms)` — an async function that suspends the
+        // Lua coroutine on the tokio timer without blocking the runtime.
+        .module("time", |lua| {
+            let t = lua.create_table()?;
+            t.set(
+                "sleep",
+                lua.create_async_function(|_, ms: u64| async move {
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                    Ok(())
+                })?,
+            )?;
+            Ok(t)
         })
         .build()
         .await?
