@@ -3,8 +3,10 @@ use std::convert::Infallible;
 use http_body_util::{combinators::BoxBody, BodyExt as _, Empty, Full};
 use hyper::body::Bytes;
 use hyper::{header, Method, Response, StatusCode};
-use mlua::{Function, LuaString, Table as LuaTable, Value as LuaValue};
+use mlua::{AnyUserData, Function, LuaString, Table as LuaTable, Value as LuaValue};
 
+use futures_util::FutureExt as _;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
@@ -33,6 +35,10 @@ enum Target {
 
 /// Serves one request: protection checks, dispatch, and the `X-Request-ID`
 /// echo on every response.
+///
+/// The whole call is wrapped in a panic boundary: a panic in Rust code
+/// (Nitr's or an extension module's) becomes a 500 and recycles the Lua
+/// state instead of killing the connection.
 pub(crate) async fn handle(
     pool: &RuntimePool,
     req: LuaRequest,
@@ -40,11 +46,38 @@ pub(crate) async fn handle(
     protection: Arc<Protection>,
 ) -> Result<HttpResponse> {
     let id = req.id.clone();
-    let mut resp = handle_inner(pool, req, streams, protection).await?;
+    let dev_mode = protection.dev_mode();
+
+    let served = AssertUnwindSafe(handle_inner(pool, req, streams, protection))
+        .catch_unwind()
+        .await;
+
+    let mut resp = match served {
+        Ok(result) => result?,
+        Err(payload) => {
+            // The guard held by `handle_inner` was dropped during the unwind,
+            // which the pool treats as damage and recycles.
+            let err = Error::Panic(panic_message(&payload));
+            tracing::error!("{err}");
+            error_response(&err, dev_mode)?
+        }
+    };
     if let Ok(value) = header::HeaderValue::from_str(&id) {
         resp.headers_mut().insert("x-request-id", value);
     }
     Ok(resp)
+}
+
+/// Best-effort text of a panic payload (`panic!("...")` produces a `&str`
+/// or `String`; anything else is opaque).
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "non-string panic payload".to_string()
 }
 
 async fn handle_inner(
@@ -57,8 +90,20 @@ async fn handle_inner(
     if let Some(rejection) = protection.check(&req) {
         return rejection;
     }
+    // `check` only compared the *declared* length; from here the bytes are
+    // counted as the handler reads them.
+    let oversized = req.limit_body(protection.max_body_bytes());
 
-    let mut rt = pool.get().await;
+    // Bounded wait for a state: past the budget the request is shed rather
+    // than queued behind an overloaded pool. Nothing Lua-side has run yet,
+    // so shedding is cheap.
+    let Some(mut rt) = pool.get_timeout(protection.pool_wait()).await else {
+        tracing::warn!("request shed: no Lua state available within the pool wait budget");
+        let mut resp = plain_response(StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable")?;
+        resp.headers_mut()
+            .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
+        return Ok(resp);
+    };
     let dev_mode = rt.dev_mode();
 
     if dev_mode {
@@ -100,28 +145,53 @@ async fn handle_inner(
             // The request becomes a Lua value up front so the error handler
             // can receive the same object the handler saw.
             let req_ud = rt.lua().create_userdata(req)?;
-            match rt.call_function::<LuaTable>(chain, &req_ud).await {
-                Ok(lua_resp) => finish(rt, lua_resp, &streams, dev_mode),
-                Err(err) => {
-                    tracing::error!("lua handler error: {err}");
-                    if let Some(error_fn) = error_fn {
-                        match rt
-                            .call_function::<LuaTable>(error_fn, (err.to_string(), &req_ud))
-                            .await
-                        {
-                            Ok(lua_resp) => match to_response(lua_resp) {
-                                Ok(resp) => return Ok(resp),
-                                Err(err) => {
-                                    tracing::error!("invalid error-handler response: {err}")
-                                }
-                            },
-                            Err(err) => tracing::error!("the app error handler failed: {err}"),
-                        }
-                    }
-                    error_response(&err, dev_mode)
+            let err = match rt.call_function::<LuaTable>(chain, &req_ud).await {
+                // `finish` releases the body itself: a streaming body may
+                // still be reading from the request.
+                Ok(lua_resp) => return finish(rt, lua_resp, &streams, dev_mode, &req_ud),
+                Err(err) => err,
+            };
+
+            // An oversized body is a rejection, not an application failure:
+            // answer it in Rust and skip the app's error handler, which
+            // would only see an opaque read error.
+            if oversized.load(std::sync::atomic::Ordering::Relaxed) {
+                tracing::debug!("request rejected: body exceeded max_body_bytes");
+                discard_body(&req_ud);
+                return plain_response(StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large");
+            }
+
+            tracing::error!("lua handler error: {err}");
+            let mut handled = None;
+            if let Some(error_fn) = error_fn {
+                match rt
+                    .call_function::<LuaTable>(error_fn, (err.to_string(), &req_ud))
+                    .await
+                {
+                    Ok(lua_resp) => match to_response(lua_resp) {
+                        Ok(resp) => handled = Some(resp),
+                        Err(err) => tracing::error!("invalid error-handler response: {err}"),
+                    },
+                    Err(err) => tracing::error!("the app error handler failed: {err}"),
                 }
             }
+            discard_body(&req_ud);
+            match handled {
+                Some(resp) => Ok(resp),
+                None => error_response(&err, dev_mode),
+            }
         }
+    }
+}
+
+/// Releases the unread remainder of the request body once nothing will read
+/// it again, so hyper can finish the exchange without waiting on a GC.
+fn discard_body(req_ud: &AnyUserData) {
+    match req_ud.borrow_mut::<LuaRequest>() {
+        Ok(mut req) => req.discard_body(),
+        // Only reachable if a script stashed a live borrow; the body is then
+        // released at the next collection instead.
+        Err(err) => tracing::debug!("could not release the request body: {err}"),
     }
 }
 
@@ -133,8 +203,11 @@ fn finish(
     lua_resp: LuaTable,
     streams: &Arc<Semaphore>,
     dev_mode: bool,
+    req_ud: &AnyUserData,
 ) -> Result<HttpResponse> {
     match lua_resp.raw_get::<LuaValue>("body") {
+        // The streaming producer keeps running after this returns and may
+        // still read from the request, so its body stays alive.
         Ok(LuaValue::Function(body_fn)) => {
             let permit = match streams.clone().try_acquire_owned() {
                 Ok(permit) => permit,
@@ -151,14 +224,18 @@ fn finish(
                 }
             }
         }
-        Ok(_) => match to_response(lua_resp) {
-            Ok(resp) => Ok(resp),
-            Err(err) => {
-                tracing::error!("invalid handler response: {err}");
-                error_response(&err, dev_mode)
+        Ok(_) => {
+            discard_body(req_ud);
+            match to_response(lua_resp) {
+                Ok(resp) => Ok(resp),
+                Err(err) => {
+                    tracing::error!("invalid handler response: {err}");
+                    error_response(&err, dev_mode)
+                }
             }
-        },
+        }
         Err(err) => {
+            discard_body(req_ud);
             let err = Error::from(err);
             tracing::error!("invalid handler response: {err}");
             error_response(&err, dev_mode)

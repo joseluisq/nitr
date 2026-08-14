@@ -176,7 +176,7 @@ async fn main() -> nitr::Result {
         })
         .build()
         .await?
-        .serve() // ctrl-c shuts down gracefully; see serve_with_shutdown()
+        .serve() // SIGTERM/ctrl-c drains gracefully; see serve_with_shutdown()
         .await
 }
 ```

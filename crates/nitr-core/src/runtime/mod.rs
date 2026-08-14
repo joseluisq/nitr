@@ -38,10 +38,15 @@ pub struct Runtime {
     /// per-request thread allocation and hook installation.
     thread: Option<Thread>,
     /// Execution deadline for the instruction hook, in nanoseconds since
-    /// `epoch`. Stored atomically so the hook closure (installed once per
-    /// thread) reads the current request's deadline without locking.
+    /// `epoch`. Stored atomically so the hook closure (installed once for
+    /// the whole state) reads the current request's deadline without
+    /// locking.
     deadline: Arc<AtomicU64>,
     epoch: Instant,
+    /// Set when a failure leaves this state unfit for reuse (memory limit
+    /// hit, panic). The pool rebuilds a poisoned state instead of handing
+    /// it to the next request.
+    poisoned: bool,
     opts: RuntimeOpts,
 }
 
@@ -131,14 +136,54 @@ impl Runtime {
             }
         }
 
+        let deadline = Arc::new(AtomicU64::new(u64::MAX));
+        let epoch = Instant::now();
+
+        // Instruction-count hook: the only mechanism that can stop a
+        // CPU-bound loop (`while true do end` never reaches an await point,
+        // blocking both the async timeout and the executor).
+        //
+        // It is installed *globally* rather than per coroutine: Lua 5.4
+        // propagates a state's hook to threads created from it, so a
+        // `coroutine.create` inside a handler inherits the budget instead of
+        // escaping it.
+        if opts.exec_timeout.is_some() {
+            let deadline = deadline.clone();
+            lua.set_global_hook(
+                HookTriggers::new().every_nth_instruction(HOOK_INSTRUCTION_INTERVAL),
+                move |_, _| {
+                    if epoch.elapsed().as_nanos() as u64 > deadline.load(Ordering::Relaxed) {
+                        return Err(mlua::Error::RuntimeError(
+                            "handler execution exceeded its time budget".into(),
+                        ));
+                    }
+                    Ok(VmState::Continue)
+                },
+            )?;
+        }
+
         Ok(Self {
             lua,
             cfg: None,
             thread: None,
-            deadline: Arc::new(AtomicU64::new(u64::MAX)),
-            epoch: Instant::now(),
+            deadline,
+            epoch,
+            poisoned: false,
             opts,
         })
+    }
+
+    /// Whether a failure has left this state unfit for reuse (a memory
+    /// limit hit or a caught panic). The pool rebuilds a poisoned state
+    /// rather than handing it to the next request.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// Marks this state unfit for reuse. Used by the HTTP layer when a
+    /// panic is caught while the state is checked out.
+    pub fn poison(&mut self) {
+        self.poisoned = true;
     }
 
     /// Registers a Rust extension module: the closure runs now (and its
@@ -225,38 +270,18 @@ impl Runtime {
     }
 
     /// Returns the cached handler coroutine reset to the given function,
-    /// creating it
-    /// (and installing the execution-deadline hook once) when necessary.
+    /// creating it when necessary.
     ///
-    /// The handler runs in its own coroutine so the hook can be attached to
-    /// it (Lua hooks are per thread; a hook on the main state would never
-    /// fire inside the coroutine).
+    /// The handler runs in its own coroutine; the execution-deadline hook is
+    /// installed globally at construction and inherited by every thread,
+    /// including coroutines the script creates itself.
     fn handler_thread(&mut self, http_fn: Function) -> Result<Thread> {
         if let Some(thread) = self.thread.take() {
             if thread.reset(http_fn.clone()).is_ok() {
                 return Ok(thread);
             }
         }
-        let thread = self.lua.create_thread(http_fn)?;
-        if self.opts.exec_timeout.is_some() {
-            // Instruction-count hook: the only mechanism that can stop a
-            // CPU-bound loop (`while true do end` never reaches an await
-            // point, blocking both the async timeout and the executor).
-            let deadline = self.deadline.clone();
-            let epoch = self.epoch;
-            thread.set_hook(
-                HookTriggers::new().every_nth_instruction(HOOK_INSTRUCTION_INTERVAL),
-                move |_, _| {
-                    if epoch.elapsed().as_nanos() as u64 > deadline.load(Ordering::Relaxed) {
-                        return Err(mlua::Error::RuntimeError(
-                            "handler execution exceeded its time budget".into(),
-                        ));
-                    }
-                    Ok(VmState::Continue)
-                },
-            )?;
-        }
-        Ok(thread)
+        Ok(self.lua.create_thread(http_fn)?)
     }
 
     /// Calls a Lua function under the configured execution budget
@@ -291,7 +316,7 @@ impl Runtime {
         // Keep the coroutine for the next request (reset() also recovers
         // errored threads on Lua 5.4).
         self.thread = Some(thread);
-        Ok(result?)
+        self.classify(result)
     }
 
     /// Calls a Lua function under the instruction-hook deadline only — no
@@ -313,7 +338,22 @@ impl Runtime {
         }
         let result = thread.clone().into_async::<R>(args)?.await;
         self.thread = Some(thread);
-        Ok(result?)
+        self.classify(result)
+    }
+
+    /// Converts a call outcome into a [`Result`], marking the state
+    /// poisoned when the failure is one it cannot cleanly recover from.
+    fn classify<R>(&mut self, result: mlua::Result<R>) -> Result<R> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(err) => {
+                let err = Error::from(err);
+                if err.poisons_state() {
+                    self.poisoned = true;
+                }
+                Err(err)
+            }
+        }
     }
 
     /// A handle for extending this runtime's execution deadline from

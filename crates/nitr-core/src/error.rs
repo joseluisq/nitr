@@ -26,6 +26,50 @@ pub enum Error {
     /// The handler exceeded its execution budget.
     #[error("handler execution timed out")]
     Timeout,
+
+    /// No Lua state became available within the pool wait budget; the
+    /// request is shed rather than queued indefinitely.
+    #[error("no Lua state available within the pool wait budget")]
+    PoolBusy,
+
+    /// A panic was caught while running a request. The state that was in
+    /// use is recycled; this is always a bug in Rust code (Nitr's or an
+    /// extension module's), never in a Lua script.
+    #[error("panic while handling the request: {0}")]
+    Panic(String),
+
+    /// The graceful-shutdown drain deadline expired with connections still
+    /// in flight, so they were aborted. Surfaced rather than swallowed: a
+    /// truncated shutdown means a client's request was cut.
+    #[error("shutdown drain deadline expired with requests still in flight")]
+    ShutdownTimeout,
+}
+
+impl Error {
+    /// Whether this error leaves the Lua state unfit for reuse.
+    ///
+    /// A memory-limit hit is the clear case: the allocator refused, the
+    /// state's heap sits at its ceiling, and the next request would inherit
+    /// the problem. Ordinary script errors are *not* damage — Lua unwinds
+    /// cleanly and the state is fine.
+    pub fn poisons_state(&self) -> bool {
+        match self {
+            Error::Panic(_) => true,
+            Error::Lua(err) => is_memory_error(err),
+            _ => false,
+        }
+    }
+}
+
+/// Walks an mlua error chain looking for a memory error, which can be
+/// wrapped in `CallbackError`/`WithContext` layers by the time it surfaces.
+fn is_memory_error(err: &mlua::Error) -> bool {
+    match err {
+        mlua::Error::MemoryError(_) => true,
+        mlua::Error::CallbackError { cause, .. } => is_memory_error(cause),
+        mlua::Error::WithContext { cause, .. } => is_memory_error(cause),
+        _ => false,
+    }
 }
 
 /// Result type alias used across the Nitr library.

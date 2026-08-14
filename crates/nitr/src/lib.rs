@@ -28,6 +28,7 @@ pub use nitr_core::{
     RuntimePool,
 };
 pub use nitr_http::{
-    Config, FetchConfig, LimitsConfig, LuaConfig, RateLimitConfig, Server, ServerBuilder, StdConfig,
+    Config, FetchConfig, LimitsConfig, LuaConfig, RateLimitConfig, Server, ServerBuilder,
+    ShutdownConfig, StdConfig,
 };
 pub use nitr_std::{Builtins, BuiltinsEnv};

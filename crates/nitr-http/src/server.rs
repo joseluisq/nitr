@@ -2,6 +2,7 @@
 
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -24,9 +25,6 @@ use nitr_std::Builtins;
 /// How long to read request headers before giving up on a connection.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long to wait for in-flight requests on shutdown.
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
-
 /// A closure that customizes each pooled Lua state (advanced escape hatch;
 /// prefer [`ServerBuilder::module()`] for extensions).
 type SetupFn = Box<dyn Fn(&mlua::Lua) -> mlua::Result<()> + Send + Sync>;
@@ -46,8 +44,15 @@ pub struct Server {
     pool: Arc<RwLock<Arc<RuntimePool>>>,
     /// Streaming-response slots: one permit per live streaming body.
     streams: Arc<Semaphore>,
+    /// The permit count `streams` was created with, so the drain can tell
+    /// whether any streaming body is still live.
+    max_streams: usize,
     /// Pre-Lua protection: rate limiting, size limits, request ids.
     protection: Arc<Protection>,
+    /// Cleared as soon as a drain starts, so a load balancer can stop
+    /// routing before requests begin to fail. Read by
+    /// [`is_ready()`](Self::is_ready), which a readiness probe surfaces.
+    ready: Arc<AtomicBool>,
 }
 
 /// Builder for [`Server`].
@@ -72,6 +77,12 @@ impl Server {
         current_pool(&self.pool)
     }
 
+    /// Whether the server is accepting traffic. Cleared at the start of a
+    /// graceful shutdown, before in-flight requests are drained.
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Relaxed)
+    }
+
     /// An in-process client that dispatches requests through the full
     /// router/middleware/handler path without binding a socket — the
     /// foundation for `nitr test` and Rust-level integration tests.
@@ -91,7 +102,13 @@ impl Server {
         tracing::info!("reload requested: rebuilding the runtime pool");
         match build_runtimes(&self.cfg, self.builtins, &self.setup_fns, &self.modules).await {
             Ok(runtimes) => {
-                let fresh = Arc::new(RuntimePool::new(runtimes));
+                let fresh = Arc::new(new_pool(
+                    runtimes,
+                    &self.cfg,
+                    self.builtins,
+                    &self.setup_fns,
+                    &self.modules,
+                ));
                 match self.pool.write() {
                     Ok(mut pool) => {
                         *pool = fresh;
@@ -106,12 +123,19 @@ impl Server {
         }
     }
 
-    /// Serves until `ctrl-c`, then shuts down gracefully.
+    /// Serves until a shutdown signal arrives, then drains gracefully.
+    ///
+    /// The signal contract:
+    ///
+    /// | Signal | Meaning |
+    /// | ------ | ------- |
+    /// | `SIGTERM` | Graceful shutdown (what containers and systemd send) |
+    /// | `SIGINT` | Graceful shutdown (ctrl-c) |
+    /// | `SIGHUP` | Reload the runtime pool, keeping connections alive |
+    ///
+    /// On Windows only ctrl-c is available; the others are not wired.
     pub async fn serve(self) -> Result {
-        self.serve_with_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await
+        self.serve_with_shutdown(shutdown_signal()).await
     }
 
     /// Serves until the given future resolves, then shuts down gracefully:
@@ -204,16 +228,45 @@ impl Server {
             }
         }
 
-        tracing::info!("shutting down, waiting for in-flight requests");
-        tokio::select! {
-            _ = graceful.shutdown() => {}
-            _ = tokio::time::sleep(SHUTDOWN_GRACE) => {
-                tracing::warn!(
-                    "graceful shutdown timed out after {SHUTDOWN_GRACE:?}, aborting connections"
-                );
-            }
+        // Step 1 happened by leaving the accept loop: the listener is
+        // dropped below and no new connection is taken.
+        drop(listener);
+        // Step 2: stop advertising readiness *before* requests can fail, so
+        // a load balancer drains us on its own terms. Responses issued from
+        // here on also carry `Connection: close`.
+        self.ready.store(false, Ordering::Relaxed);
+
+        let grace = self.cfg.shutdown.grace();
+        let total = self.cfg.shutdown.total_grace();
+        tracing::info!(
+            "draining: waiting up to {grace:?} for in-flight requests \
+             ({stream_grace:?} more for streaming bodies)",
+            stream_grace = total.saturating_sub(grace),
+        );
+
+        // Steps 3-5: in-flight requests finish, idle keep-alive connections
+        // close (hyper marks them `Connection: close` as it drains), and the
+        // pool states they hold come back with them. Streaming bodies get
+        // the extra budget before anything is cut.
+        // Step 6 follows from the drain: dropping the watcher (and with it
+        // the last connection tasks) closes every Lua state, which
+        // checkpoints the SQLite WAL of each connection.
+        let deadline = drain_deadline(&self.streams, self.max_streams, grace, total);
+        let drained = tokio::select! {
+            _ = graceful.shutdown() => true,
+            _ = deadline => false,
+        };
+
+        if drained {
+            tracing::info!("drained cleanly, shutting down");
+            Ok(())
+        } else {
+            // A truncated shutdown means somebody's request was cut. Report
+            // it as an error so a supervisor can surface it, rather than
+            // exiting 0 and hiding it.
+            tracing::warn!("drain deadline of {total:?} expired, aborting remaining connections");
+            Err(Error::ShutdownTimeout)
         }
-        Ok(())
     }
 }
 
@@ -322,6 +375,7 @@ impl ServerBuilder {
         let setup_fns = Arc::new(self.setup_fns);
         let modules = Arc::new(self.modules);
         let runtimes = build_runtimes(&cfg, builtins, &setup_fns, &modules).await?;
+        let pool = new_pool(runtimes, &cfg, builtins, &setup_fns, &modules);
 
         // Streaming responses hold a pooled state for their lifetime; by
         // default keep at least one state free for short requests.
@@ -335,8 +389,10 @@ impl ServerBuilder {
             builtins,
             setup_fns,
             modules,
-            pool: Arc::new(RwLock::new(Arc::new(RuntimePool::new(runtimes)))),
+            pool: Arc::new(RwLock::new(Arc::new(pool))),
             streams: Arc::new(Semaphore::new(max_streams)),
+            max_streams,
+            ready: Arc::new(AtomicBool::new(true)),
         })
     }
 }
@@ -350,12 +406,84 @@ impl std::fmt::Debug for Server {
     }
 }
 
+/// Resolves when the drain has run out of time.
+///
+/// Ordinary requests get `grace`. A streaming body legitimately outlives any
+/// request-shaped budget, so when one is still live at that point the drain
+/// waits until `total` instead — the extra budget is spent only on the case
+/// it exists for, rather than delaying every shutdown by it.
+async fn drain_deadline(streams: &Semaphore, max_streams: usize, grace: Duration, total: Duration) {
+    tokio::time::sleep(grace).await;
+    if streams.available_permits() < max_streams {
+        tracing::info!("streaming bodies still live, extending the drain to {total:?}");
+        tokio::time::sleep(total.saturating_sub(grace)).await;
+    }
+}
+
+/// Resolves when the process is asked to stop: `SIGTERM` (containers and
+/// systemd) or `SIGINT` (ctrl-c). On non-Unix targets only ctrl-c exists.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(sig) => sig,
+            Err(err) => {
+                tracing::warn!("failed to install the SIGTERM handler: {err}");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = term.recv() => tracing::info!("received SIGTERM"),
+            _ = tokio::signal::ctrl_c() => tracing::info!("received SIGINT"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("received ctrl-c");
+    }
+}
+
 /// The currently-live pool (poisoning is unreachable: the lock is only
 /// held to clone/replace an `Arc`).
 pub(crate) fn current_pool(pool: &Arc<RwLock<Arc<RuntimePool>>>) -> Arc<RuntimePool> {
     pool.read()
         .map(|p| p.clone())
         .unwrap_or_else(|e| e.into_inner().clone())
+}
+
+/// Wraps the runtimes in a pool that can recycle a damaged state.
+///
+/// The rebuild closure reproduces exactly what `build_runtimes` produces for
+/// a non-bootstrap state: builtins, extension modules, the configuration
+/// snapshot, and the compiled handler. The configuration *script* is never
+/// re-run — its snapshot is captured once, so a recycle has no side effects.
+fn new_pool(
+    runtimes: Vec<Runtime>,
+    cfg: &Config,
+    builtins: Builtins,
+    setup_fns: &Arc<Vec<SetupFn>>,
+    modules: &Arc<Vec<Module>>,
+) -> RuntimePool {
+    // A rebuilt state needs the same configuration snapshot the others got.
+    let snapshot = runtimes
+        .first()
+        .and_then(|rt| rt.cfg_snapshot().ok().flatten());
+    let cfg = cfg.clone();
+    let setup_fns = setup_fns.clone();
+    let modules = modules.clone();
+    RuntimePool::with_rebuild(runtimes, move || {
+        let base_statics = crate::static_files::base_mounts(&cfg);
+        let mut rt = new_runtime(&cfg, builtins, &setup_fns, &modules)?;
+        if let Some(snapshot) = &snapshot {
+            rt.set_cfg_snapshot(snapshot)?;
+        }
+        set_nitr_cfg(&rt)?;
+        app::load(&rt, &cfg.handler_script, &base_statics)?;
+        Ok(rt)
+    })
 }
 
 /// Builds the full set of pooled runtimes: a bootstrap state runs the

@@ -17,6 +17,7 @@ nitr-core = { workspace = true }
 nitr-std = { workspace = true }
 
 async-channel = { workspace = true }
+futures-util = { workspace = true }
 bytes = { workspace = true }
 http-body-util = { workspace = true }
 httpdate = { workspace = true }

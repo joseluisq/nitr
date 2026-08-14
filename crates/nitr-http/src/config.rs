@@ -59,6 +59,8 @@ pub struct Config {
     pub rate_limit: RateLimitConfig,
     /// Outbound-request policy for the `fetch` builtin (`[fetch]` section).
     pub fetch: FetchConfig,
+    /// Graceful-shutdown timing (`[shutdown]` section).
+    pub shutdown: ShutdownConfig,
     /// Static file serving (`[static]` section).
     #[serde(rename = "static")]
     pub static_files: StaticConfig,
@@ -101,6 +103,12 @@ pub struct LimitsConfig {
     /// Maximum concurrent TCP connections; the listener stops accepting
     /// while at the cap.
     pub max_connections: usize,
+    /// How long a request may wait for a free Lua state before it is shed
+    /// with `503` and a `Retry-After`, in milliseconds. `0` waits forever
+    /// (the pre-phase-10 behavior). Shedding happens before any Lua runs,
+    /// so an overloaded server answers quickly instead of queueing work
+    /// nobody is still waiting for.
+    pub pool_wait_ms: u64,
 }
 
 impl Default for LimitsConfig {
@@ -110,7 +118,47 @@ impl Default for LimitsConfig {
             max_header_bytes: 16 * 1024, // 16 KiB
             max_uri_bytes: 8 * 1024,     // 8 KiB
             max_connections: 1024,
+            // Generous by default: long enough that a brief burst queues
+            // rather than sheds, short enough that a saturated server fails
+            // fast instead of accumulating doomed requests.
+            pool_wait_ms: 5_000,
         }
+    }
+}
+
+/// Graceful-shutdown timing (`[shutdown]` section).
+///
+/// On `SIGTERM`/`SIGINT` the server stops accepting, lets in-flight
+/// requests finish, and only then exits. These bound how long it waits.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ShutdownConfig {
+    /// Seconds to let ordinary in-flight requests finish.
+    pub grace: u64,
+    /// Extra seconds granted to streaming and SSE bodies, which can
+    /// legitimately outlive a normal request. They are cut at
+    /// `grace + stream_grace`.
+    pub stream_grace: u64,
+}
+
+impl Default for ShutdownConfig {
+    fn default() -> Self {
+        Self {
+            grace: 30,
+            stream_grace: 5,
+        }
+    }
+}
+
+impl ShutdownConfig {
+    /// Deadline for ordinary in-flight requests.
+    pub fn grace(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.grace)
+    }
+
+    /// Total deadline including the extra budget for long-lived bodies.
+    pub fn total_grace(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.grace + self.stream_grace)
     }
 }
 
@@ -227,6 +275,7 @@ impl Default for Config {
             limits: LimitsConfig::default(),
             rate_limit: RateLimitConfig::default(),
             fetch: FetchConfig::default(),
+            shutdown: ShutdownConfig::default(),
             static_files: StaticConfig::default(),
             tests_dir: None,
             lua: LuaConfig::default(),
@@ -268,7 +317,8 @@ impl Config {
     /// Applies `NITR_*` environment variable overrides on top of the current
     /// values: `NITR_LISTEN`, `NITR_HANDLER_SCRIPT`, `NITR_CONFIG_SCRIPT`,
     /// `NITR_TEMPLATES_DIR`, `NITR_DATABASE`, `NITR_WORKERS`, `NITR_MAX_STREAMS`,
-    /// `NITR_DEV_MODE`, `NITR_LUA_MEMORY_LIMIT`, `NITR_LUA_EXEC_TIMEOUT_MS`.
+    /// `NITR_DEV_MODE`, `NITR_LUA_MEMORY_LIMIT`, `NITR_LUA_EXEC_TIMEOUT_MS`,
+    /// `NITR_POOL_WAIT_MS`, `NITR_SHUTDOWN_GRACE`.
     pub fn apply_env(&mut self) -> Result {
         if let Some(v) = env_var("NITR_LISTEN") {
             self.listen = parse_env("NITR_LISTEN", &v)?;
@@ -299,6 +349,12 @@ impl Config {
         }
         if let Some(v) = env_var("NITR_LUA_EXEC_TIMEOUT_MS") {
             self.lua.exec_timeout_ms = parse_env("NITR_LUA_EXEC_TIMEOUT_MS", &v)?;
+        }
+        if let Some(v) = env_var("NITR_POOL_WAIT_MS") {
+            self.limits.pool_wait_ms = parse_env("NITR_POOL_WAIT_MS", &v)?;
+        }
+        if let Some(v) = env_var("NITR_SHUTDOWN_GRACE") {
+            self.shutdown.grace = parse_env("NITR_SHUTDOWN_GRACE", &v)?;
         }
         Ok(())
     }

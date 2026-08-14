@@ -40,10 +40,24 @@ database = "scripts/file.db"
 
 # Request-size and connection limits, enforced before a request reaches Lua.
 #[limits]
-#max_body_bytes = 1048576    # declared request body cap (413 beyond it)
+#max_body_bytes = 1048576    # request body cap (413 beyond it), counted as
+                             # the body arrives, not trusted from
+                             # Content-Length
 #max_header_bytes = 16384    # request header buffer (min 8192)
 #max_uri_bytes = 8192        # request URI cap (414 beyond it)
 #max_connections = 1024      # concurrent TCP connections
+#pool_wait_ms = 5000         # how long a request waits for a free Lua state
+                             # before it is shed with 503 + Retry-After;
+                             # 0 waits forever
+
+# Graceful shutdown. On SIGTERM/SIGINT the server stops accepting, stops
+# reporting ready, lets in-flight work finish, and only then exits. A drain
+# that runs out of time exits non-zero, because a cut request is not a clean
+# shutdown.
+#[shutdown]
+#grace = 30                  # seconds for ordinary in-flight requests
+#stream_grace = 5            # extra seconds for streaming/SSE bodies, spent
+                             # only if one is still live
 
 # Per-client-IP fixed-window rate limiting (429 + Retry-After beyond the
 # budget). Disabled by default.

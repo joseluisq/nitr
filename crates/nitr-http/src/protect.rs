@@ -26,6 +26,9 @@ pub(crate) struct Protection {
     max_body_bytes: u64,
     max_uri_bytes: usize,
     trust_request_id: bool,
+    dev_mode: bool,
+    /// How long a request may wait for a Lua state before it is shed.
+    pool_wait: Duration,
     rate: Option<RateLimiter>,
     /// Static mounts from the `[static]` configuration, appended to the
     /// script's own mounts on every (re)load.
@@ -38,6 +41,8 @@ impl Protection {
             max_body_bytes: cfg.limits.max_body_bytes,
             max_uri_bytes: cfg.limits.max_uri_bytes,
             trust_request_id: cfg.trust_request_id,
+            dev_mode: cfg.dev_mode,
+            pool_wait: Duration::from_millis(cfg.limits.pool_wait_ms),
             rate: cfg.rate_limit.enabled.then(|| RateLimiter {
                 max: cfg.rate_limit.requests.max(1),
                 window: Duration::from_secs(cfg.rate_limit.window.max(1)),
@@ -51,6 +56,21 @@ impl Protection {
     /// The `[static]` mounts merged into every state's dispatch table.
     pub(crate) fn base_statics(&self) -> &[crate::static_files::StaticMount] {
         &self.base_statics
+    }
+
+    /// Whether error responses may carry internal detail.
+    pub(crate) fn dev_mode(&self) -> bool {
+        self.dev_mode
+    }
+
+    /// The checkout wait budget; zero means wait indefinitely.
+    pub(crate) fn pool_wait(&self) -> Duration {
+        self.pool_wait
+    }
+
+    /// The configured request body ceiling, enforced as the body is read.
+    pub(crate) fn max_body_bytes(&self) -> u64 {
+        self.max_body_bytes
     }
 
     /// The id for a request: a trusted, well-formed inbound `X-Request-ID`
