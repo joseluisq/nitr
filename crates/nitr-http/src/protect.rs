@@ -8,11 +8,11 @@ use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use hyper::header::HeaderValue;
 use hyper::StatusCode;
+use hyper::header::HeaderValue;
 
 use crate::config::Config;
-use crate::handler::{plain_response, HttpResponse};
+use crate::handler::{HttpResponse, plain_response};
 use crate::request::LuaRequest;
 use nitr_core::Result;
 
@@ -110,36 +110,35 @@ impl Protection {
     /// [`request_id`](Self::request_id) over bare headers (used by the
     /// in-process test client, whose body type differs).
     pub(crate) fn request_id_for_parts(&self, headers: &hyper::HeaderMap) -> String {
-        if self.trust_request_id {
-            if let Some(id) = headers
+        if self.trust_request_id
+            && let Some(id) = headers
                 .get("x-request-id")
                 .and_then(|v| v.to_str().ok())
                 .filter(|v| {
                     !v.is_empty() && v.len() <= 64 && v.bytes().all(|b| b.is_ascii_graphic())
                 })
-            {
-                return id.to_string();
-            }
+        {
+            return id.to_string();
         }
         uuid::Uuid::now_v7().to_string()
     }
 
     /// Runs the pre-Lua checks; `Some` is the rejection response.
     pub(crate) fn check(&self, req: &LuaRequest) -> Option<Result<HttpResponse>> {
-        if let Some(rate) = &self.rate {
-            if let Err(retry_after) = rate.check(req) {
-                tracing::debug!(peer = %req.peer_addr, "request rate limited");
-                return Some(
-                    plain_response(StatusCode::TOO_MANY_REQUESTS, "Too Many Requests").map(
-                        |mut resp| {
-                            if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
-                                resp.headers_mut().insert(hyper::header::RETRY_AFTER, value);
-                            }
-                            resp
-                        },
-                    ),
-                );
-            }
+        if let Some(rate) = &self.rate
+            && let Err(retry_after) = rate.check(req)
+        {
+            tracing::debug!(peer = %req.peer_addr, "request rate limited");
+            return Some(
+                plain_response(StatusCode::TOO_MANY_REQUESTS, "Too Many Requests").map(
+                    |mut resp| {
+                        if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
+                            resp.headers_mut().insert(hyper::header::RETRY_AFTER, value);
+                        }
+                        resp
+                    },
+                ),
+            );
         }
 
         if uri_len(req) > self.max_uri_bytes {
@@ -211,17 +210,16 @@ impl RateLimiter {
     /// The IP the budget is keyed by: the first `X-Forwarded-For` entry
     /// when explicitly trusted (behind a proxy), else the peer address.
     fn client_ip(&self, req: &LuaRequest) -> IpAddr {
-        if self.trust_forwarded_for {
-            if let Some(ip) = req
+        if self.trust_forwarded_for
+            && let Some(ip) = req
                 .req
                 .headers()
                 .get("x-forwarded-for")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.split(',').next())
                 .and_then(|v| v.trim().parse().ok())
-            {
-                return ip;
-            }
+        {
+            return ip;
         }
         req.peer_addr.ip()
     }

@@ -56,7 +56,7 @@ jobs:
 
     - name: Check formatting
       run: |
-        cargo fmt --all -- --check tests/*.rs
+        cargo fmt --all -- --check
 
     # The `all` feature alias selects exactly one TLS crypto provider
     # (tls-ring, the default). Using `--all-features` would enable both

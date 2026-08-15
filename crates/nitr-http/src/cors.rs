@@ -115,23 +115,24 @@ impl Cors {
         // origin's verdict to another.
         vary_preflight(resp.headers_mut());
 
-        if let Some(allow) = self.allow_origin(origin) {
-            if self.method_allowed(requested) && self.headers_allowed(headers) {
-                let out = resp.headers_mut();
-                out.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, allow);
-                out.insert(header::ACCESS_CONTROL_ALLOW_METHODS, self.methods.clone());
-                if let Some(value) = &self.allowed_headers_value {
-                    out.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, value.clone());
-                }
-                if self.credentials {
-                    out.insert(
-                        header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
-                        HeaderValue::from_static("true"),
-                    );
-                }
-                if let Some(age) = &self.max_age {
-                    out.insert(header::ACCESS_CONTROL_MAX_AGE, age.clone());
-                }
+        if let Some(allow) = self.allow_origin(origin)
+            && self.method_allowed(requested)
+            && self.headers_allowed(headers)
+        {
+            let out = resp.headers_mut();
+            out.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, allow);
+            out.insert(header::ACCESS_CONTROL_ALLOW_METHODS, self.methods.clone());
+            if let Some(value) = &self.allowed_headers_value {
+                out.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, value.clone());
+            }
+            if self.credentials {
+                out.insert(
+                    header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+                    HeaderValue::from_static("true"),
+                );
+            }
+            if let Some(age) = &self.max_age {
+                out.insert(header::ACCESS_CONTROL_MAX_AGE, age.clone());
             }
         }
         Some(Ok(resp))
@@ -295,10 +296,12 @@ mod tests {
         let h = resp.headers();
         assert_eq!(h[header::ACCESS_CONTROL_ALLOW_ORIGIN], "https://ok.example");
         assert_eq!(h[header::ACCESS_CONTROL_MAX_AGE], "600");
-        assert!(h[header::ACCESS_CONTROL_ALLOW_METHODS]
-            .to_str()
-            .expect("methods")
-            .contains("POST"));
+        assert!(
+            h[header::ACCESS_CONTROL_ALLOW_METHODS]
+                .to_str()
+                .expect("methods")
+                .contains("POST")
+        );
     }
 
     #[test]
@@ -323,9 +326,11 @@ mod tests {
         // 204 without the approval headers: the browser blocks the request,
         // and we have not told the caller what the policy is.
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-        assert!(!resp
-            .headers()
-            .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
+        assert!(
+            !resp
+                .headers()
+                .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+        );
     }
 
     #[test]

@@ -198,7 +198,7 @@ impl Server {
         {
             let tx = reload_tx.clone();
             tokio::spawn(async move {
-                use tokio::signal::unix::{signal, SignalKind};
+                use tokio::signal::unix::{SignalKind, signal};
                 let Ok(mut hangup) = signal(SignalKind::hangup()) else {
                     tracing::warn!("failed to install the SIGHUP reload handler");
                     return;
@@ -489,7 +489,7 @@ async fn drain_deadline(streams: &Semaphore, max_streams: usize, grace: Duration
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         let mut term = match signal(SignalKind::terminate()) {
             Ok(sig) => sig,
             Err(err) => {

@@ -3,8 +3,8 @@ use mlua::{
     RegistryKey, StdLib, Table, Thread, Value, VmState,
 };
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
@@ -127,13 +127,13 @@ impl Runtime {
 
         // Confine `require` to the configured directory and forbid loading
         // native modules.
-        if opts.libs.contains(StdLib::PACKAGE) {
-            if let Some(dir) = &opts.package_dir {
-                let dir = dir.to_string_lossy();
-                let package: Table = lua.globals().get("package")?;
-                package.set("path", format!("{dir}/?.lua;{dir}/?/init.lua"))?;
-                package.set("cpath", "")?;
-            }
+        if opts.libs.contains(StdLib::PACKAGE)
+            && let Some(dir) = &opts.package_dir
+        {
+            let dir = dir.to_string_lossy();
+            let package: Table = lua.globals().get("package")?;
+            package.set("path", format!("{dir}/?.lua;{dir}/?/init.lua"))?;
+            package.set("cpath", "")?;
         }
 
         let deadline = Arc::new(AtomicU64::new(u64::MAX));
@@ -276,10 +276,10 @@ impl Runtime {
     /// installed globally at construction and inherited by every thread,
     /// including coroutines the script creates itself.
     fn handler_thread(&mut self, http_fn: Function) -> Result<Thread> {
-        if let Some(thread) = self.thread.take() {
-            if thread.reset(http_fn.clone()).is_ok() {
-                return Ok(thread);
-            }
+        if let Some(thread) = self.thread.take()
+            && thread.reset(http_fn.clone()).is_ok()
+        {
+            return Ok(thread);
         }
         Ok(self.lua.create_thread(http_fn)?)
     }

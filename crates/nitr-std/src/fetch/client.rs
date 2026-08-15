@@ -15,10 +15,10 @@ use bytes::Bytes;
 use mlua::{
     AnyUserData, ExternalResult, Function, Lua, Table, UserData, UserDataMethods, Value, Variadic,
 };
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE, LOCATION};
-use reqwest::{redirect, Client as HttpClient, Method as HttpMethod, StatusCode, Url};
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, LOCATION};
+use reqwest::{Client as HttpClient, Method as HttpMethod, StatusCode, Url, redirect};
 
-use crate::fetch::policy::{check_url, ConnectPolicy, FetchOptions, GuardedResolver};
+use crate::fetch::policy::{ConnectPolicy, FetchOptions, GuardedResolver, check_url};
 use crate::fetch::response::LuaResponse;
 
 /// Maximum redirects followed per outbound request.
@@ -344,10 +344,10 @@ fn parse_spec(method: String, url: String, arg: Option<Table>) -> mlua::Result<R
                 headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
                 body = Some(Bytes::from(bytes));
             }
-            if body.is_none() {
-                if let Some(raw) = table.get::<Option<mlua::LuaString>>("body")? {
-                    body = Some(Bytes::copy_from_slice(&raw.as_bytes()));
-                }
+            if body.is_none()
+                && let Some(raw) = table.get::<Option<mlua::LuaString>>("body")?
+            {
+                body = Some(Bytes::copy_from_slice(&raw.as_bytes()));
             }
             if let Some(secs) = table.get::<Option<f64>>("timeout")? {
                 timeout = Some(Duration::from_secs_f64(secs.max(0.0)));
@@ -379,7 +379,7 @@ fn parse_retry(table: &Table) -> mlua::Result<Retry> {
         Some(other) => {
             return Err(mlua::Error::RuntimeError(format!(
                 "unknown retry backoff `{other}`: expected \"exponential\" or \"constant\""
-            )))
+            )));
         }
     };
     Ok(Retry {
@@ -445,12 +445,12 @@ pub(crate) fn create_fetch_fn(lua: &Lua, opts: Arc<FetchOptions>) -> mlua::Resul
     lua.create_function(
         move |lua, (method, url, arg): (String, String, Option<Table>)| {
             let mut spec = parse_spec(method, url, arg)?;
-            if opts.propagate_trace_context {
-                if let Some(value) = traceparent(lua) {
-                    spec.headers
-                        .entry(HeaderName::from_static("traceparent"))
-                        .or_insert(value);
-                }
+            if opts.propagate_trace_context
+                && let Some(value) = traceparent(lua)
+            {
+                spec.headers
+                    .entry(HeaderName::from_static("traceparent"))
+                    .or_insert(value);
             }
             Ok(LuaFetch {
                 client: http_client.clone(),

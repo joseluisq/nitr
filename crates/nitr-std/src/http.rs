@@ -9,8 +9,8 @@
 
 use std::sync::Mutex;
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use hmac::{Hmac, Mac as _};
 use mlua::{
     ExternalResult as _, Function, Lua, MetaMethod, ObjectLike as _, Table, UserData,
@@ -130,7 +130,7 @@ pub(crate) fn register(lua: &Lua, nitr: &Table) -> mlua::Result<()> {
                     return Err(mlua::Error::RuntimeError(format!(
                         "nitr.error body must be a string or a table, got {}",
                         other.type_name()
-                    )))
+                    )));
                 }
             }
             Ok(table)
@@ -398,7 +398,7 @@ fn build_cookie(name: &str, value: &str, opts: Option<&Table>) -> mlua::Result<S
                 other => {
                     return Err(mlua::Error::RuntimeError(format!(
                         "invalid same_site value `{other}`: expected Strict, Lax or None"
-                    )))
+                    )));
                 }
             });
         }

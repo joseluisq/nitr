@@ -26,11 +26,11 @@ pub(crate) mod template;
 pub(crate) mod utils;
 
 pub use cache::{Cache, CacheOptions};
+pub use db::SqlitePragmas;
 pub use db::migrate;
 pub use db::pragmas::open as db_open;
-pub use db::SqlitePragmas;
-pub use fetch::{reset_outbound_budget, set_trace_context, FetchOptions};
-pub use http::{best_match, RequestCookies, ResponseCookies};
+pub use fetch::{FetchOptions, reset_outbound_budget, set_trace_context};
+pub use http::{RequestCookies, ResponseCookies, best_match};
 
 bitflags::bitflags! {
     /// Built-in `nitr.*` standard library modules that can be exposed to

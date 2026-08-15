@@ -1,4 +1,4 @@
-use rusqlite::{params_from_iter, Connection};
+use rusqlite::{Connection, params_from_iter};
 
 use crate::db::types::SqlValue;
 

@@ -761,7 +761,7 @@ impl LuaConfig {
                 _ => {
                     return Err(Error::Config(format!(
                         "unknown Lua standard library `{name}`"
-                    )))
+                    )));
                 }
             };
         }

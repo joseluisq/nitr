@@ -236,7 +236,7 @@ fn compile(value: Value, script: &Path) -> Result<Compiled> {
                 "the handler script {} must return a nitr.app(), got {}",
                 script.display(),
                 other.type_name()
-            )))
+            )));
         }
     };
     let app = app_ud.borrow::<LuaApp>()?;
@@ -329,7 +329,7 @@ fn to_matchit(path: &str) -> Result<String> {
             s if s.starts_with(':') || s.starts_with('*') => {
                 return Err(Error::Script(format!(
                     "invalid segment `{seg}` in route path `{path}`"
-                )))
+                )));
             }
             s => s.to_string(),
         });

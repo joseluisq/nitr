@@ -120,10 +120,10 @@ pub(crate) async fn try_serve(
         let rel = mount.relative(&decoded)?;
         let Some(file) = resolve(&mount.dir, rel).await else {
             // Unknown path inside an SPA mount falls back to its index.
-            if mount.spa {
-                if let Some(index) = resolve(&mount.dir, "index.html").await {
-                    return Some(serve_file(req, mount, &index, compression).await);
-                }
+            if mount.spa
+                && let Some(index) = resolve(&mount.dir, "index.html").await
+            {
+                return Some(serve_file(req, mount, &index, compression).await);
             }
             continue;
         };
@@ -202,10 +202,10 @@ async fn serve_file(
     if let Some(modified) = modified {
         builder = builder.header(header::LAST_MODIFIED, httpdate::fmt_http_date(modified));
     }
-    if let Some(cache_control) = &mount.cache_control {
-        if let Ok(value) = HeaderValue::from_str(cache_control) {
-            builder = builder.header(header::CACHE_CONTROL, value);
-        }
+    if let Some(cache_control) = &mount.cache_control
+        && let Ok(value) = HeaderValue::from_str(cache_control)
+    {
+        builder = builder.header(header::CACHE_CONTROL, value);
     }
     // A sidecar is looked for on every request, so which bytes come back
     // genuinely depends on this header — say so, or a shared cache will

@@ -15,11 +15,11 @@ use std::io::Write as _;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use http_body_util::combinators::BoxBody;
 use http_body_util::BodyExt as _;
+use http_body_util::combinators::BoxBody;
+use hyper::StatusCode;
 use hyper::body::{Body, Bytes, Frame, SizeHint};
 use hyper::header::{self, HeaderValue};
-use hyper::StatusCode;
 
 use crate::config::CompressionConfig;
 use crate::handler::HttpResponse;
@@ -163,10 +163,10 @@ impl Compression {
         // A known-small body is not worth a compressor. An unknown length
         // (a stream) is compressed: refusing would exclude exactly the
         // responses where compression pays best.
-        if let Some(len) = resp.body().size_hint().exact() {
-            if len < self.min_size {
-                return false;
-            }
+        if let Some(len) = resp.body().size_hint().exact()
+            && len < self.min_size
+        {
+            return false;
         }
         let content_type = headers
             .get(header::CONTENT_TYPE)

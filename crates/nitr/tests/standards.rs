@@ -301,10 +301,12 @@ async fn precompressed_sidecars_are_served_when_accepted() {
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.headers()["content-encoding"], "gzip");
     // The content type comes from the logical file, not from `.gz`.
-    assert!(resp.headers()["content-type"]
-        .to_str()
-        .expect("content type")
-        .contains("javascript"));
+    assert!(
+        resp.headers()["content-type"]
+            .to_str()
+            .expect("content type")
+            .contains("javascript")
+    );
     assert_eq!(resp.headers()["vary"], "accept-encoding");
 
     let mut decoded = String::new();
@@ -360,10 +362,12 @@ async fn dynamic_responses_compress_only_when_enabled() {
         .await
         .expect("gzip");
     assert_eq!(resp.headers()["content-encoding"], "gzip");
-    assert!(resp.headers()["vary"]
-        .to_str()
-        .expect("vary")
-        .contains("accept-encoding"));
+    assert!(
+        resp.headers()["vary"]
+            .to_str()
+            .expect("vary")
+            .contains("accept-encoding")
+    );
     let body = resp.bytes().await.expect("bytes");
     assert!(body.len() < identity_len, "compression must shrink it");
     let mut decoded = String::new();

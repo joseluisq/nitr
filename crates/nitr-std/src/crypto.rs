@@ -5,10 +5,10 @@
 //! Primitives, not a framework: everything is implemented in Rust
 //! (RustCrypto), and scripts compose them into their own auth flows.
 
-use argon2::password_hash::{PasswordHash, PasswordHasher as _, PasswordVerifier as _, SaltString};
 use argon2::Argon2;
-use base64::engine::general_purpose::STANDARD as B64;
+use argon2::password_hash::{PasswordHash, PasswordHasher as _, PasswordVerifier as _, SaltString};
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64;
 use hmac::{Hmac, Mac as _};
 use mlua::{Lua, LuaString, ObjectLike as _, Table, Value};
 use sha2::{Digest as _, Sha256};
@@ -216,9 +216,11 @@ mod tests {
         let verify: mlua::Function = crypto.get("password_verify").expect("fn");
         assert!(verify.call::<bool>(("hunter2", hash.clone())).expect("ok"));
         assert!(!verify.call::<bool>(("wrong", hash)).expect("ok"));
-        assert!(!verify
-            .call::<bool>(("hunter2", "not-a-hash".to_string()))
-            .expect("ok"));
+        assert!(
+            !verify
+                .call::<bool>(("hunter2", "not-a-hash".to_string()))
+                .expect("ok")
+        );
     }
 
     #[test]

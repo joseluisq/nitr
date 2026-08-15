@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use mlua::{AnyUserData, Function, Lua, Table, UserData, UserDataMethods, Value};
 use rusqlite::Connection;
 
-use crate::db::types::{params_from_table, row_to_lua, Conn, SqlValue};
+use crate::db::types::{Conn, SqlValue, params_from_table, row_to_lua};
 use nitr_core::Result;
 
 pub(crate) mod execute;

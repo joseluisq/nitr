@@ -176,7 +176,7 @@ pub fn pending(conn: &Connection, dir: &Path) -> Result<Vec<String>> {
                      the change.",
                     migration.name,
                     migration.path.display()
-                )))
+                )));
             }
             State::Applied => {}
         }
@@ -200,7 +200,7 @@ pub fn run(conn: &Connection, dir: &Path) -> Result<Vec<String>> {
                 return Err(Error::Config(format!(
                     "migration `{}` has changed since it was applied; refusing to continue",
                     migration.name
-                )))
+                )));
             }
             None => {}
         }

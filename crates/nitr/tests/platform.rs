@@ -83,10 +83,12 @@ return app
         .await
         .expect("asset");
     assert_eq!(resp.status(), 200);
-    assert!(resp.headers()["content-type"]
-        .to_str()
-        .expect("ct")
-        .contains("javascript"));
+    assert!(
+        resp.headers()["content-type"]
+            .to_str()
+            .expect("ct")
+            .contains("javascript")
+    );
 
     // Traversal attempts never leave the mount.
     for path in [

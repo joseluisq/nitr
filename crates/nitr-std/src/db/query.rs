@@ -1,6 +1,6 @@
-use rusqlite::{params_from_iter, Connection};
+use rusqlite::{Connection, params_from_iter};
 
-use crate::db::types::{read_row, SqlRow, SqlValue};
+use crate::db::types::{SqlRow, SqlValue, read_row};
 
 /// Runs a query and returns all result rows.
 pub(crate) fn call(

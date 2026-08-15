@@ -16,5 +16,5 @@ pub mod ns;
 mod runtime;
 
 pub use error::{Error, Result};
-pub use ns::{mount, nitr_table, ModuleFn};
+pub use ns::{ModuleFn, mount, nitr_table};
 pub use runtime::{DeadlineHandle, Runtime, RuntimeGuard, RuntimeOpts, RuntimePool};

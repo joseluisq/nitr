@@ -1,8 +1,8 @@
 use std::convert::Infallible;
 
-use http_body_util::{combinators::BoxBody, BodyExt as _, Empty, Full};
+use http_body_util::{BodyExt as _, Empty, Full, combinators::BoxBody};
 use hyper::body::Bytes;
-use hyper::{header, Method, Response, StatusCode};
+use hyper::{Method, Response, StatusCode, header};
 use mlua::{AnyUserData, Function, LuaString, Table as LuaTable, Value as LuaValue};
 
 use futures_util::FutureExt as _;
@@ -115,10 +115,10 @@ fn strip_body(resp: HttpResponse) -> HttpResponse {
     use hyper::body::Body as _;
 
     let (mut parts, body) = resp.into_parts();
-    if !parts.headers.contains_key(header::CONTENT_LENGTH) {
-        if let Some(len) = body.size_hint().exact() {
-            parts.headers.insert(header::CONTENT_LENGTH, len.into());
-        }
+    if !parts.headers.contains_key(header::CONTENT_LENGTH)
+        && let Some(len) = body.size_hint().exact()
+    {
+        parts.headers.insert(header::CONTENT_LENGTH, len.into());
     }
     HttpResponse::from_parts(parts, Empty::<Bytes>::new().boxed())
 }
@@ -147,10 +147,10 @@ async fn handle_inner(
     }
     // A preflight carries no body and calls no handler: answering it here
     // keeps a pooled Lua state free for a request that needs one.
-    if let Some(cors) = protection.cors() {
-        if let Some(resp) = cors.preflight(&req.req) {
-            return resp;
-        }
+    if let Some(cors) = protection.cors()
+        && let Some(resp) = cors.preflight(&req.req)
+    {
+        return resp;
     }
     // `check` only compared the *declared* length; from here the bytes are
     // counted as the handler reads them.
@@ -169,11 +169,9 @@ async fn handle_inner(
     };
     let dev_mode = rt.dev_mode();
 
-    if dev_mode {
-        if let Err(err) = app::reload_if_changed(&rt, protection.base_statics()) {
-            tracing::error!("failed to reload the HTTP handler: {err}");
-            return error_response(&err, dev_mode);
-        }
+    if dev_mode && let Err(err) = app::reload_if_changed(&rt, protection.base_statics()) {
+        tracing::error!("failed to reload the HTTP handler: {err}");
+        return error_response(&err, dev_mode);
     }
 
     // A state serves one request at a time, so "this request" is
@@ -495,7 +493,7 @@ pub(crate) fn build_response(
             return Err(Error::Script(format!(
                 "invalid `cookies` field of type `{}` in the response table",
                 other.type_name()
-            )))
+            )));
         }
     }
 

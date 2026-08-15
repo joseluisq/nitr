@@ -1,13 +1,13 @@
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 
-use http_body_util::combinators::BoxBody;
 use http_body_util::BodyExt as _;
-use hyper::body::{Body, Bytes, Frame};
+use http_body_util::combinators::BoxBody;
 use hyper::Request;
+use hyper::body::{Body, Bytes, Frame};
 
 /// The request body type: boxed so both real (`hyper::body::Incoming`) and
 /// synthetic (test client) bodies flow through the same dispatch.
@@ -346,10 +346,10 @@ impl UserData for LuaRequest {
                 // The parser cannot advance while a field is alive, so the
                 // part is reclaimed and drained whatever the callback did
                 // with it — including nothing, and including failing.
-                if let Ok(part) = part.borrow::<crate::multipart::LuaPart>() {
-                    if let Some(mut field) = part.reclaim() {
-                        while field.chunk().await.into_lua_err()?.is_some() {}
-                    }
+                if let Ok(part) = part.borrow::<crate::multipart::LuaPart>()
+                    && let Some(mut field) = part.reclaim()
+                {
+                    while field.chunk().await.into_lua_err()?.is_some() {}
                 }
                 outcome?;
             }

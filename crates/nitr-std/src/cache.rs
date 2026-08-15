@@ -263,7 +263,7 @@ impl UserData for Cache {
                     _ => {
                         return Err(mlua::Error::RuntimeError(
                             "cache:remember expects (key, fn) or (key, opts, fn)".into(),
-                        ))
+                        ));
                     }
                 };
                 if let Some(bytes) = cache.get_raw(&key)? {
@@ -413,8 +413,10 @@ mod tests {
             ..Default::default()
         });
         c.set_raw("k".into(), b"v".to_vec(), None).expect("set");
-        assert!(c.inner.lock().expect("lock").entries["k"]
-            .expires_at
-            .is_none());
+        assert!(
+            c.inner.lock().expect("lock").entries["k"]
+                .expires_at
+                .is_none()
+        );
     }
 }

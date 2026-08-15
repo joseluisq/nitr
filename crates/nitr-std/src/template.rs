@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use minijinja::{path_loader, Environment};
+use minijinja::{Environment, path_loader};
 use mlua::{AnyUserData, ExternalResult, Lua, LuaSerdeExt, Table, UserData, UserDataMethods};
 
 pub(crate) struct LuaTemplate<'a>(Arc<Environment<'a>>);

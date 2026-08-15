@@ -29,8 +29,8 @@
 //! of every three, so the retry path is visible rather than theoretical.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use nitr::{Builtins, Config, DatabaseConfig, Server};
 

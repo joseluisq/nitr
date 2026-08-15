@@ -350,9 +350,11 @@ fn migrations_apply_and_the_ledger_is_readable() {
     );
     let applied = nitr::stdlib::migrate::run(&conn, &dir).expect("run");
     assert_eq!(applied.len(), 2);
-    assert!(nitr::stdlib::migrate::pending(&conn, &dir)
-        .expect("pending")
-        .is_empty());
+    assert!(
+        nitr::stdlib::migrate::pending(&conn, &dir)
+            .expect("pending")
+            .is_empty()
+    );
 
     conn.execute("INSERT INTO notes (body) VALUES ('hi')", [])
         .expect("the schema really exists");
