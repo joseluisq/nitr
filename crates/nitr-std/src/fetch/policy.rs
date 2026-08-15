@@ -7,11 +7,15 @@
 //! against the same policy.
 
 use std::net::IpAddr;
+use std::time::Duration;
 
 use mlua::ExternalResult as _;
 use reqwest::Url;
 
 /// Policy and limits applied to every outbound `fetch` request.
+///
+/// None of this is reachable from Lua: a script declares intent (a timeout,
+/// a retry count) but cannot widen its own policy or uncap its budget.
 #[derive(Debug, Clone)]
 pub struct FetchOptions {
     /// When set, only these exact host names may be fetched (compared
@@ -25,6 +29,24 @@ pub struct FetchOptions {
     pub max_response_bytes: u64,
     /// Maximum concurrent requests per `await_all(...)` call.
     pub max_concurrent: usize,
+    /// Maximum outbound requests one inbound request may make in total.
+    /// `0` removes the cap.
+    pub max_per_request: u32,
+    /// How long to wait for a TCP/TLS connection to an upstream.
+    pub connect_timeout: Duration,
+    /// Default total budget per outbound request.
+    pub timeout: Duration,
+    /// Idle connections kept per upstream host.
+    pub pool_max_idle_per_host: usize,
+    /// Ceiling on the `retry.attempts` a call may ask for.
+    pub max_retries: u32,
+    /// Explicit proxy URL; `None` uses the environment variables unless
+    /// [`no_proxy`](Self::no_proxy) is set.
+    pub proxy: Option<String>,
+    /// Ignore the proxy environment variables.
+    pub no_proxy: bool,
+    /// Forward a W3C `traceparent` derived from the inbound request id.
+    pub propagate_trace_context: bool,
 }
 
 impl Default for FetchOptions {
@@ -34,8 +56,106 @@ impl Default for FetchOptions {
             allow_private_networks: false,
             max_response_bytes: 8 * 1024 * 1024, // 8 MiB
             max_concurrent: 8,
+            max_per_request: 32,
+            connect_timeout: Duration::from_secs(10),
+            timeout: Duration::from_secs(30),
+            pool_max_idle_per_host: 8,
+            max_retries: 5,
+            proxy: None,
+            no_proxy: false,
+            propagate_trace_context: false,
         }
     }
+}
+
+/// The parts of the policy that decide which addresses may be connected to.
+///
+/// Split out because the DNS resolver needs exactly this and nothing else,
+/// and because it is what the client is keyed on: two configurations that
+/// agree here can share a connection pool.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ConnectPolicy {
+    pub(crate) allow_private_networks: bool,
+    pub(crate) connect_timeout: Duration,
+    pub(crate) timeout: Duration,
+    pub(crate) pool_max_idle_per_host: usize,
+    pub(crate) proxy: Option<String>,
+    pub(crate) no_proxy: bool,
+}
+
+impl FetchOptions {
+    pub(crate) fn connect_policy(&self) -> ConnectPolicy {
+        ConnectPolicy {
+            allow_private_networks: self.allow_private_networks,
+            connect_timeout: self.connect_timeout,
+            timeout: self.timeout,
+            pool_max_idle_per_host: self.pool_max_idle_per_host,
+            proxy: self.proxy.clone(),
+            no_proxy: self.no_proxy,
+        }
+    }
+}
+
+/// A DNS resolver that refuses to hand the connector an address the policy
+/// forbids.
+///
+/// This is what closes the rebinding hole. The old flow resolved a name,
+/// checked the addresses, and then passed the *name* to the connector,
+/// which resolved it again — so a malicious DNS server could answer
+/// `93.184.216.34` to the check and `169.254.169.254` to the connect. Here
+/// the filtering happens inside the single resolution the connector
+/// actually uses, so the checked value and the used value are the same one.
+#[derive(Debug)]
+pub(crate) struct GuardedResolver {
+    allow_private_networks: bool,
+}
+
+impl GuardedResolver {
+    pub(crate) fn new(allow_private_networks: bool) -> Self {
+        Self {
+            allow_private_networks,
+        }
+    }
+}
+
+impl reqwest::dns::Resolve for GuardedResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let allow_private = self.allow_private_networks;
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            // Port 0: the connector substitutes the real one. Only the
+            // address matters for the policy.
+            let resolved: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|err| -> BoxError { Box::new(err) })?
+                .collect();
+            if resolved.is_empty() {
+                return Err(no_address(&host));
+            }
+            let allowed: Vec<std::net::SocketAddr> = resolved
+                .into_iter()
+                .filter(|addr| allow_private || !is_forbidden_ip(addr.ip()))
+                .collect();
+            if allowed.is_empty() {
+                return Err(forbidden(&host));
+            }
+            Ok(Box::new(allowed.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+fn no_address(host: &str) -> BoxError {
+    format!("fetch host `{host}` did not resolve to any address").into()
+}
+
+fn forbidden(host: &str) -> BoxError {
+    format!(
+        "fetch host `{host}` resolves to a private or local address \
+         (set fetch.allow_private_networks to permit this)"
+    )
+    .into()
 }
 
 /// Validates one request URL against the policy. Called for the initial
@@ -66,9 +186,10 @@ pub(crate) async fn check_url(url: &Url, opts: &FetchOptions) -> mlua::Result<()
         return Ok(());
     }
 
-    // Resolve-then-check: a domain must not resolve to any special-purpose
-    // address. (Known limitation: without connection pinning a malicious
-    // DNS server could still rebind between this check and the connect.)
+    // A first look, so a forbidden target fails with a clear message
+    // rather than a connector error. It is not the security boundary:
+    // [`GuardedResolver`] filters the resolution the connector actually
+    // uses, which is what makes rebinding between the two impossible.
     let ips: Vec<IpAddr> = match host {
         url::Host::Ipv4(ip) => vec![ip.into()],
         url::Host::Ipv6(ip) => vec![ip.into()],
@@ -154,6 +275,30 @@ mod tests {
         for good in ["93.184.216.34", "1.1.1.1", "2606:4700::1111"] {
             assert!(!is_forbidden_ip(ip(good)), "{good} must be allowed");
         }
+    }
+
+    /// The resolver is the actual boundary, not `check_url`: it filters the
+    /// single resolution the connector uses, so there is no second lookup
+    /// for a malicious DNS server to answer differently.
+    #[tokio::test]
+    async fn the_resolver_refuses_to_hand_over_a_forbidden_address() {
+        use reqwest::dns::Resolve as _;
+
+        let guarded = GuardedResolver::new(false);
+        let name: reqwest::dns::Name = "localhost".parse().expect("name");
+        let err = guarded
+            .resolve(name)
+            .await
+            .err()
+            .expect("localhost resolves to loopback and must be refused");
+        assert!(err.to_string().contains("private or local"), "{err}");
+
+        // The same name is fine once private networks are allowed, which
+        // proves the refusal came from the policy and not from resolution.
+        let open = GuardedResolver::new(true);
+        let name: reqwest::dns::Name = "localhost".parse().expect("name");
+        let addrs = open.resolve(name).await.expect("allowed");
+        assert!(addrs.count() > 0);
     }
 
     #[tokio::test]

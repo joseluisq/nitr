@@ -15,6 +15,7 @@ use std::path::PathBuf;
 
 use nitr_core::Result;
 
+pub mod cache;
 pub(crate) mod crypto;
 pub(crate) mod db;
 pub(crate) mod fetch;
@@ -24,7 +25,11 @@ pub(crate) mod log;
 pub(crate) mod template;
 pub(crate) mod utils;
 
-pub use fetch::FetchOptions;
+pub use cache::{Cache, CacheOptions};
+pub use db::migrate;
+pub use db::pragmas::open as db_open;
+pub use db::SqlitePragmas;
+pub use fetch::{reset_outbound_budget, set_trace_context, FetchOptions};
 pub use http::{best_match, RequestCookies, ResponseCookies};
 
 bitflags::bitflags! {
@@ -53,6 +58,8 @@ bitflags::bitflags! {
         /// `nitr.crypto` primitives (hashing, HMAC, passwords) and the
         /// `nitr.auth` header parsers.
         const CRYPTO = 1 << 7;
+        /// `nitr.cache`: the bounded cache shared by every pooled state.
+        const CACHE = 1 << 8;
     }
 }
 
@@ -94,6 +101,7 @@ impl Builtins {
             "http" => Some(Builtins::HTTP),
             "log" => Some(Builtins::LOG),
             "crypto" => Some(Builtins::CRYPTO),
+            "cache" => Some(Builtins::CACHE),
             _ => None,
         }
     }
@@ -105,8 +113,14 @@ impl Builtins {
 pub struct BuiltinsEnv {
     /// Directory the `template` builtin loads templates from.
     pub templates_dir: Option<PathBuf>,
-    /// SQLite database file the `conn` builtin connects to.
+    /// SQLite database file the `db` builtin connects to.
     pub database: Option<PathBuf>,
+    /// Connection pragmas applied to that database.
+    pub sqlite: SqlitePragmas,
+    /// The shared cache backing `nitr.cache`. Built once by the server and
+    /// handed to every state, so it survives a pool rebuild — a cache that
+    /// empties on every reload is a cache that never warms.
+    pub cache: Option<Cache>,
     /// Outbound-request policy for the `fetch` builtin.
     pub fetch: FetchOptions,
 }
@@ -149,9 +163,15 @@ pub fn register_builtins(lua: &mlua::Lua, builtins: Builtins, env: &BuiltinsEnv)
                 nitr.set("auth", crypto::create_auth_table(lua)?)?;
             }
             Builtins::DATABASE => match &env.database {
-                Some(path) => nitr.set("db", db::create_database_fn(lua, path)?)?,
+                Some(path) => nitr.set("db", db::create_database_fn(lua, path, &env.sqlite)?)?,
                 None => {
                     tracing::warn!("skipping builtin `db`: `database` is not configured");
+                }
+            },
+            Builtins::CACHE => match &env.cache {
+                Some(cache) => nitr.set("cache", cache::create_cache(lua, cache.clone())?)?,
+                None => {
+                    tracing::warn!("skipping builtin `cache`: no shared cache was provided");
                 }
             },
             _ => continue,

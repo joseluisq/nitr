@@ -28,3 +28,7 @@ docs/site
 docs/*/**.html
 */**/*.1
 docs/docs
+
+# SQLite WAL sidecars: enabling WAL makes a database three files.
+*.db-wal
+*.db-shm

@@ -53,6 +53,34 @@ pub struct Server {
     /// routing before requests begin to fail. Read by
     /// [`is_ready()`](Self::is_ready), which a readiness probe surfaces.
     ready: Arc<AtomicBool>,
+    /// The shared `nitr.cache`, held here so a reload hands the new pool
+    /// the same storage rather than starting cold.
+    cache: Option<nitr_std::Cache>,
+}
+
+/// Refuses to start while a migration is pending.
+///
+/// The alternative — applying them at boot — is how two instances of a
+/// rolling deployment race to change the same schema, each believing it is
+/// the only one. Making it an explicit step means somebody chose when it
+/// happened.
+fn check_migrations(cfg: &Config) -> Result {
+    let Some(db) = &cfg.database else {
+        return Ok(());
+    };
+    let Some(dir) = db.migrations() else {
+        return Ok(());
+    };
+    let conn = nitr_std::db_open(&db.path, &db.pragmas())?;
+    let pending = nitr_std::migrate::pending(&conn, &dir)?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+    Err(Error::Config(format!(
+        "{} migration(s) pending ({}). Run `nitr migrate` first.",
+        pending.len(),
+        pending.join(", ")
+    )))
 }
 
 /// Builder for [`Server`].
@@ -100,7 +128,15 @@ impl Server {
     /// error the old pool stays.
     async fn reload(&self) {
         tracing::info!("reload requested: rebuilding the runtime pool");
-        match build_runtimes(&self.cfg, self.builtins, &self.setup_fns, &self.modules).await {
+        match build_runtimes(
+            &self.cfg,
+            self.builtins,
+            &self.setup_fns,
+            &self.modules,
+            self.cache.as_ref(),
+        )
+        .await
+        {
             Ok(runtimes) => {
                 let fresh = Arc::new(new_pool(
                     runtimes,
@@ -108,6 +144,7 @@ impl Server {
                     self.builtins,
                     &self.setup_fns,
                     &self.modules,
+                    self.cache.clone(),
                 ));
                 match self.pool.write() {
                     Ok(mut pool) => {
@@ -305,7 +342,10 @@ impl ServerBuilder {
 
     /// SQLite database file for the `conn` builtin.
     pub fn database(mut self, path: impl Into<PathBuf>) -> Self {
-        self.cfg.database = Some(path.into());
+        match &mut self.cfg.database {
+            Some(db) => db.path = path.into(),
+            None => self.cfg.database = Some(crate::config::DatabaseConfig::new(path)),
+        }
         self
     }
 
@@ -377,8 +417,28 @@ impl ServerBuilder {
         };
         let setup_fns = Arc::new(self.setup_fns);
         let modules = Arc::new(self.modules);
-        let runtimes = build_runtimes(&cfg, builtins, &setup_fns, &modules).await?;
-        let pool = new_pool(runtimes, &cfg, builtins, &setup_fns, &modules);
+
+        // Pending migrations stop the boot. Applying them here instead
+        // would mean two instances rolling out at once race to change the
+        // schema, each believing it is alone.
+        check_migrations(&cfg)?;
+
+        // Built once and shared by every state, including states built by
+        // a later reload: a cache that empties whenever the handler script
+        // changes is a cache that never warms.
+        let cache = builtins
+            .contains(nitr_std::Builtins::CACHE)
+            .then(|| nitr_std::Cache::new(cfg.cache_options()));
+
+        let runtimes = build_runtimes(&cfg, builtins, &setup_fns, &modules, cache.as_ref()).await?;
+        let pool = new_pool(
+            runtimes,
+            &cfg,
+            builtins,
+            &setup_fns,
+            &modules,
+            cache.clone(),
+        );
 
         // Streaming responses hold a pooled state for their lifetime; by
         // default keep at least one state free for short requests.
@@ -396,6 +456,7 @@ impl ServerBuilder {
             streams: Arc::new(Semaphore::new(max_streams)),
             max_streams,
             ready: Arc::new(AtomicBool::new(true)),
+            cache,
         })
     }
 }
@@ -469,6 +530,7 @@ fn new_pool(
     builtins: Builtins,
     setup_fns: &Arc<Vec<SetupFn>>,
     modules: &Arc<Vec<Module>>,
+    cache: Option<nitr_std::Cache>,
 ) -> RuntimePool {
     // A rebuilt state needs the same configuration snapshot the others got.
     let snapshot = runtimes
@@ -479,7 +541,7 @@ fn new_pool(
     let modules = modules.clone();
     RuntimePool::with_rebuild(runtimes, move || {
         let base_statics = crate::static_files::base_mounts(&cfg);
-        let mut rt = new_runtime(&cfg, builtins, &setup_fns, &modules)?;
+        let mut rt = new_runtime(&cfg, builtins, &setup_fns, &modules, cache.as_ref())?;
         if let Some(snapshot) = &snapshot {
             rt.set_cfg_snapshot(snapshot)?;
         }
@@ -498,13 +560,14 @@ async fn build_runtimes(
     builtins: Builtins,
     setup_fns: &[SetupFn],
     modules: &[Module],
+    cache: Option<&nitr_std::Cache>,
 ) -> Result<Vec<Runtime>> {
     let workers = cfg.workers.max(1);
     let base_statics = crate::static_files::base_mounts(cfg);
     let base_statics = base_statics.as_slice();
 
     // Bootstrap state: runs the configuration script exactly once.
-    let mut bootstrap = new_runtime(cfg, builtins, setup_fns, modules)?;
+    let mut bootstrap = new_runtime(cfg, builtins, setup_fns, modules, cache)?;
     let snapshot = match &cfg.config_script {
         Some(conf_src) => {
             // Pass the database connection to the config script when available.
@@ -525,7 +588,7 @@ async fn build_runtimes(
     let mut runtimes = Vec::with_capacity(workers);
     runtimes.push(bootstrap);
     for _ in 1..workers {
-        let mut rt = new_runtime(cfg, builtins, setup_fns, modules)?;
+        let mut rt = new_runtime(cfg, builtins, setup_fns, modules, cache)?;
         if let Some(snapshot) = &snapshot {
             rt.set_cfg_snapshot(snapshot)?;
         }
@@ -541,12 +604,19 @@ fn new_runtime(
     builtins: Builtins,
     setup_fns: &[SetupFn],
     modules: &[Module],
+    cache: Option<&nitr_std::Cache>,
 ) -> Result<Runtime> {
     let rt = Runtime::new_with(cfg.runtime_opts()?)?;
     let env = nitr_std::BuiltinsEnv {
         templates_dir: cfg.templates_dir.clone(),
-        database: cfg.database.clone(),
+        database: cfg.database.as_ref().map(|db| db.path.clone()),
+        sqlite: cfg
+            .database
+            .as_ref()
+            .map(|db| db.pragmas())
+            .unwrap_or_default(),
         fetch: cfg.fetch.options(),
+        cache: cache.cloned(),
     };
     nitr_std::register_builtins(rt.lua(), builtins, &env)?;
     app::register_nitr_app(rt.lua())?;

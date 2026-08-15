@@ -9,7 +9,7 @@ on:
       - .cargo/config.toml
       - Cargo.lock
       - Cargo.toml
-      - src/**
+      - crates/**
       - tests/**
   push:
     branches:
@@ -19,7 +19,7 @@ on:
       - .cargo/config.toml
       - Cargo.lock
       - Cargo.toml
-      - src/**
+      - crates/**
       - tests/**
   schedule:
     - cron: '40 01 * * *' # Every day at 01:40 UTC

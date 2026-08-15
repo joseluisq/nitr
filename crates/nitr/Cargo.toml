@@ -23,6 +23,10 @@ nitr-std = { workspace = true }
 
 [dev-dependencies]
 flate2 = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+rusqlite = { workspace = true }
 mlua = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }

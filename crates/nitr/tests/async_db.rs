@@ -11,6 +11,17 @@ fn write_temp(name: &str, content: &str) -> PathBuf {
     path
 }
 
+/// Waits for a spawned server to actually be accepting on `addr`.
+async fn wait_until_listening(addr: std::net::SocketAddr) {
+    for _ in 0..200 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the server never started listening on {addr}");
+}
+
 fn free_addr() -> SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind port 0");
     listener.local_addr().expect("local addr")
@@ -231,6 +242,7 @@ return app
     let served = tokio::spawn(server.serve_with_shutdown(async {
         let _ = stop_rx.await;
     }));
+    wait_until_listening(addr).await;
     let client = reqwest::Client::new();
 
     let body: serde_json::Value = client
@@ -288,6 +300,9 @@ return app
     let served = tokio::spawn(server.serve_with_shutdown(async {
         let _ = stop_rx.await;
     }));
+    // `serve` binds inside the spawned task, so the first request has to
+    // wait for the listener rather than race it.
+    wait_until_listening(addr).await;
 
     let body: serde_json::Value = client
         .get(format!("http://{addr}/try"))

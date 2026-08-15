@@ -1,6 +1,6 @@
-# Nitr
+# Nitr [![devel](https://github.com/joseluisq/nitr/actions/workflows/devel.yml/badge.svg)](https://github.com/joseluisq/nitr/actions/workflows/devel.yml)
 
-> A Rust web server embedding [Lua](https://www.lua.org/) for fast, efficient and safe dynamic backends.
+> A Rust web server embedding [Lua](https://www.lua.org/) for fast, efficient and safe smaller dynamic backends.
 
 **STATUS:** Nitr is in early development and not ready for production use. Feel free to try it out and contribute.
 
@@ -16,7 +16,8 @@ Nitr is both a **binary** (`nitr`, configured via `nitr.toml`) and a **library c
 
 - **Pool of Lua states over a multi-thread runtime:** one request per state, no global locks, natural backpressure.
 - **Safety by default**: `io`/`os` excluded from the stdlib (opt-in), 8 MiB memory limit per state, 30 s execution budget enforced by an instruction-count hook (stops `while true do end`) plus an async timeout, `require` confined to the scripts directory, no native Lua modules.
-- **One namespaced standard library:** `nitr.json`, `nitr.fetch` (HTTP client with SSRF policy), `nitr.template` (minijinja), `nitr.db` (SQLite, runs off the async threads), `nitr.log`, `nitr.crypto`/`nitr.auth`, `nitr.dbg`.
+- **One namespaced standard library:** `nitr.json`, `nitr.fetch` (HTTP client with SSRF policy, opt-in retries and a per-request outbound budget), `nitr.template` (minijinja), `nitr.db` (SQLite in WAL mode, runs off the async threads), `nitr.cache` (bounded, shared across states), `nitr.log`, `nitr.crypto`/`nitr.auth`, `nitr.dbg`.
+- **Data you can deploy:** SQLite with WAL, a busy timeout and foreign keys on by default; plain-SQL migrations applied by `nitr migrate` and a server that refuses to start with a pending one.
 - **Rust-side routing (`nitr.app()`):** path parameters, middleware chains composed once at load, per-app error handler, 404/405 answered without entering Lua.
 - **HTTP correctness:** binary-safe request/response bodies, multi-value headers (`Set-Cookie`), parsed query strings, `HEAD`/`OPTIONS` answered without a route, conditional requests, graceful shutdown, no Lua tracebacks leaked to clients (unless dev mode).
 - **The rest of HTTP, in Rust:** range requests (`206`/`416`, `If-Range`), response compression (brotli/gzip plus precompressed `.br`/`.gz` sidecars), CORS policy with preflights answered before Lua runs, `req:form()` for urlencoded bodies, and `req:multipart()` uploads that stream to disk without ever entering the Lua heap.
@@ -101,7 +102,9 @@ Every Nitr API is a field of the global `nitr` table; nothing else is registered
 | `req.params` | Table of path parameters |
 | `req.id` | Request id (UUIDv7, echoed as `X-Request-ID`) |
 | `req.cookies` | `req.cookies.name`, `req.cookies:verify(name, secret)` |
-| `req:text()`, `req:json()`, `req:read()`, `req:accepts(...)` | Body as string, decoded JSON, streamed chunks; content negotiation |
+| `req:text()`, `req:json()`, `req:form()`, `req:read(n?)`, `req:accepts(...)` | Body as string, decoded JSON, urlencoded form table, bounded chunks; content negotiation |
+| `req:multipart(fn)` | Uploads: `fn(part)` per part, with `part:save(path)` streaming to disk without entering the Lua heap |
+| `req:fresh(etag, last_modified?)` | Whether the client's cached copy is current (`If-None-Match` / `If-Modified-Since`) |
 
 ### Response (returned table)
 
@@ -114,6 +117,7 @@ Every Nitr API is a field of the global `nitr` table; nothing else is registered
 | `nitr.redirect(location, status?)`, `nitr.status(code)` | Redirects and bare status responses |
 | `nitr.error(code, body?)` | Error response; a table body is rendered as JSON |
 | `nitr.negotiate(req, offers)` | Content negotiation over the `Accept` header (406 when nothing matches) |
+| `nitr.etag(value, weak?)` | A validator for a dynamic response, to pair with `req:fresh()` |
 | `nitr.sse(fn)` | Server-Sent Events stream; `fn(send)` calls `send(event, data)` |
 
 ### Standard library
@@ -123,11 +127,13 @@ The `nitr.*` standard library provides building blocks — enable the features y
 | Module | Description |
 | --- | --- |
 | `nitr.json:encode(v)` / `nitr.json:decode(s)` | JSON codec (serde); callable as the response helper above |
-| `nitr.fetch(method, url, opts?)` → `client:send()` | HTTP client (shared pool, timeouts, SSRF policy, per-hop redirect checks). Response: `.status`, `.headers`, `.url`, `:text()`, `:json()`, `:read()` |
+| `nitr.fetch(method, url, opts?)` → `client:send()` | HTTP client (shared pool, timeouts, SSRF policy with a guarded resolver, per-hop redirect checks, opt-in `retry = { attempts, backoff }` on idempotent methods, per-request outbound budget). Response: `.status`, `.headers`, `.url`, `:text()`, `:json()`, `:read()` |
+| `nitr.cache:get/set/delete/clear/remember/stats` | Bounded TTL+LRU cache shared by every state. Entries are plain data, so no Lua value crosses between states; per-process, so not a session store |
 | `nitr.await_all({...})` | Run several `fetch` handles concurrently, capped by `fetch.max_concurrent` |
 | `nitr.template:render(name, data?)` | minijinja templates from `templates_dir` |
 | `nitr.db:execute/query/query_row/query_one(sql, params?)` | SQLite (`database` file); queries run on a blocking thread pool with a prepared-statement cache |
-| `nitr.db:transaction(fn)` | Atomic transaction (nestable via savepoints); rolls back on error |
+| `nitr.db:transaction(fn)` | Atomic transaction (nestable via savepoints); rolls back on error. Use the `tx` handle inside the body — the outer `nitr.db` refuses to run while a transaction is open, rather than silently joining it |
+| `nitr.db:query_async(sql, params?, kind?)` | An unsent query, so `nitr.await_all` can run it alongside a `fetch` instead of in series |
 | `nitr.log.debug/info/warn/error(msg, fields?)` | Structured logging into the request span |
 | `nitr.crypto.*` | `sha256`, `hmac_sha256`, `random_bytes`, `constant_time_eq`, `password_hash`/`password_verify` (argon2id) |
 | `nitr.auth.basic(req)` / `nitr.auth.bearer(req)` | Parse `Authorization` credentials |

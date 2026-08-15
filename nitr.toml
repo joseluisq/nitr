@@ -57,6 +57,32 @@ database = "scripts/file.db"
                              # `max_body_bytes` too — it bounds the whole
                              # request, uploads included.
 
+# SQLite. Either a bare path (`database = "app.db"`, taking the defaults
+# below) or this table when the pragmas need tuning.
+#
+# WAL matters most: with one connection per pooled state, SQLite's default
+# rollback journal serializes every writer and fails fast on contention.
+# It also changes the on-disk file set to `app.db`, `app.db-wal` and
+# `app.db-shm`, so copying only `app.db` while the server runs no longer
+# captures a consistent snapshot -- use `VACUUM INTO` or stop the server.
+#[database]
+#path = "app.db"
+#journal_mode = "wal"      # or "delete"; "keep" leaves the existing mode
+#busy_timeout = 5000       # ms to wait on a lock instead of failing
+#synchronous = "normal"    # the right pairing with WAL
+#foreign_keys = true       # SQLite leaves this off, which surprises everyone
+#cache_size = -2000        # KiB per connection
+#migrations_dir = "migrations"
+
+# The shared `nitr.cache` (enable with `cache` in [std] features). Bounded
+# and owned by Rust; entries are serialized, so no Lua value crosses between
+# states. Per-process: a restart empties it and two Nitr processes have two
+# independent caches, so sessions and exact counters do not belong here.
+#[cache]
+#max_entries = 10000
+#max_bytes = 33554432
+#default_ttl = 300         # seconds; 0 means no expiry
+
 # Response compression. Off by default: it trades the server's CPU for
 # bandwidth, and that should be a decision rather than a surprise.
 # Precompressed sidecars (`app.js.br` next to `app.js`) are served whenever
@@ -98,11 +124,27 @@ database = "scripts/file.db"
 # Outbound-request policy for the `nitr.fetch` builtin. By default requests to
 # loopback/private/link-local addresses are refused (SSRF protection) and
 # every redirect hop is re-checked against this policy.
+# A hostname is resolved once, inside the resolver the connector uses, so a
+# DNS server cannot answer one address to the check and another to the
+# connect.
 #[fetch]
 #allowed_hosts = ["api.example.com"] # exact-host allow-list (all hops)
 #allow_private_networks = false      # permit loopback/RFC1918 targets
 #max_response_bytes = 8388608        # cap on resp:text()/resp:json() bodies
 #max_concurrent = 8                  # max requests per nitr.await_all(...)
+#max_per_request = 32                # total outbound calls one inbound
+                                     # request may make; 0 removes the cap
+#connect_timeout = 10.0              # seconds to establish a connection
+#timeout = 30.0                      # default per-request budget; a per-call
+                                     # `timeout` option overrides it
+#pool_max_idle_per_host = 8
+#max_retries = 5                     # ceiling on retry.attempts; retries are
+                                     # opt-in per call and only ever applied
+                                     # to idempotent methods
+#proxy = "http://proxy.internal:3128" # unset reads HTTPS_PROXY/HTTP_PROXY
+#no_proxy = false                    # ignore the proxy env vars entirely
+#propagate_trace_context = false     # forward a W3C traceparent derived
+                                     # from the inbound request id
 
 # Static file serving (Rust-side: ETag/Last-Modified/304, content types,
 # traversal protection). Scripts can add mounts with app:static(...).
@@ -123,11 +165,12 @@ dev_mode = true
 # library provides building blocks — opt into the features your scripts
 # need (or replace them with your own modules). When the list is omitted,
 # only a minimal set is enabled: "json", "http", "log". Valid names:
-# "dbg", "fetch", "template", "json", "db", "http", "log", "crypto".
+# "dbg", "fetch", "template", "json", "db", "http", "log", "crypto",
+# "cache".
 # Listing a feature is strict: a listed feature missing its configuration
 # (e.g. "db" without `database`) fails at startup.
 [std]
-features = ["dbg", "fetch", "template", "json", "db", "http", "log", "crypto"]
+features = ["dbg", "fetch", "template", "json", "db", "http", "log", "crypto", "cache"]
 
 [lua]
 # Lua standard libraries loaded into every state.

@@ -176,6 +176,12 @@ async fn handle_inner(
         }
     }
 
+    // A state serves one request at a time, so "this request" is
+    // unambiguous: the outbound budget starts fresh here, and outbound
+    // calls can carry a `traceparent` derived from this request's id.
+    nitr_std::reset_outbound_budget(rt.lua());
+    nitr_std::set_trace_context(rt.lua(), &req.id);
+
     let target = match resolve(&rt, &req, protection.compression()).await {
         Ok(target) => target,
         Err(err) => {

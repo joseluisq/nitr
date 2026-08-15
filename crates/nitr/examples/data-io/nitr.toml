@@ -1,0 +1,13 @@
+# Configuration for the `nitr migrate` half of the data-io example.
+handler_script = "crates/nitr/examples/data-io/app.lua"
+
+[std]
+features = ["json", "http", "log", "db", "cache", "fetch"]
+
+[database]
+path = "/tmp/nitr-data-io-example.db"
+journal_mode = "wal"
+busy_timeout = 5000
+synchronous = "normal"
+foreign_keys = true
+migrations_dir = "crates/nitr/examples/data-io/migrations"

@@ -25,7 +25,7 @@ pub mod testing;
 pub mod service;
 
 pub use config::{
-    CompressionConfig, Config, CorsConfig, FetchConfig, LimitsConfig, LuaConfig, RateLimitConfig,
-    ShutdownConfig, StaticConfig, StdConfig,
+    CacheConfig, CompressionConfig, Config, CorsConfig, DatabaseConfig, FetchConfig, LimitsConfig,
+    LuaConfig, RateLimitConfig, ShutdownConfig, StaticConfig, StdConfig,
 };
 pub use server::{Server, ServerBuilder};

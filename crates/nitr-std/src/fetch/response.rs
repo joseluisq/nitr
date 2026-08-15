@@ -13,6 +13,10 @@ impl LuaResponse {
     pub(crate) fn new(resp: Response, max_bytes: u64) -> Self {
         Self { resp, max_bytes }
     }
+
+    pub(crate) fn status(&self) -> reqwest::StatusCode {
+        self.resp.status()
+    }
 }
 
 /// Reads the whole body into memory, enforcing the response-size cap.

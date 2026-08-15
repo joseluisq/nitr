@@ -14,11 +14,13 @@ Commands:
   dev              Start the server in development mode (hot reload)
   check            Load the configuration and scripts, then exit
   test             Run the Lua tests against an in-process server
+  migrate          Apply pending SQL migrations from migrations/
   init [DIR]       Scaffold a new Nitr application
 
 Options:
   -c, --config <PATH>  Path to the TOML config file (default: ./nitr.toml)
       --dev            Enable development mode (hot reload)
+      --status         With `migrate`: report what has run and what is pending
   -h, --help           Print this help message
 
 Signals:
@@ -28,12 +30,14 @@ struct Args {
     command: Command,
     config: Option<PathBuf>,
     dev: bool,
+    status: bool,
 }
 
 enum Command {
     Run,
     Check,
     Test,
+    Migrate,
     Init(PathBuf),
 }
 
@@ -42,6 +46,7 @@ fn parse_args() -> anyhow::Result<Args> {
         command: Command::Run,
         config: None,
         dev: false,
+        status: false,
     };
     let mut iter = std::env::args().skip(1).peekable();
     let mut command_seen = false;
@@ -60,6 +65,10 @@ fn parse_args() -> anyhow::Result<Args> {
                 command_seen = true;
                 args.command = Command::Test;
             }
+            "migrate" if !command_seen => {
+                command_seen = true;
+                args.command = Command::Migrate;
+            }
             "init" if !command_seen => {
                 command_seen = true;
                 let dir = match iter.peek() {
@@ -77,6 +86,7 @@ fn parse_args() -> anyhow::Result<Args> {
                 args.config = Some(PathBuf::from(path));
             }
             "--dev" => args.dev = true,
+            "--status" => args.status = true,
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -136,6 +146,71 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
+        Command::Migrate => {
+            let cfg = load_config(&args)?;
+            migrate(&cfg, args.status)?;
+        }
+    }
+    Ok(())
+}
+
+/// Applies pending migrations, or reports their state with `--status`.
+///
+/// Deliberately separate from `nitr run`: applying schema changes at boot
+/// means a rolling deployment has two instances racing to change the same
+/// schema, each believing it is alone.
+fn migrate(cfg: &Config, status_only: bool) -> anyhow::Result<()> {
+    let db = cfg
+        .database
+        .as_ref()
+        .context("no database is configured; set `database` in nitr.toml")?;
+    let dir = db.migrations().context(
+        "no migrations directory found (looked for `migrations/`; set \
+         [database] migrations_dir to point elsewhere)",
+    )?;
+    let conn = nitr::stdlib::db_open(&db.path, &db.pragmas())?;
+
+    if status_only {
+        let entries = nitr::stdlib::migrate::status(&conn, &dir)?;
+        if entries.is_empty() {
+            println!("no migrations in {}", dir.display());
+            return Ok(());
+        }
+        for (migration, state) in &entries {
+            let label = match state {
+                nitr::stdlib::migrate::State::Applied => "applied",
+                nitr::stdlib::migrate::State::Pending => "pending",
+                nitr::stdlib::migrate::State::Modified => "MODIFIED SINCE APPLIED",
+            };
+            println!("  {:<10} {}", label, migration.name);
+        }
+        let count = |wanted: nitr::stdlib::migrate::State| {
+            entries.iter().filter(|(_, state)| *state == wanted).count()
+        };
+        let modified = count(nitr::stdlib::migrate::State::Modified);
+        println!(
+            "{} applied, {} pending, {modified} modified",
+            count(nitr::stdlib::migrate::State::Applied),
+            count(nitr::stdlib::migrate::State::Pending),
+        );
+        if modified > 0 {
+            // Not a warning to skim past: the database and the repository
+            // disagree about what the schema is.
+            println!(
+                "a modified migration will not be re-run; restore the file or write a new one"
+            );
+        }
+        return Ok(());
+    }
+
+    let applied = nitr::stdlib::migrate::run(&conn, &dir)?;
+    if applied.is_empty() {
+        println!("ok: the schema is up to date");
+    } else {
+        println!("ok: applied {} migration(s)", applied.len());
+        for name in applied {
+            println!("  {name}");
+        }
     }
     Ok(())
 }
@@ -178,8 +253,16 @@ async fn run_tests(cfg: Config) -> anyhow::Result<usize> {
     let builtins = cfg.builtins()?;
     let env = BuiltinsEnv {
         templates_dir: cfg.templates_dir.clone(),
-        database: cfg.database.clone(),
+        database: cfg.database.as_ref().map(|db| db.path.clone()),
+        sqlite: cfg
+            .database
+            .as_ref()
+            .map(|db| db.pragmas())
+            .unwrap_or_default(),
         fetch: cfg.fetch.options(),
+        // Tests get their own cache: a test file must not see entries a
+        // previous one left behind.
+        cache: Some(nitr::stdlib::Cache::new(cfg.cache_options())),
     };
     let opts = cfg.runtime_opts()?;
 

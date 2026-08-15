@@ -9,7 +9,7 @@ on:
       - .cargo/config.toml
       - Cargo.lock
       - Cargo.toml
-      - src/**
+      - crates/**
       - tests/**
   merge_group:
     branches:
@@ -23,7 +23,7 @@ on:
       - .cargo/config.toml
       - Cargo.lock
       - Cargo.toml
-      - src/**
+      - crates/**
       - tests/**
   schedule:
     - cron: '20 02 * * 1' # Runs at 02:20, only on Monday

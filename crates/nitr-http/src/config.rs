@@ -32,8 +32,10 @@ pub struct Config {
     pub config_script: Option<PathBuf>,
     /// Directory for the `template` builtin.
     pub templates_dir: Option<PathBuf>,
-    /// SQLite database file for the `conn` builtin.
-    pub database: Option<PathBuf>,
+    /// SQLite database for the `db` builtin (`[database]` section). Accepts
+    /// either a bare path (`database = "app.db"`) or a table with the
+    /// connection pragmas.
+    pub database: Option<DatabaseConfig>,
     /// Number of pooled Lua states. Reserved: takes effect with the runtime
     /// pool (roadmap phase 3).
     pub workers: usize,
@@ -65,6 +67,8 @@ pub struct Config {
     pub compression: CompressionConfig,
     /// Cross-origin resource sharing (`[cors]` section).
     pub cors: CorsConfig,
+    /// The shared `nitr.cache` (`[cache]` section).
+    pub cache: CacheConfig,
     /// Static file serving (`[static]` section).
     #[serde(rename = "static")]
     pub static_files: StaticConfig,
@@ -193,6 +197,30 @@ pub struct FetchConfig {
     pub max_response_bytes: u64,
     /// Maximum concurrent requests per `await_all(...)` call.
     pub max_concurrent: usize,
+    /// Maximum outbound requests one inbound request may make in total.
+    /// `max_concurrent` bounds a single `await_all`; this bounds the whole
+    /// handler, including a loop issuing calls one after another. `0`
+    /// removes the cap.
+    pub max_per_request: u32,
+    /// Seconds to wait for a TCP/TLS connection to an upstream.
+    pub connect_timeout: f64,
+    /// Default total budget per outbound request, in seconds. A per-call
+    /// `timeout` option overrides it.
+    pub timeout: f64,
+    /// Idle connections kept per upstream host.
+    pub pool_max_idle_per_host: usize,
+    /// Maximum retry attempts a call may ask for. Retries are opt-in per
+    /// call and only ever applied to idempotent methods.
+    pub max_retries: u32,
+    /// Proxy URL for outbound requests. Unset reads the conventional
+    /// `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` environment variables.
+    pub proxy: Option<String>,
+    /// Ignore the proxy environment variables entirely.
+    pub no_proxy: bool,
+    /// Forward a W3C `traceparent` header on outbound calls, derived from
+    /// the inbound request id, so a request crossing services can be
+    /// correlated. Pass-through only: this is not a tracing SDK.
+    pub propagate_trace_context: bool,
 }
 
 impl Default for FetchConfig {
@@ -203,6 +231,14 @@ impl Default for FetchConfig {
             allow_private_networks: defaults.allow_private_networks,
             max_response_bytes: defaults.max_response_bytes,
             max_concurrent: defaults.max_concurrent,
+            max_per_request: defaults.max_per_request,
+            connect_timeout: defaults.connect_timeout.as_secs_f64(),
+            timeout: defaults.timeout.as_secs_f64(),
+            pool_max_idle_per_host: defaults.pool_max_idle_per_host,
+            max_retries: defaults.max_retries,
+            proxy: None,
+            no_proxy: false,
+            propagate_trace_context: false,
         }
     }
 }
@@ -215,6 +251,14 @@ impl FetchConfig {
             allow_private_networks: self.allow_private_networks,
             max_response_bytes: self.max_response_bytes,
             max_concurrent: self.max_concurrent.max(1),
+            max_per_request: self.max_per_request,
+            connect_timeout: std::time::Duration::from_secs_f64(self.connect_timeout.max(0.1)),
+            timeout: std::time::Duration::from_secs_f64(self.timeout.max(0.1)),
+            pool_max_idle_per_host: self.pool_max_idle_per_host,
+            max_retries: self.max_retries,
+            proxy: self.proxy.clone(),
+            no_proxy: self.no_proxy,
+            propagate_trace_context: self.propagate_trace_context,
         }
     }
 }
@@ -233,6 +277,163 @@ pub struct StaticConfig {
     pub spa: bool,
     /// `Cache-Control` header value for served files.
     pub cache_control: Option<String>,
+}
+
+/// SQLite settings (`[database]` section).
+///
+/// Written either as a bare path — `database = "app.db"`, which takes the
+/// defaults below — or as a table when the pragmas need tuning. The
+/// defaults are what a server should have shipped with: WAL so readers do
+/// not block the writer, a busy timeout so contention is a brief wait
+/// rather than an error, and foreign keys actually enforced.
+#[derive(Debug, Clone)]
+pub struct DatabaseConfig {
+    /// Path to the SQLite file.
+    pub path: PathBuf,
+    /// Journal mode. `"wal"` lets readers run alongside one writer;
+    /// `"delete"` (SQLite's default) serializes everything. `"keep"` leaves
+    /// whatever the file already uses, which is the safe choice for a
+    /// database other tools also open.
+    pub journal_mode: String,
+    /// Milliseconds a statement waits on a locked database before failing
+    /// with `SQLITE_BUSY`.
+    pub busy_timeout: u64,
+    /// `synchronous` pragma. `"normal"` is the correct pairing with WAL:
+    /// durable across an application crash, and only at risk from a power
+    /// loss mid-checkpoint.
+    pub synchronous: String,
+    /// Enforce foreign-key constraints. SQLite leaves this off by default,
+    /// which surprises everyone who wrote a `REFERENCES` clause.
+    pub foreign_keys: bool,
+    /// `cache_size` pragma, per connection. Negative values are KiB.
+    pub cache_size: i64,
+    /// Directory holding `NNN_name.sql` migrations. Unset looks for
+    /// `migrations/` in the working directory and ignores it when absent.
+    pub migrations_dir: Option<PathBuf>,
+}
+
+impl DatabaseConfig {
+    /// The defaults for a given path.
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            journal_mode: "wal".into(),
+            busy_timeout: 5_000,
+            synchronous: "normal".into(),
+            foreign_keys: true,
+            cache_size: -2_000, // 2 MiB
+            migrations_dir: None,
+        }
+    }
+
+    /// The migrations directory to use, when one exists.
+    pub fn migrations(&self) -> Option<PathBuf> {
+        match &self.migrations_dir {
+            Some(dir) => Some(dir.clone()),
+            None => {
+                let default = PathBuf::from("migrations");
+                default.is_dir().then_some(default)
+            }
+        }
+    }
+
+    /// The pragma set handed to every connection.
+    pub fn pragmas(&self) -> nitr_std::SqlitePragmas {
+        nitr_std::SqlitePragmas {
+            journal_mode: self.journal_mode.clone(),
+            busy_timeout: self.busy_timeout,
+            synchronous: self.synchronous.clone(),
+            foreign_keys: self.foreign_keys,
+            cache_size: self.cache_size,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for DatabaseConfig {
+    /// Accepts a bare path string or the full table.
+    ///
+    /// Hand-written rather than `#[serde(untagged)]` so a typo inside the
+    /// table is reported as the unknown field it is, instead of "data did
+    /// not match any variant".
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> std::result::Result<Self, D::Error> {
+        use serde::de::{MapAccess, Visitor};
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Table {
+            path: PathBuf,
+            journal_mode: Option<String>,
+            busy_timeout: Option<u64>,
+            synchronous: Option<String>,
+            foreign_keys: Option<bool>,
+            cache_size: Option<i64>,
+            migrations_dir: Option<PathBuf>,
+        }
+
+        struct PathOrTable;
+
+        impl<'de> Visitor<'de> for PathOrTable {
+            type Value = DatabaseConfig;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a database path or a [database] table")
+            }
+
+            fn visit_str<E: serde::de::Error>(
+                self,
+                path: &str,
+            ) -> std::result::Result<DatabaseConfig, E> {
+                Ok(DatabaseConfig::new(path))
+            }
+
+            fn visit_map<M: MapAccess<'de>>(
+                self,
+                map: M,
+            ) -> std::result::Result<DatabaseConfig, M::Error> {
+                let table = Table::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                let defaults = DatabaseConfig::new(table.path);
+                Ok(DatabaseConfig {
+                    journal_mode: table.journal_mode.unwrap_or(defaults.journal_mode),
+                    busy_timeout: table.busy_timeout.unwrap_or(defaults.busy_timeout),
+                    synchronous: table.synchronous.unwrap_or(defaults.synchronous),
+                    foreign_keys: table.foreign_keys.unwrap_or(defaults.foreign_keys),
+                    cache_size: table.cache_size.unwrap_or(defaults.cache_size),
+                    migrations_dir: table.migrations_dir,
+                    ..defaults
+                })
+            }
+        }
+
+        de.deserialize_any(PathOrTable)
+    }
+}
+
+/// The shared `nitr.cache` (`[cache]` section).
+///
+/// Bounded and owned by Rust, so it is shared *data* rather than shared
+/// *state*: entries are serialized on the way in, no Lua value crosses
+/// between states, and the memory cannot grow past these limits.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CacheConfig {
+    /// Maximum number of live entries; the least recently used is evicted
+    /// past this.
+    pub max_entries: usize,
+    /// Maximum total size of the stored values, in bytes.
+    pub max_bytes: u64,
+    /// Seconds an entry lives when `set` does not say. `0` means no
+    /// expiry, leaving eviction entirely to the size bounds.
+    pub default_ttl: u64,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            max_entries: 10_000,
+            max_bytes: 32 * 1024 * 1024, // 32 MiB
+            default_ttl: 300,
+        }
+    }
 }
 
 /// Response compression (`[compression]` section).
@@ -359,6 +560,7 @@ impl Default for Config {
             shutdown: ShutdownConfig::default(),
             compression: CompressionConfig::default(),
             cors: CorsConfig::default(),
+            cache: CacheConfig::default(),
             static_files: StaticConfig::default(),
             tests_dir: None,
             lua: LuaConfig::default(),
@@ -416,7 +618,11 @@ impl Config {
             self.templates_dir = Some(PathBuf::from(v));
         }
         if let Some(v) = env_var("NITR_DATABASE") {
-            self.database = Some(PathBuf::from(v));
+            // Overrides only the path; the pragmas stay as configured.
+            match &mut self.database {
+                Some(db) => db.path = PathBuf::from(v),
+                None => self.database = Some(DatabaseConfig::new(v)),
+            }
         }
         if let Some(v) = env_var("NITR_WORKERS") {
             self.workers = parse_env("NITR_WORKERS", &v)?;
@@ -443,6 +649,15 @@ impl Config {
             self.compression.enabled = parse_env("NITR_COMPRESSION", &v)?;
         }
         Ok(())
+    }
+
+    /// Limits for the shared `nitr.cache`.
+    pub fn cache_options(&self) -> nitr_std::CacheOptions {
+        nitr_std::CacheOptions {
+            max_entries: self.cache.max_entries.max(1),
+            max_bytes: self.cache.max_bytes,
+            default_ttl: self.cache.default_ttl,
+        }
     }
 
     /// Rejects configurations that parse but cannot be honored.
@@ -646,7 +861,7 @@ mod tests {
             ..Config::default()
         };
         assert!(cfg.builtins().is_err());
-        cfg.database = Some(PathBuf::from("x.db"));
+        cfg.database = Some(DatabaseConfig::new("x.db"));
         assert_eq!(cfg.builtins().expect("builtins"), Builtins::DATABASE);
 
         cfg.std.features = Some(vec!["nope".into()]);
