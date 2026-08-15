@@ -203,7 +203,7 @@ jobs:
         echo "Configuring Cross..."
         # Use 'cargo.sh' script for Android targets only
         if [[ "${{ matrix.build }}" == "linux-android-armv7" ]] || [[ "${{ matrix.build }}" == "linux-android-arm64" ]]; then
-          echo "CARGO_BIN=scripts/ci/cargo.sh" >> $GITHUB_ENV
+          echo "CARGO_BIN=.github/scripts/ci/cargo.sh" >> $GITHUB_ENV
         else
           target=''
           case "${{ matrix.os }}" in
@@ -244,7 +244,7 @@ jobs:
       shell: bash
       if: ${{ !startsWith(matrix.os, 'windows') }}
       run: |
-        scripts/ci/install_tools.sh --build=${{ matrix.build }} --target=${{ matrix.target }}
+        .github/scripts/ci/install_tools.sh --build=${{ matrix.build }} --target=${{ matrix.target }}
 
     - name: Build release binary
       shell: bash
