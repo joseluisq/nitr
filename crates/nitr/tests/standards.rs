@@ -4,6 +4,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -86,10 +87,20 @@ end)
 return app
 "#;
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("nitr-standards-{}", std::process::id()));
+/// A scratch directory private to one caller.
+///
+/// Every test here runs as a thread of the same process, so a directory
+/// keyed only on the pid would be shared by all of them. `fs::write`
+/// truncates before it writes, so one test rewriting `app.lua` while
+/// another's server is reading it hands that server an empty file — a
+/// race that surfaces as "must return a nitr.app(), got nil". The counter
+/// keeps every test on its own copy.
+fn scratch_dir() -> PathBuf {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("nitr-standards-{}-{id}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("scratch dir");
-    dir.join(name)
+    dir
 }
 
 fn free_addr() -> SocketAddr {
@@ -122,26 +133,30 @@ fn base_config() -> nitr::Config {
 struct Harness {
     addr: SocketAddr,
     client: reqwest::Client,
+    /// This server's own scratch directory, so a test can assert on what
+    /// the handler wrote (uploads) without reaching into another's.
+    dir: PathBuf,
     stop: tokio::sync::oneshot::Sender<()>,
     served: tokio::task::JoinHandle<nitr::Result>,
 }
 
 impl Harness {
     async fn start(cfg: nitr::Config) -> Self {
-        let handler = scratch("app.lua");
+        let dir = scratch_dir();
+        let handler = dir.join("app.lua");
         std::fs::write(&handler, APP_SCRIPT).expect("write handler");
         // The upload directory reaches Lua the same way any deployment
         // setting would: through the configuration script.
-        let config_script = scratch("config.lua");
+        let config_script = dir.join("config.lua");
         std::fs::write(
             &config_script,
             format!(
                 "return function() return {{ upload_dir = {:?} }} end",
-                scratch("uploads").to_string_lossy()
+                dir.join("uploads").to_string_lossy()
             ),
         )
         .expect("write config script");
-        std::fs::create_dir_all(scratch("uploads")).expect("uploads dir");
+        std::fs::create_dir_all(dir.join("uploads")).expect("uploads dir");
 
         let addr = cfg.listen;
         let server = nitr::Server::builder()
@@ -167,6 +182,7 @@ impl Harness {
                 .no_brotli()
                 .build()
                 .expect("client"),
+            dir,
             stop,
             served,
         }
@@ -187,7 +203,7 @@ impl Harness {
 
 /// Writes a static tree with a precompressed sidecar and returns its path.
 fn static_dir() -> PathBuf {
-    let dir = scratch("public");
+    let dir = scratch_dir().join("public");
     std::fs::create_dir_all(&dir).expect("public dir");
     std::fs::write(
         dir.join("data.txt"),
@@ -462,7 +478,7 @@ async fn a_contradictory_cors_policy_fails_at_startup() {
     let mut cfg = base_config();
     cfg.cors.origins = Some(vec!["*".into()]);
     cfg.cors.credentials = true;
-    let handler = scratch("app.lua");
+    let handler = scratch_dir().join("app.lua");
     std::fs::write(&handler, APP_SCRIPT).expect("write handler");
 
     let err = nitr::Server::builder()
@@ -542,7 +558,7 @@ async fn form_and_multipart_bodies_are_parsed_in_rust() {
     assert_eq!(out["files"][0]["size"], payload);
 
     // The bytes really landed on disk, byte for byte.
-    let saved = std::fs::read(scratch("uploads").join("report.bin")).expect("saved file");
+    let saved = std::fs::read(h.dir.join("uploads").join("report.bin")).expect("saved file");
     assert_eq!(saved, file_bytes);
 
     h.stop().await;
