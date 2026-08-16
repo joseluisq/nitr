@@ -50,6 +50,30 @@ struct RouteDef {
     method: Method,
     path: String,
     fns: Vec<Function>,
+    /// A per-route error handler (`{ on_error = fn }` options), overriding
+    /// the app-wide `app:on_error`.
+    error_fn: Option<Function>,
+    /// Where the script registered this route (`source`, `line`), captured
+    /// at registration so a duplicate can name both sites.
+    site: Option<(String, u32)>,
+}
+
+/// The script frame that called into a registration method, for load-time
+/// diagnostics. Costs one stack inspection at registration — never on the
+/// request path.
+fn caller_site(lua: &Lua) -> Option<(String, u32)> {
+    lua.inspect_stack(1, |dbg| {
+        let source = dbg.source().short_src?;
+        Some((source.into_owned(), dbg.current_line()? as u32))
+    })?
+}
+
+/// Renders a registration site for an error message.
+fn site_label(site: &Option<(String, u32)>) -> String {
+    match site {
+        Some((source, line)) => format!("{source}:{line}"),
+        None => "unknown location".into(),
+    }
 }
 
 /// What the script builds up through `app:get(...)`, `app:use(...)`, etc.
@@ -70,7 +94,28 @@ impl UserData for LuaApp {
             let method = method_of(name);
             methods.add_method(
                 *name,
-                move |_, this, (path, fns): (String, Variadic<Function>)| {
+                // `middleware..., handler` optionally followed by an options
+                // table: `app:get(path, handler, { on_error = fn })`.
+                move |lua, this, (path, mut args): (String, Variadic<Value>)| {
+                    let error_fn = match args.last() {
+                        Some(Value::Table(opts)) => {
+                            let error_fn = opts.get::<Option<Function>>("on_error")?;
+                            args.pop();
+                            error_fn
+                        }
+                        _ => None,
+                    };
+                    let fns: Vec<Function> = args
+                        .into_iter()
+                        .map(|value| match value {
+                            Value::Function(f) => Ok(f),
+                            other => Err(mlua::Error::RuntimeError(format!(
+                                "app:{name}(\"{path}\", ...) takes handler functions \
+                                 and an optional trailing options table, got {}",
+                                other.type_name()
+                            ))),
+                        })
+                        .collect::<mlua::Result<_>>()?;
                     if fns.is_empty() {
                         return Err(mlua::Error::RuntimeError(format!(
                             "app:{name}(\"{path}\", ...) requires a handler function"
@@ -81,10 +126,13 @@ impl UserData for LuaApp {
                             "route path `{path}` must start with `/`"
                         )));
                     }
+                    let site = caller_site(lua);
                     lock(&this.0)?.routes.push(RouteDef {
                         method: method.clone(),
                         path,
-                        fns: fns.into_iter().collect(),
+                        fns,
+                        error_fn,
+                        site,
                     });
                     Ok(())
                 },
@@ -141,14 +189,30 @@ impl UserData for LuaApp {
 pub(crate) struct Dispatch(pub(crate) Box<CompiledApp>);
 
 /// The Rust-side router plus the per-route composed Lua chains.
+/// A composed route: the middleware/handler chain plus its resolved error
+/// handler (route-level `on_error` first, the app-wide one as fallback) —
+/// resolved once at compile time so dispatch pays nothing.
+pub(crate) struct Chain {
+    pub(crate) fns: Function,
+    pub(crate) error_fn: Option<Function>,
+}
+
 pub(crate) struct CompiledApp {
     pub(crate) router: Router<HashMap<Method, usize>>,
-    pub(crate) chains: Vec<Function>,
-    pub(crate) error_fn: Option<Function>,
+    pub(crate) chains: Vec<Chain>,
 }
 
 /// Per-state dispatch state, stored in the Lua registry so it lives and
 /// dies with its state without changing the runtime pool's shape.
+/// The handler script path of the compiled app in this state, for
+/// diagnostics that need to read the source back (Lua truncates long chunk
+/// names, so the error's own `source` may not be openable).
+pub(crate) fn script_path(lua: &Lua) -> Option<std::path::PathBuf> {
+    state(lua)
+        .ok()
+        .and_then(|ud| ud.borrow::<AppState>().ok().map(|s| s.script.clone()))
+}
+
 pub(crate) struct AppState {
     pub(crate) dispatch: Dispatch,
     /// Static mounts: the script's `app:static(...)` calls first, then the
@@ -255,7 +319,10 @@ fn compile(value: Value, script: &Path) -> Result<Compiled> {
     let mut index: HashMap<String, usize> = HashMap::new();
     for route in &def.routes {
         let idx = chains.len();
-        chains.push(compose(&def.middleware, route)?);
+        chains.push(Chain {
+            fns: compose(&def.middleware, route)?,
+            error_fn: route.error_fn.clone().or_else(|| def.error_fn.clone()),
+        });
         let pattern = to_matchit(&route.path)?;
         let slot = match index.get(&pattern) {
             Some(&i) => &mut patterns[i].1,
@@ -265,12 +332,15 @@ fn compile(value: Value, script: &Path) -> Result<Compiled> {
                 &mut patterns.last_mut().expect("just pushed").1
             }
         };
-        if slot.insert(route.method.clone(), idx).is_some() {
+        if let Some(first) = slot.insert(route.method.clone(), idx) {
+            // Both registration sites: knowing only the second one means
+            // hunting the file for the first.
             return Err(Error::Script(format!(
-                "duplicate route `{} {}` in {}",
+                "duplicate route `{} {}`\n  --> {}   (first registered here)\n  --> {}   (registered again here)",
                 route.method,
                 route.path,
-                script.display()
+                site_label(&def.routes[first].site),
+                site_label(&route.site),
             )));
         }
     }
@@ -286,11 +356,7 @@ fn compile(value: Value, script: &Path) -> Result<Compiled> {
     }
 
     Ok((
-        Dispatch(Box::new(CompiledApp {
-            router,
-            chains,
-            error_fn: def.error_fn.clone(),
-        })),
+        Dispatch(Box::new(CompiledApp { router, chains })),
         def.statics.clone(),
     ))
 }

@@ -35,6 +35,7 @@ pub use cache::{Cache, CacheOptions};
 // regardless of which builtins this build compiled in.
 pub use config::{FetchOptions, SqlitePragmas};
 pub use http::{RequestCookies, ResponseCookies, best_match};
+pub use utils::error_lua_value;
 
 #[cfg(feature = "db")]
 pub use db::migrate;
@@ -227,6 +228,10 @@ pub fn register_builtins(lua: &mlua::Lua, builtins: Builtins, env: &BuiltinsEnv)
             _ => continue,
         };
     }
+    // Always registered, independent of the configured builtins: turning a
+    // caught error into its structured form is part of the error model,
+    // not an optional capability.
+    nitr.set("errinfo", utils::create_errinfo_fn(lua)?)?;
     Ok(())
 }
 

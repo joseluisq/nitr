@@ -4,6 +4,8 @@ use anyhow::{Context as _, bail};
 
 use nitr::{BuiltinsEnv, Config, Runtime, Server};
 
+mod diag;
+
 const DEFAULT_CONFIG_FILE: &str = "nitr.toml";
 
 const USAGE: &str = "\
@@ -117,7 +119,17 @@ fn load_config(args: &Args) -> anyhow::Result<Config> {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() {
+    if let Err(err) = run_main().await {
+        // Print the report ourselves instead of returning the error:
+        // diagnostics get color on a terminal (plain text otherwise, same
+        // bytes anyhow would have printed).
+        diag::report(&err);
+        std::process::exit(1);
+    }
+}
+
+async fn run_main() -> anyhow::Result<()> {
     let args = parse_args()?;
 
     tracing_subscriber::fmt()
@@ -424,7 +436,11 @@ app:get("/api/hello", function(req)
 end)
 
 app:on_error(function(err, req)
-    nitr.log.error("handler failed", { error = err })
+    -- err is structured: err.kind ("lua"|"nitr"|"module"|"timeout"|"memory"|"panic"),
+    -- err.message, err.source, err.line, err.module, err.traceback, err.cause.
+    nitr.log.error("handler failed", {
+        error = err.message, kind = err.kind, source = err.source, line = err.line,
+    })
     return nitr.error(500, { code = "INTERNAL" })
 end)
 

@@ -1,6 +1,6 @@
 use mlua::{
-    FromLuaMulti, Function, HookTriggers, IntoLuaMulti, Lua, LuaOptions, LuaSerdeExt as _,
-    RegistryKey, StdLib, Table, Thread, Value, VmState,
+    FromLuaMulti, Function, HookTriggers, IntoLuaMulti, Lua, LuaOptions, LuaSerdeExt as _, StdLib,
+    Table, Thread, Value, VmState,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -154,7 +154,7 @@ impl Runtime {
                 move |_, _| {
                     if epoch.elapsed().as_nanos() as u64 > deadline.load(Ordering::Relaxed) {
                         return Err(mlua::Error::RuntimeError(
-                            "handler execution exceeded its time budget".into(),
+                            crate::error::EXEC_BUDGET_MSG.into(),
                         ));
                     }
                     Ok(VmState::Continue)
@@ -194,6 +194,24 @@ impl Runtime {
     /// This is the embedding-side extension point; HTTP applications use
     /// `ServerBuilder::module()` in the `nitr-http` crate, which applies
     /// the closure to every pooled state.
+    ///
+    /// ## Error attribution
+    ///
+    /// An error a module raises should say which module failed. Wrap Rust
+    /// errors with a `module <name>` context and [`ErrorInfo`] classifies
+    /// them as `kind = "module"` with the module named; a module that
+    /// returns an opaque string makes its failures everyone's problem:
+    ///
+    /// ```ignore
+    /// t.set("query", lua.create_function(|_, sql: String| {
+    ///     run(&sql).map_err(|err| mlua::Error::WithContext {
+    ///         context: "module db".into(),
+    ///         cause: std::sync::Arc::new(mlua::Error::external(err)),
+    ///     })
+    /// })?)?;
+    /// ```
+    ///
+    /// [`ErrorInfo`]: crate::ErrorInfo
     pub fn register_module<F>(&self, name: &str, f: F) -> Result
     where
         F: Fn(&Lua) -> mlua::Result<Table>,
@@ -216,13 +234,65 @@ impl Runtime {
             ))
         })?;
 
-        // Create config handler and call it
-        let key = self.lua.load(data).eval::<RegistryKey>()?;
-        let cfg_fn = self.lua.registry_value::<Function>(&key)?;
-        let cfg = cfg_fn.call_async::<Table>(args).await?;
+        // Create config handler and call it.
+        let value = self
+            .eval_chunk(data, cfg_src)
+            .map_err(|err| load_error(cfg_src, err))?;
+        let cfg_fn = match value {
+            Value::Function(f) => f,
+            other => {
+                return Err(Error::Script(format!(
+                    "the configuration script {} must evaluate to a function, got {}",
+                    cfg_src.display(),
+                    other.type_name()
+                )));
+            }
+        };
+        // A failure while the function runs (a misspelled `db:` method, a
+        // nil index) gets the same in-context rendering as a parse error.
+        let cfg = cfg_fn
+            .call_async::<Table>(args)
+            .await
+            .map_err(|err| load_error(cfg_src, err))?;
 
         self.cfg = Some(cfg);
         Ok(())
+    }
+
+    /// Loads and runs a chunk the way `eval` does — expression form first
+    /// (`function(db) ... end` configuration scripts), statement block
+    /// second — but with precise diagnostics: when *both* parses fail, the
+    /// error that got further into the file wins. mlua's own `eval` reports
+    /// only the block fallback, which for an expression-form script always
+    /// blames the top-level `function(` line instead of the actual typo.
+    ///
+    /// The chunk is named after the file (`@` marks a real path) so errors
+    /// report `config.lua:12` instead of an anonymous chunk.
+    fn eval_chunk(&self, data: Vec<u8>, path: &Path) -> mlua::Result<Value> {
+        let name = format!("@{}", path.display());
+        // `return ` on the same line keeps every line number intact.
+        let mut wrapped = Vec::with_capacity(data.len() + 7);
+        wrapped.extend_from_slice(b"return ");
+        wrapped.extend_from_slice(&data);
+        let expr_err = match self.lua.load(wrapped).set_name(&name).into_function() {
+            Ok(f) => return f.call(()),
+            Err(err) => err,
+        };
+        match self.lua.load(data).set_name(&name).into_function() {
+            Ok(f) => f.call(()),
+            Err(block_err) => {
+                let line = |err: &mlua::Error| {
+                    crate::error::ErrorInfo::from_error(&Error::Lua(err.clone()))
+                        .line
+                        .unwrap_or(0)
+                };
+                if line(&expr_err) > line(&block_err) {
+                    Err(expr_err)
+                } else {
+                    Err(block_err)
+                }
+            }
+        }
     }
 
     /// The underlying Lua state, for advanced customization beyond
@@ -383,8 +453,41 @@ impl Runtime {
                 path.display()
             ))
         })?;
-        Ok(self.lua.load(data).eval::<Value>()?)
+        self.eval_chunk(data, path)
+            .map_err(|err| load_error(path, err))
     }
+}
+
+/// Converts a load-time Lua failure into a [`Error::Script`] that points at
+/// the offending line, with the source rendered around it — parse errors
+/// and runtime errors alike (a misspelled method carries a position the
+/// same way a typo does). Runs only at startup (and on dev-mode reloads),
+/// so reading the file back is fine.
+fn load_error(path: &Path, err: mlua::Error) -> Error {
+    let info = crate::error::ErrorInfo::from_error(&Error::Lua(err));
+    // No `error:` prefix of our own: `Error::Script` already displays as
+    // `script error: ...`, and one headline is enough.
+    let mut out = info.message.clone();
+    match info.line {
+        Some(line) => {
+            let token = crate::error::message_token(&info.message);
+            match crate::error::source_snippet(path, line, 2, token) {
+                Some(snippet) => {
+                    out.push('\n');
+                    out.push_str(&snippet);
+                }
+                None => out.push_str(&format!("\n  --> {}:{line}", path.display())),
+            };
+        }
+        None => out.push_str(&format!("\n  --> {}", path.display())),
+    }
+    // Runtime failures carry a call stack; parse errors have none. Already
+    // bounded by the classifier.
+    if let Some(traceback) = &info.traceback {
+        out.push_str("\nstack traceback:\n");
+        out.push_str(traceback);
+    }
+    Error::Script(out)
 }
 
 #[cfg(test)]
@@ -415,6 +518,46 @@ mod tests {
 
     fn eval_function(rt: &Runtime, src: &str) -> Function {
         rt.lua().load(src).eval().expect("eval handler function")
+    }
+
+    #[test]
+    fn expression_form_typos_report_the_real_line() {
+        // An expression-form script (`function(...) ... end`, no `return`)
+        // with a typo mid-body. mlua's own `eval` would report its block
+        // fallback — "<name> expected" at the `function(` line — masking
+        // the actual position; the dual-parse must surface line 4.
+        let rt = Runtime::new().expect("runtime");
+        let path = write_temp_script(
+            "expr-typo.lua",
+            "-- comment\nfunction(db)\n    local ok = 1\n    lodcal users = 2\n    return {}\nend",
+        );
+        let err = rt.eval_script(&path).expect_err("typo must fail the load");
+        let message = err.to_string();
+        assert!(message.contains("expr-typo.lua:4"), "{message}");
+        assert!(message.contains("near 'users'"), "{message}");
+        // The caret spans the token the parser stopped at (`users`, five
+        // wide); exact column alignment is covered by the snippet unit test.
+        assert!(message.contains("^^^^^"), "{message}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn both_script_forms_still_evaluate() {
+        let rt = Runtime::new().expect("runtime");
+        // Expression form (configuration scripts).
+        let path = write_temp_script("expr-ok.lua", "function(x)\n    return x\nend");
+        assert!(matches!(
+            rt.eval_script(&path).expect("expression form"),
+            Value::Function(_)
+        ));
+        std::fs::remove_file(&path).ok();
+        // Statement-block form (handler scripts).
+        let path = write_temp_script("block-ok.lua", "local t = { ok = true }\nreturn t");
+        assert!(matches!(
+            rt.eval_script(&path).expect("block form"),
+            Value::Table(_)
+        ));
+        std::fs::remove_file(&path).ok();
     }
 
     #[tokio::test]

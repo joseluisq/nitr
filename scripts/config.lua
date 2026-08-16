@@ -27,7 +27,11 @@ function(db)
         status = resp.status
         print("Response status: " .. resp.status)
     else
-        print("fetch skipped: " .. tostring(resp))
+        -- `nitr.errinfo` classifies whatever pcall caught (Rust or Lua
+        -- error): concise `kind: message (source:line)` instead of the raw
+        -- traceback dump. `.pretty` adds ANSI color on a terminal; plain
+        -- concatenation (`.. err`) stays uncolored for logs/bodies.
+        print("fetch skipped: " .. nitr.errinfo(resp).pretty)
     end
 
     -- Passing custom data to the HTTP handlers (`nitr.cfg`).

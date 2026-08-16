@@ -15,6 +15,6 @@ mod error;
 pub mod ns;
 mod runtime;
 
-pub use error::{Error, Result};
+pub use error::{Error, ErrorInfo, Result, message_token, source_snippet};
 pub use ns::{ModuleFn, mount, nitr_table};
 pub use runtime::{DeadlineHandle, Runtime, RuntimeGuard, RuntimeOpts, RuntimePool};

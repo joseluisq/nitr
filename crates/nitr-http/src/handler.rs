@@ -15,7 +15,7 @@ use crate::protect::Protection;
 use crate::request::LuaRequest;
 use crate::static_files::{self, StaticMount};
 use crate::stream;
-use nitr_core::{Error, Result, Runtime, RuntimeGuard, RuntimePool};
+use nitr_core::{Error, ErrorInfo, Result, Runtime, RuntimeGuard, RuntimePool};
 
 pub(crate) type HttpResponse = Response<BoxBody<Bytes, Infallible>>;
 
@@ -212,6 +212,9 @@ async fn handle_inner(
             error_fn,
         } => {
             req.params = params;
+            // Read before the request moves into Lua: the dev error page
+            // honors `Accept` (a curl user does not want markup).
+            let wants_html = dev_mode && accepts_html(req.req.headers());
             // The request becomes a Lua value up front so the error handler
             // can receive the same object the handler saw.
             let req_ud = rt.lua().create_userdata(req)?;
@@ -231,11 +234,26 @@ async fn handle_inner(
                 return plain_response(StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large");
             }
 
-            tracing::error!("lua handler error: {err}");
+            // Classified once, on the error path only; the structured
+            // fields make the failure greppable without the dev page.
+            let info = ErrorInfo::from_error(&err);
+            tracing::error!(
+                error.kind = info.kind,
+                error.source = info.source.as_deref(),
+                error.line = info.line,
+                error.module = info.module.as_deref(),
+                "handler failed: {}",
+                info.message
+            );
+            if dev_mode && let Some(traceback) = info.traceback.as_deref() {
+                tracing::debug!("stack traceback:{traceback}");
+            }
+
             let mut handled = None;
             if let Some(error_fn) = error_fn {
+                let err_value = nitr_std::error_lua_value(rt.lua(), &info)?;
                 match rt
-                    .call_function::<LuaTable>(error_fn, (err.to_string(), &req_ud))
+                    .call_function::<LuaTable>(error_fn, (err_value, &req_ud))
                     .await
                 {
                     Ok(lua_resp) => match to_response(lua_resp) {
@@ -248,7 +266,12 @@ async fn handle_inner(
             discard_body(&req_ud);
             match handled {
                 Some(resp) => Ok(resp),
-                None => error_response(&err, dev_mode),
+                None => {
+                    // The script path backs up the error's own `source` for
+                    // the dev snippet: Lua truncates long chunk names.
+                    let script = dev_mode.then(|| app::script_path(rt.lua())).flatten();
+                    error_page_with_source(&info, dev_mode, wants_html, script.as_deref())
+                }
             }
         }
     }
@@ -337,13 +360,15 @@ async fn resolve(
                 });
                 match route {
                     Some(&idx) => Target::Chain {
-                        chain: app.chains[idx].clone(),
+                        chain: app.chains[idx].fns.clone(),
                         params: matched
                             .params
                             .iter()
                             .map(|(k, v)| (k.to_string(), v.to_string()))
                             .collect(),
-                        error_fn: app.error_fn.clone(),
+                        // Resolved at compile time: the route's own handler
+                        // first, the app-wide one as fallback.
+                        error_fn: app.chains[idx].error_fn.clone(),
                     },
                     None if *method == Method::OPTIONS => {
                         Target::Options(matched.value.keys().cloned().collect())
@@ -501,17 +526,100 @@ pub(crate) fn build_response(
 }
 
 /// A generic 500 that never leaks internals to clients; in development mode
-/// the error (including the Lua traceback) is included for fast iteration.
+/// the classified error is rendered in context for fast iteration.
 fn error_response(err: &Error, dev_mode: bool) -> Result<HttpResponse> {
-    let body = if dev_mode {
-        format!("Internal Server Error\n\n{err}")
+    error_page_with_source(&ErrorInfo::from_error(err), dev_mode, false, None)
+}
+
+/// Whether the client would rather see HTML than plain text.
+fn accepts_html(headers: &hyper::HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|accept| accept.contains("text/html"))
+}
+
+/// The error response body.
+///
+/// Production is deliberately curt: a generic `500` with no source, no
+/// traceback, no internal paths — the structured log line is where the
+/// diagnosis lives. Development mode renders the error in context: the
+/// concise headline, the failing source with the line marked, the bounded
+/// traceback and cause chain — as HTML when the client accepts it. The
+/// source snippet reads from disk, which only development mode pays.
+fn error_page_with_source(
+    info: &ErrorInfo,
+    dev_mode: bool,
+    html: bool,
+    script: Option<&std::path::Path>,
+) -> Result<HttpResponse> {
+    if !dev_mode {
+        return Ok(Response::builder()
+            .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
+            .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(Full::new(Bytes::from("Internal Server Error")).boxed())?);
+    }
+
+    let mut text = format!("Internal Server Error\n\n{}", info.concise());
+    if let (Some(source), Some(line)) = (&info.source, info.line)
+        && let Some(path) = resolve_source_path(source, script)
+        && let Some(snippet) =
+            nitr_core::source_snippet(&path, line, 2, nitr_core::message_token(&info.message))
+    {
+        text.push_str("\n\n");
+        text.push_str(&snippet);
+    }
+    if let Some(traceback) = &info.traceback {
+        text.push_str("\nstack traceback:\n");
+        text.push_str(traceback);
+        text.push('\n');
+    }
+    for cause in &info.cause {
+        text.push_str(&format!("caused by: {cause}\n"));
+    }
+
+    let (content_type, body) = if html {
+        (
+            "text/html; charset=utf-8",
+            format!(
+                "<!doctype html><html><head><title>Internal Server Error</title></head>\
+                 <body><h1>Internal Server Error</h1><pre>{}</pre></body></html>",
+                escape_html(text.trim_start_matches("Internal Server Error\n\n"))
+            ),
+        )
     } else {
-        "Internal Server Error".to_string()
+        ("text/plain; charset=utf-8", text)
     };
     Ok(Response::builder()
         .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
-        .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(hyper::header::CONTENT_TYPE, content_type)
         .body(Full::new(Bytes::from(body)).boxed())?)
+}
+
+/// Maps an error's `source` chunk name back to a readable file. Lua bounds
+/// chunk names (`LUA_IDSIZE`), so a long script path arrives truncated with
+/// a `...` prefix; the known script path covers that case when its tail
+/// matches.
+fn resolve_source_path(
+    source: &str,
+    script: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    let direct = std::path::Path::new(source);
+    if direct.is_file() {
+        return Some(direct.to_path_buf());
+    }
+    let script = script?;
+    let tail = source.trim_start_matches("...");
+    script
+        .to_string_lossy()
+        .ends_with(tail)
+        .then(|| script.to_path_buf())
+}
+
+fn escape_html(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 #[cfg(test)]
