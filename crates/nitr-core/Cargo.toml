@@ -8,9 +8,26 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+documentation = "https://docs.rs/nitr-core"
 readme = "../../README.md"
+categories = ["network-programming", "api-bindings"]
 keywords = ["lua", "runtime", "sandbox"]
-include = ["src/**/*.rs", "Cargo.toml"]
+include = ["src/**/*.rs", "Cargo.toml", "LICENSE-APACHE", "LICENSE-MIT"]
+
+# The crates gate `doc_cfg` behind `--cfg docsrs`.
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]
+
+# The runtime core has no optional dependencies. `all` exists so every
+# crate in the workspace answers to the same feature name, which is what
+# lets CI and docs.rs pass `--features all` uniformly.
+[features]
+default = []
+all = []
+
+[lib]
+name = "nitr_core"
+path = "src/lib.rs"
 
 [dependencies]
 async-channel = { workspace = true }

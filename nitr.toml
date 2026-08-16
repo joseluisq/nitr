@@ -161,7 +161,12 @@ database = "scripts/file.db"
 # Default: false (also enabled by the --dev flag).
 dev_mode = true
 
-# Standard library (`nitr.*`) modules exposed to scripts. The standard
+# Standard library (`nitr.*`) modules exposed to scripts.
+#
+# A feature must also be compiled into the binary. The released `nitr`
+# includes all of them; a build made with `--no-default-features` does not,
+# and asking for one it lacks is a startup error naming the Cargo feature
+# to enable. The standard
 # library provides building blocks — opt into the features your scripts
 # need (or replace them with your own modules). When the list is omitted,
 # only a minimal set is enabled: "json", "http", "log". Valid names:

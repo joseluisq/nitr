@@ -16,35 +16,8 @@
 
 use rusqlite::Connection;
 
+use crate::config::SqlitePragmas;
 use nitr_core::{Error, Result};
-
-/// The pragma set applied to a connection when it is opened.
-#[derive(Debug, Clone)]
-pub struct SqlitePragmas {
-    /// `"wal"`, `"delete"`, any other SQLite journal mode, or `"keep"` to
-    /// leave whatever the database already uses.
-    pub journal_mode: String,
-    /// Milliseconds to wait on a locked database before failing.
-    pub busy_timeout: u64,
-    /// `synchronous` pragma (`"off"`, `"normal"`, `"full"`, `"extra"`).
-    pub synchronous: String,
-    /// Enforce foreign-key constraints.
-    pub foreign_keys: bool,
-    /// `cache_size` per connection; negative values are KiB.
-    pub cache_size: i64,
-}
-
-impl Default for SqlitePragmas {
-    fn default() -> Self {
-        Self {
-            journal_mode: "wal".into(),
-            busy_timeout: 5_000,
-            synchronous: "normal".into(),
-            foreign_keys: true,
-            cache_size: -2_000,
-        }
-    }
-}
 
 /// Journal modes SQLite accepts. Checked rather than interpolated blindly:
 /// a pragma value cannot be bound as a parameter, so the only safe way to

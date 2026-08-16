@@ -64,6 +64,14 @@ pub struct Server {
 /// rolling deployment race to change the same schema, each believing it is
 /// the only one. Making it an explicit step means somebody chose when it
 /// happened.
+#[cfg(not(feature = "db"))]
+fn check_migrations(_cfg: &Config) -> Result {
+    // Without the `db` builtin there is no connection to check against;
+    // `register_builtins` is what reports the misconfiguration.
+    Ok(())
+}
+
+#[cfg(feature = "db")]
 fn check_migrations(cfg: &Config) -> Result {
     let Some(db) = &cfg.database else {
         return Ok(());

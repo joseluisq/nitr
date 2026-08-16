@@ -8,15 +8,35 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+documentation = "https://docs.rs/nitr-cli"
 readme = "../../README.md"
+categories = ["web-programming::http-server", "command-line-utilities"]
 keywords = ["dynamic-web-server", "http-server", "lua-server"]
-include = ["src/**/*.rs", "Cargo.toml"]
+include = ["src/**/*.rs", "Cargo.toml", "LICENSE-APACHE", "LICENSE-MIT"]
 publish = true
 
 [[bin]]
 name = "nitr"
 path = "src/main.rs"
 doc = false
+
+# The crates gate `doc_cfg` behind `--cfg docsrs`.
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]
+
+# The published binary is full-featured: someone installing `nitr` expects
+# every builtin to be there. Building it with `--no-default-features` (plus
+# whichever features are wanted) produces a smaller server.
+[features]
+default = ["all"]
+all = ["nitr/all"]
+
+compression = ["nitr/compression"]
+crypto = ["nitr/crypto"]
+db = ["nitr/db"]
+fetch = ["nitr/fetch"]
+multipart = ["nitr/multipart"]
+template = ["nitr/template"]
 
 [dependencies]
 nitr = { workspace = true }

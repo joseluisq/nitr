@@ -9,28 +9,49 @@
 #![deny(warnings)]
 #![deny(rust_2018_idioms)]
 #![deny(dead_code)]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 use std::path::PathBuf;
 
 use nitr_core::Result;
 
 pub mod cache;
+pub(crate) mod config;
+#[cfg(feature = "crypto")]
 pub(crate) mod crypto;
+#[cfg(feature = "db")]
 pub(crate) mod db;
+#[cfg(feature = "fetch")]
 pub(crate) mod fetch;
 pub(crate) mod http;
 pub(crate) mod json;
 pub(crate) mod log;
+#[cfg(feature = "template")]
 pub(crate) mod template;
 pub(crate) mod utils;
 
 pub use cache::{Cache, CacheOptions};
-pub use db::SqlitePragmas;
-pub use db::migrate;
-pub use db::pragmas::open as db_open;
-pub use fetch::{FetchOptions, reset_outbound_budget, set_trace_context};
+// The configuration types are always available: `nitr.toml` has one shape
+// regardless of which builtins this build compiled in.
+pub use config::{FetchOptions, SqlitePragmas};
 pub use http::{RequestCookies, ResponseCookies, best_match};
+
+#[cfg(feature = "db")]
+pub use db::migrate;
+#[cfg(feature = "db")]
+pub use db::pragmas::open as db_open;
+#[cfg(feature = "fetch")]
+pub use fetch::{reset_outbound_budget, set_trace_context};
+
+/// Resets the per-request outbound budget. A no-op without the `fetch`
+/// feature, so the server can call it unconditionally.
+#[cfg(not(feature = "fetch"))]
+pub fn reset_outbound_budget(_lua: &mlua::Lua) {}
+
+/// Records the inbound request id for `traceparent` propagation. A no-op
+/// without the `fetch` feature.
+#[cfg(not(feature = "fetch"))]
+pub fn set_trace_context(_lua: &mlua::Lua, _request_id: &str) {}
 
 bitflags::bitflags! {
     /// Built-in `nitr.*` standard library modules that can be exposed to
@@ -132,17 +153,37 @@ pub struct BuiltinsEnv {
 /// `templates_dir`, `db` needs `database`) are skipped with a warning when
 /// that setting is absent; callers that take an explicit builtins list
 /// should reject such combinations upfront.
+/// Only reachable when at least one gated builtin was left out.
+#[cfg(not(all(
+    feature = "crypto",
+    feature = "db",
+    feature = "fetch",
+    feature = "template"
+)))]
+fn not_compiled_in(name: &str) -> nitr_core::Error {
+    nitr_core::Error::Config(format!(
+        "the `{name}` builtin is configured but was not compiled into this \
+         binary: rebuild with the `{name}` Cargo feature (or `all`), or drop \
+         it from `[std] features`"
+    ))
+}
+
 pub fn register_builtins(lua: &mlua::Lua, builtins: Builtins, env: &BuiltinsEnv) -> Result {
     let nitr = nitr_core::nitr_table(lua)?;
     for builtin in builtins.iter() {
         match builtin {
             Builtins::DEBUG => nitr.set("dbg", utils::create_debug_fn(lua)?)?,
             // Also registers `nitr.await_all` for concurrent requests.
+            #[cfg(feature = "fetch")]
             Builtins::FETCH => {
                 let opts = std::sync::Arc::new(env.fetch.clone());
                 nitr.set("fetch", fetch::create_fetch_fn(lua, opts.clone())?)?;
                 nitr.set("await_all", fetch::create_await_all_fn(lua, opts)?)?;
             }
+            #[cfg(not(feature = "fetch"))]
+            Builtins::FETCH => return Err(not_compiled_in("fetch")),
+
+            #[cfg(feature = "template")]
             Builtins::TEMPLATE => match &env.templates_dir {
                 Some(dir) => nitr.set("template", template::create_template_fn(lua, dir)?)?,
                 None => {
@@ -151,6 +192,8 @@ pub fn register_builtins(lua: &mlua::Lua, builtins: Builtins, env: &BuiltinsEnv)
                     );
                 }
             },
+            #[cfg(not(feature = "template"))]
+            Builtins::TEMPLATE => return Err(not_compiled_in("template")),
             Builtins::JSON => nitr.set("json", json::create_json_fn(lua)?)?,
             // Registers the response helpers (`nitr.text`, `nitr.html`,
             // `nitr.redirect`, `nitr.status`, `nitr.negotiate`, `nitr.sse`)
@@ -158,16 +201,23 @@ pub fn register_builtins(lua: &mlua::Lua, builtins: Builtins, env: &BuiltinsEnv)
             Builtins::HTTP => http::register(lua, &nitr)?,
             Builtins::LOG => nitr.set("log", log::create_log_table(lua)?)?,
             // Registers both `nitr.crypto` and `nitr.auth`.
+            #[cfg(feature = "crypto")]
             Builtins::CRYPTO => {
                 nitr.set("crypto", crypto::create_crypto_table(lua)?)?;
                 nitr.set("auth", crypto::create_auth_table(lua)?)?;
             }
+            #[cfg(not(feature = "crypto"))]
+            Builtins::CRYPTO => return Err(not_compiled_in("crypto")),
+
+            #[cfg(feature = "db")]
             Builtins::DATABASE => match &env.database {
                 Some(path) => nitr.set("db", db::create_database_fn(lua, path, &env.sqlite)?)?,
                 None => {
                     tracing::warn!("skipping builtin `db`: `database` is not configured");
                 }
             },
+            #[cfg(not(feature = "db"))]
+            Builtins::DATABASE => return Err(not_compiled_in("db")),
             Builtins::CACHE => match &env.cache {
                 Some(cache) => nitr.set("cache", cache::create_cache(lua, cache.clone())?)?,
                 None => {

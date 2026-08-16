@@ -10,16 +10,26 @@
 //!    sidecar. Off by default, because it trades the server's CPU for
 //!    bandwidth and that should be a decision rather than a surprise.
 
+#[cfg(feature = "compression")]
 use std::convert::Infallible;
+#[cfg(feature = "compression")]
 use std::io::Write as _;
+#[cfg(feature = "compression")]
 use std::pin::Pin;
+#[cfg(feature = "compression")]
 use std::task::{Context, Poll};
 
+#[cfg(feature = "compression")]
 use http_body_util::BodyExt as _;
+#[cfg(feature = "compression")]
 use http_body_util::combinators::BoxBody;
+#[cfg(feature = "compression")]
 use hyper::StatusCode;
+#[cfg(feature = "compression")]
 use hyper::body::{Body, Bytes, Frame, SizeHint};
-use hyper::header::{self, HeaderValue};
+use hyper::header::HeaderValue;
+#[cfg(feature = "compression")]
+use hyper::header::{self};
 
 use crate::config::CompressionConfig;
 use crate::handler::HttpResponse;
@@ -61,16 +71,20 @@ impl Encoding {
 /// which is needed for sidecars even when on-the-fly compression is off.
 #[derive(Debug)]
 pub(crate) struct Compression {
-    enabled: bool,
     /// Offered algorithms in server-preference order.
     algorithms: Vec<Encoding>,
+    #[cfg(feature = "compression")]
+    enabled: bool,
+    #[cfg(feature = "compression")]
     min_size: u64,
     /// Compressible content types; an entry ending in `*` matches a prefix.
+    #[cfg(feature = "compression")]
     types: Vec<String>,
 }
 
 /// Content types that are already compressed. Running them through gzip
 /// spends CPU to make the payload very slightly larger.
+#[cfg(feature = "compression")]
 const INCOMPRESSIBLE: &[&str] = &[
     "image/",
     "video/",
@@ -85,13 +99,16 @@ const INCOMPRESSIBLE: &[&str] = &[
 impl Compression {
     pub(crate) fn new(cfg: &CompressionConfig) -> Self {
         Self {
-            enabled: cfg.enabled,
             algorithms: cfg
                 .algorithms
                 .iter()
                 .filter_map(|name| Encoding::from_token(name))
                 .collect(),
+            #[cfg(feature = "compression")]
+            enabled: cfg.enabled,
+            #[cfg(feature = "compression")]
             min_size: cfg.min_size,
+            #[cfg(feature = "compression")]
             types: cfg.types.iter().map(|t| t.to_ascii_lowercase()).collect(),
         }
     }
@@ -114,6 +131,14 @@ impl Compression {
     /// or pointless: disabled, already encoded, a status with no body, a
     /// partial response (the range was computed against the identity
     /// bytes), an incompressible type, or a body known to be too small.
+    #[cfg(not(feature = "compression"))]
+    pub(crate) fn apply(&self, resp: HttpResponse, _encoding: Option<Encoding>) -> HttpResponse {
+        // Built without an encoder. Sidecar selection still works, since
+        // serving an already-compressed file needs no compression code.
+        resp
+    }
+
+    #[cfg(feature = "compression")]
     pub(crate) fn apply(&self, mut resp: HttpResponse, encoding: Option<Encoding>) -> HttpResponse {
         let Some(encoding) = encoding.filter(|_| self.enabled) else {
             return resp;
@@ -147,6 +172,7 @@ impl Compression {
         HttpResponse::from_parts(parts, body)
     }
 
+    #[cfg(feature = "compression")]
     fn should_compress(&self, resp: &HttpResponse) -> bool {
         let status = resp.status();
         if status == StatusCode::NO_CONTENT
@@ -206,141 +232,149 @@ fn parse_accept_encoding(value: &str) -> Vec<(Encoding, f32)> {
         .collect()
 }
 
-/// A body that compresses each frame as it passes through.
-///
-/// The compressors are synchronous, which is right here: the bytes are
-/// already in memory and compressing them is pure CPU, so there is nothing
-/// to await. Each frame is flushed so a streaming response still reaches
-/// the client incrementally — that costs a little ratio, and buffering
-/// instead would defeat the point of streaming.
-struct CompressedBody {
-    inner: BoxBody<Bytes, Infallible>,
-    /// Taken by `finish`, which consumes the encoder to terminate the
-    /// stream; `None` also marks the body as complete.
-    encoder: Option<Encoder>,
-}
+#[cfg(feature = "compression")]
+mod encoder {
+    use super::*;
 
-enum Encoder {
-    Brotli(Box<brotli::CompressorWriter<Vec<u8>>>),
-    Gzip(Box<flate2::write::GzEncoder<Vec<u8>>>),
-}
-
-impl CompressedBody {
-    fn new(inner: BoxBody<Bytes, Infallible>, encoding: Encoding) -> Self {
-        let encoder = match encoding {
-            // Quality 4 is the usual server-side pick: most of the ratio of
-            // the higher levels for a fraction of the CPU. lgwin 22 is the
-            // brotli default window.
-            Encoding::Brotli => Encoder::Brotli(Box::new(brotli::CompressorWriter::new(
-                Vec::new(),
-                32 * 1024,
-                4,
-                22,
-            ))),
-            Encoding::Gzip => Encoder::Gzip(Box::new(flate2::write::GzEncoder::new(
-                Vec::new(),
-                flate2::Compression::fast(),
-            ))),
-        };
-        Self {
-            inner,
-            encoder: Some(encoder),
-        }
-    }
-
-    /// Compresses `data` and returns whatever the encoder is willing to
-    /// release now (possibly nothing, when it is still filling its window).
-    fn write(&mut self, data: &[u8]) -> std::io::Result<Bytes> {
-        let Some(encoder) = self.encoder.as_mut() else {
-            return Ok(Bytes::new());
-        };
-        match encoder {
-            Encoder::Brotli(w) => {
-                w.write_all(data)?;
-                w.flush()?;
-                Ok(Bytes::from(std::mem::take(w.get_mut())))
-            }
-            Encoder::Gzip(w) => {
-                w.write_all(data)?;
-                w.flush()?;
-                Ok(Bytes::from(std::mem::take(w.get_mut())))
-            }
-        }
-    }
-
-    /// Terminates the stream, returning the compressor's trailing bytes.
+    /// A body that compresses each frame as it passes through.
     ///
-    /// Both encoders need to be *consumed* to emit their end-of-stream
-    /// marker: a plain flush ends a block, not the stream, and a decoder
-    /// handed the result reports an unexpected EOF.
-    fn finish(&mut self) -> std::io::Result<Bytes> {
-        match self.encoder.take() {
-            None => Ok(Bytes::new()),
-            Some(Encoder::Brotli(w)) => Ok(Bytes::from(w.into_inner())),
-            Some(Encoder::Gzip(w)) => Ok(Bytes::from(w.finish()?)),
+    /// The compressors are synchronous, which is right here: the bytes are
+    /// already in memory and compressing them is pure CPU, so there is nothing
+    /// to await. Each frame is flushed so a streaming response still reaches
+    /// the client incrementally — that costs a little ratio, and buffering
+    /// instead would defeat the point of streaming.
+    pub(super) struct CompressedBody {
+        inner: BoxBody<Bytes, Infallible>,
+        /// Taken by `finish`, which consumes the encoder to terminate the
+        /// stream; `None` also marks the body as complete.
+        encoder: Option<Encoder>,
+    }
+
+    pub(super) enum Encoder {
+        Brotli(Box<brotli::CompressorWriter<Vec<u8>>>),
+        Gzip(Box<flate2::write::GzEncoder<Vec<u8>>>),
+    }
+
+    impl CompressedBody {
+        pub(super) fn new(inner: BoxBody<Bytes, Infallible>, encoding: Encoding) -> Self {
+            let encoder = match encoding {
+                // Quality 4 is the usual server-side pick: most of the ratio of
+                // the higher levels for a fraction of the CPU. lgwin 22 is the
+                // brotli default window.
+                Encoding::Brotli => Encoder::Brotli(Box::new(brotli::CompressorWriter::new(
+                    Vec::new(),
+                    32 * 1024,
+                    4,
+                    22,
+                ))),
+                Encoding::Gzip => Encoder::Gzip(Box::new(flate2::write::GzEncoder::new(
+                    Vec::new(),
+                    flate2::Compression::fast(),
+                ))),
+            };
+            Self {
+                inner,
+                encoder: Some(encoder),
+            }
+        }
+
+        /// Compresses `data` and returns whatever the encoder is willing to
+        /// release now (possibly nothing, when it is still filling its window).
+        fn write(&mut self, data: &[u8]) -> std::io::Result<Bytes> {
+            let Some(encoder) = self.encoder.as_mut() else {
+                return Ok(Bytes::new());
+            };
+            match encoder {
+                Encoder::Brotli(w) => {
+                    w.write_all(data)?;
+                    w.flush()?;
+                    Ok(Bytes::from(std::mem::take(w.get_mut())))
+                }
+                Encoder::Gzip(w) => {
+                    w.write_all(data)?;
+                    w.flush()?;
+                    Ok(Bytes::from(std::mem::take(w.get_mut())))
+                }
+            }
+        }
+
+        /// Terminates the stream, returning the compressor's trailing bytes.
+        ///
+        /// Both encoders need to be *consumed* to emit their end-of-stream
+        /// marker: a plain flush ends a block, not the stream, and a decoder
+        /// handed the result reports an unexpected EOF.
+        fn finish(&mut self) -> std::io::Result<Bytes> {
+            match self.encoder.take() {
+                None => Ok(Bytes::new()),
+                Some(Encoder::Brotli(w)) => Ok(Bytes::from(w.into_inner())),
+                Some(Encoder::Gzip(w)) => Ok(Bytes::from(w.finish()?)),
+            }
         }
     }
-}
 
-impl Body for CompressedBody {
-    type Data = Bytes;
-    type Error = Infallible;
+    impl Body for CompressedBody {
+        type Data = Bytes;
+        type Error = Infallible;
 
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<std::result::Result<Frame<Bytes>, Infallible>>> {
-        // `BoxBody` is a pinned box, so the wrapper is `Unpin`.
-        let this = self.get_mut();
-        loop {
-            if this.encoder.is_none() {
-                return Poll::Ready(None);
-            }
-            match Pin::new(&mut this.inner).poll_frame(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Some(Ok(frame))) => {
-                    let Some(data) = frame.data_ref() else {
-                        // Trailers pass through untouched.
-                        return Poll::Ready(Some(Ok(frame)));
-                    };
-                    match this.write(data) {
-                        // The encoder buffered everything; ask for more
-                        // rather than emitting a zero-length frame.
-                        Ok(out) if out.is_empty() => continue,
-                        Ok(out) => return Poll::Ready(Some(Ok(Frame::data(out)))),
-                        Err(err) => {
-                            // The body type is infallible, so the only
-                            // honest option is to end the stream; the
-                            // client sees a truncated response.
-                            tracing::error!("response compression failed: {err}");
-                            this.encoder = None;
-                            return Poll::Ready(None);
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<std::result::Result<Frame<Bytes>, Infallible>>> {
+            // `BoxBody` is a pinned box, so the wrapper is `Unpin`.
+            let this = self.get_mut();
+            loop {
+                if this.encoder.is_none() {
+                    return Poll::Ready(None);
+                }
+                match Pin::new(&mut this.inner).poll_frame(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Some(Ok(frame))) => {
+                        let Some(data) = frame.data_ref() else {
+                            // Trailers pass through untouched.
+                            return Poll::Ready(Some(Ok(frame)));
+                        };
+                        match this.write(data) {
+                            // The encoder buffered everything; ask for more
+                            // rather than emitting a zero-length frame.
+                            Ok(out) if out.is_empty() => continue,
+                            Ok(out) => return Poll::Ready(Some(Ok(Frame::data(out)))),
+                            Err(err) => {
+                                // The body type is infallible, so the only
+                                // honest option is to end the stream; the
+                                // client sees a truncated response.
+                                tracing::error!("response compression failed: {err}");
+                                this.encoder = None;
+                                return Poll::Ready(None);
+                            }
                         }
                     }
-                }
-                Poll::Ready(Some(Err(never))) => match never {},
-                Poll::Ready(None) => {
-                    return match this.finish() {
-                        Ok(tail) if tail.is_empty() => Poll::Ready(None),
-                        Ok(tail) => Poll::Ready(Some(Ok(Frame::data(tail)))),
-                        Err(err) => {
-                            tracing::error!("response compression failed to finish: {err}");
-                            Poll::Ready(None)
-                        }
-                    };
+                    Poll::Ready(Some(Err(never))) => match never {},
+                    Poll::Ready(None) => {
+                        return match this.finish() {
+                            Ok(tail) if tail.is_empty() => Poll::Ready(None),
+                            Ok(tail) => Poll::Ready(Some(Ok(Frame::data(tail)))),
+                            Err(err) => {
+                                tracing::error!("response compression failed to finish: {err}");
+                                Poll::Ready(None)
+                            }
+                        };
+                    }
                 }
             }
         }
-    }
 
-    fn size_hint(&self) -> SizeHint {
-        // Compression makes the identity length meaningless, and an
-        // inherited exact hint would contradict the bytes actually sent.
-        SizeHint::default()
+        fn size_hint(&self) -> SizeHint {
+            // Compression makes the identity length meaningless, and an
+            // inherited exact hint would contradict the bytes actually sent.
+            SizeHint::default()
+        }
     }
 }
 
-#[cfg(test)]
+#[cfg(feature = "compression")]
+use encoder::CompressedBody;
+
+#[cfg(all(test, feature = "compression"))]
 mod tests {
     use super::*;
     use http_body_util::Full;

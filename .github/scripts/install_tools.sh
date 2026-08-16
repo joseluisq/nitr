@@ -1,6 +1,6 @@
 # Installer script for build tools needed by CI jobs.
 # It is intended to be run on GitHub Actions hosted runners.
-# USAGE: .github/scripts/ci/install_tools.sh --target=<target> --build=<build>
+# USAGE: .github/scripts/install_tools.sh --target=<target> --build=<build>
 #
 # Script adapted from https://github.com/briansmith/ring/blob/main/mk/install-build-tools.sh
 
@@ -64,11 +64,6 @@ setup_all() {
       exit 0
       ;;
 
-    # FIPS
-    *fips)
-      setup_linux_fips_64_bit
-      exit 0
-      ;;
     *)
       info "No build case matching, nothing to do."
       ;;
@@ -91,15 +86,6 @@ setup_all() {
       info "No target case matching, nothing to do."
       ;;
   esac
-}
-
-setup_linux_fips_64_bit() {
-  setup_linux_64_bit
-
-  info "Setting up Cargo features for FIPS builds..."
-  echo "CARGO_FEATURES=--no-default-features --features all-fips" >> $GITHUB_ENV
-  echo "RUSTFLAGS=--cfg tokio_unstable" >> $GITHUB_ENV
-  info "Successfully configured!"
 }
 
 # Linux 64-bit (arm64/amd64) and (GNU/musl) builds.

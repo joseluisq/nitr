@@ -20,7 +20,7 @@ pub(crate) mod query_one;
 pub(crate) mod query_row;
 pub(crate) mod types;
 
-pub use pragmas::SqlitePragmas;
+use crate::config::SqlitePragmas;
 
 /// Set while a transaction is open on the connection.
 type TxFlag = Arc<AtomicBool>;

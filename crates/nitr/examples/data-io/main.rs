@@ -130,7 +130,7 @@ async fn flaky_upstream() -> nitr::Result<std::net::SocketAddr> {
                 let service = service_fn(move |_req| {
                     let n = seen.fetch_add(1, Ordering::SeqCst);
                     async move {
-                        if n % 3 == 0 {
+                        if n.is_multiple_of(3) {
                             return Ok::<_, std::convert::Infallible>(
                                 Response::builder()
                                     .status(StatusCode::SERVICE_UNAVAILABLE)

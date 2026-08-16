@@ -5,13 +5,14 @@
 #![deny(warnings)]
 #![deny(rust_2018_idioms)]
 #![deny(dead_code)]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub(crate) mod app;
 pub(crate) mod compress;
 pub(crate) mod config;
 pub(crate) mod cors;
 pub(crate) mod handler;
+#[cfg(feature = "multipart")]
 pub(crate) mod multipart;
 pub(crate) mod protect;
 pub(crate) mod range;

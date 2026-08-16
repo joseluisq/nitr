@@ -17,12 +17,8 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/joseluisq/nitr"
 homepage = "https://github.com/joseluisq/nitr"
 
-[workspace.package.metadata.docs.rs]
-features = ["all"]
-rustdoc-args = ["--cfg", "docsrs"]
-
 # Cross: workaround for https://github.com/cross-rs/cross/issues/1345
-[workspace.package.metadata.cross.target.x86_64-unknown-netbsd]
+[workspace.metadata.cross.target.x86_64-unknown-netbsd]
 pre-build = [
     "mkdir -p /tmp/netbsd",
     "curl -fO https://ftp.uni-erlangen.de/netbsd/NetBSD-9.4/amd64/binary/sets/base.tar.xz",

@@ -125,10 +125,17 @@ pub(crate) struct LuaRequest {
 }
 
 /// Bounds applied while parsing a request body into Lua values.
+///
+/// Only multipart reads these today, so a build without that feature
+/// carries the values without using them; keeping the struct whole means
+/// `[limits]` parses identically either way.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FormLimits {
+    #[cfg_attr(not(feature = "multipart"), allow(dead_code))]
     pub(crate) max_parts: usize,
+    #[cfg_attr(not(feature = "multipart"), allow(dead_code))]
     pub(crate) max_field_bytes: u64,
+    #[cfg_attr(not(feature = "multipart"), allow(dead_code))]
     pub(crate) max_file_bytes: u64,
 }
 
@@ -311,6 +318,7 @@ impl UserData for LuaRequest {
         // req:multipart(fn) — invokes `fn` once per part, in arrival order.
         // See `crate::multipart` for why parts stream instead of being
         // collected. Returns the number of parts seen.
+        #[cfg(feature = "multipart")]
         methods.add_async_method_mut("multipart", |lua, mut req, cb: mlua::Function| async move {
             let content_type = req
                 .req

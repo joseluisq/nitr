@@ -8,13 +8,96 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+documentation = "https://docs.rs/nitr"
 readme = "../../README.md"
+categories = ["web-programming::http-server", "network-programming"]
 keywords = [
     "dynamic-web-server",
     "http-server",
     "lua-server"
 ]
-include = ["src/**/*.rs", "Cargo.toml"]
+include = ["src/**/*.rs", "Cargo.toml", "LICENSE-APACHE", "LICENSE-MIT"]
+
+# The feature set an application picks. Each one turns on the matching
+# `nitr.*` builtin or server capability; `all` is every optional one.
+#
+# Nothing is on by default, so a plain `cargo add nitr` builds the minimal
+# server: routing, static files, and the `json`/`http`/`log`/`cache`
+# builtins, which need no dependency the server does not already have.
+# Configuring a builtin that was not compiled in is a startup error naming
+# the feature to enable.
+[features]
+default = []
+all = [
+    "compression",
+    "crypto",
+    "db",
+    "fetch",
+    "multipart",
+    "template",
+]
+
+# `nitr.crypto` / `nitr.auth`: argon2 passwords, constant-time comparison.
+crypto = ["nitr-http/crypto"]
+# `nitr.db`: the SQLite driver, migrations, and `nitr migrate`.
+db = ["nitr-http/db"]
+# `nitr.fetch` / `nitr.await_all`: the outbound HTTP client. The heaviest
+# by far — reqwest is over half of the full dependency graph.
+fetch = ["nitr-http/fetch"]
+# `nitr.template`: the minijinja engine.
+template = ["nitr-http/template"]
+# On-the-fly brotli/gzip response compression. Precompressed `.br`/`.gz`
+# sidecars are served without it.
+compression = ["nitr-http/compression"]
+# `req:multipart(fn)`: streaming file uploads.
+multipart = ["nitr-http/multipart"]
+
+# Explicit targets so `cargo test`/`cargo build --examples` skip whatever
+# the selected feature set cannot build, instead of failing. Everything not
+# listed here needs no optional feature.
+[lib]
+name = "nitr"
+path = "src/lib.rs"
+
+[[test]]
+name = "async_db"
+path = "tests/async_db.rs"
+required-features = ["db", "fetch"]
+
+[[test]]
+name = "data_io"
+path = "tests/data_io.rs"
+required-features = ["db", "fetch"]
+
+[[test]]
+name = "namespace"
+path = "tests/namespace.rs"
+required-features = ["crypto", "fetch"]
+
+[[test]]
+name = "standards"
+path = "tests/standards.rs"
+required-features = ["compression", "multipart"]
+
+[[example]]
+name = "aggregate"
+path = "examples/aggregate/main.rs"
+required-features = ["db", "fetch"]
+
+[[example]]
+name = "data-io"
+path = "examples/data-io/main.rs"
+required-features = ["db", "fetch"]
+
+[[example]]
+name = "standards"
+path = "examples/standards/main.rs"
+required-features = ["compression", "multipart"]
+
+[[example]]
+name = "stdlib"
+path = "examples/stdlib/main.rs"
+required-features = ["crypto", "fetch"]
 
 [dependencies]
 nitr-core = { workspace = true }

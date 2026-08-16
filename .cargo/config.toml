@@ -9,8 +9,3 @@ rustflags = ["-C", "target-feature=+crt-static"]
 rustflags = ["-C", "target-feature=+crt-static"]
 [target.i686-pc-windows-msvc]
 rustflags = ["-C", "link-arg=libvcruntime.lib"]
-
-[build]
-# Required for experimental features like `metrics` and others.
-rustflags = ["--cfg", "tokio_unstable"]
-rustdocflags = ["--cfg", "tokio_unstable"]

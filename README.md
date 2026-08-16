@@ -25,6 +25,37 @@ Nitr is both a **binary** (`nitr`, configured via `nitr.toml`) and a **library c
 - **Dev mode (`--dev`)**: handler hot reload and error details in responses.
 - **Extensible:** `ServerBuilder::module("name", ...)` mounts a Rust table at `nitr.name` in every Lua state, third-party extension crates need no fork.
 
+## Cargo features
+
+Optional builtins are Cargo features, so a build only carries the
+dependencies it uses. Nothing is enabled by default in the **library**; the
+`nitr` **binary** enables `all`, because someone installing a server expects
+every builtin to be there.
+
+| Feature | Enables | Heaviest dependency |
+| --- | --- | --- |
+| `fetch` | `nitr.fetch`, `nitr.await_all` | `reqwest` |
+| `db` | `nitr.db`, migrations, `nitr migrate` | `rusqlite` (bundles SQLite) |
+| `template` | `nitr.template` | `minijinja` |
+| `crypto` | `nitr.crypto`, `nitr.auth` | `argon2` |
+| `compression` | on-the-fly brotli/gzip responses | `brotli`, `flate2` |
+| `multipart` | `req:multipart(fn)` file uploads | `multer` |
+| `all` | every feature above | — |
+
+`json`, `http`, `log`, `cache` and `dbg` are always compiled in: they need
+nothing the server does not already depend on, so gating them would save
+nothing. Precompressed `.br`/`.gz` sidecars are also served without the
+`compression` feature — serving an already-compressed file needs no encoder.
+
+```sh
+cargo add nitr                                   # minimal
+cargo add nitr --features db,template            # plus SQLite and templates
+cargo add nitr --features all                    # everything
+```
+
+Configuring a builtin that was not compiled in is a startup error naming the
+feature to enable, rather than a mysterious "unknown std feature".
+
 ## Quick start (binary)
 
 ```sh

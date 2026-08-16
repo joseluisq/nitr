@@ -11,17 +11,17 @@ jobs:
     name: create-release
     runs-on: ubuntu-24.04
     outputs:
-      sws_version: ${{ env.SWS_VERSION }}
+      nitr_version: ${{ env.NITR_VERSION }}
     steps:
       - name: Get the release version from the tag
         shell: bash
-        if: env.SWS_VERSION == ''
+        if: env.NITR_VERSION == ''
         run: |
           # Apparently, this is the right way to get a tag name. Really?
           #
           # See: https://github.community/t5/GitHub-Actions/How-to-get-just-the-tag-name/m-p/32167/highlight/true#M1027
-          echo "SWS_VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
-          echo "version is: ${{ env.SWS_VERSION }}"
+          echo "NITR_VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+          echo "version is: ${{ env.NITR_VERSION }}"
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -30,7 +30,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create ${{ env.SWS_VERSION }} --verify-tag --draft --title="${{ env.SWS_VERSION }}"
+          gh release create ${{ env.NITR_VERSION }} --verify-tag --draft --title="${{ env.NITR_VERSION }}"
 
   build-release:
     name: build-release
@@ -46,7 +46,7 @@ jobs:
       TARGET_DIR: ./target
       # Emit backtraces on panics.
       RUST_BACKTRACE: 1
-      # SWS features for Cargo build
+      # Every optional builtin: a released binary is full-featured.
       CARGO_FEATURES: "--features=all"
     strategy:
       matrix:
@@ -203,7 +203,7 @@ jobs:
         echo "Configuring Cross..."
         # Use 'cargo.sh' script for Android targets only
         if [[ "${{ matrix.build }}" == "linux-android-armv7" ]] || [[ "${{ matrix.build }}" == "linux-android-arm64" ]]; then
-          echo "CARGO_BIN=.github/scripts/ci/cargo.sh" >> $GITHUB_ENV
+          echo "CARGO_BIN=.github/scripts/cargo.sh" >> $GITHUB_ENV
         else
           target=''
           case "${{ matrix.os }}" in
@@ -244,7 +244,7 @@ jobs:
       shell: bash
       if: ${{ !startsWith(matrix.os, 'windows') }}
       run: |
-        .github/scripts/ci/install_tools.sh --build=${{ matrix.build }} --target=${{ matrix.target }}
+        .github/scripts/install_tools.sh --build=${{ matrix.build }} --target=${{ matrix.target }}
 
     - name: Build release binary
       shell: bash
@@ -253,7 +253,7 @@ jobs:
     - name: Build archive
       shell: bash
       run: |
-        staging="nitr-${{ needs.create-release.outputs.sws_version }}-${{ matrix.target }}"
+        staging="nitr-${{ needs.create-release.outputs.nitr_version }}-${{ matrix.target }}"
         mkdir -p "$staging/"
         mkdir -p bin
 
@@ -275,4 +275,4 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        gh release upload ${{ needs.create-release.outputs.sws_version }} ${{ env.ASSET }}
+        gh release upload ${{ needs.create-release.outputs.nitr_version }} ${{ env.ASSET }}

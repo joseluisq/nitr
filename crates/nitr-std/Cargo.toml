@@ -8,28 +8,62 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+documentation = "https://docs.rs/nitr-std"
 readme = "../../README.md"
+categories = ["network-programming", "api-bindings"]
 keywords = ["lua", "stdlib", "builtins"]
-include = ["src/**/*.rs", "Cargo.toml"]
+include = ["src/**/*.rs", "Cargo.toml", "LICENSE-APACHE", "LICENSE-MIT"]
+
+# The crates gate `doc_cfg` behind `--cfg docsrs`.
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]
+
+# Which `nitr.*` builtins are compiled in. Only the builtins with heavy
+# exclusive dependencies are gated; `json`, `http`, `log`, `dbg` and
+# `cache` need nothing that is not already required, so gating them would
+# be ceremony rather than savings.
+#
+# The names match the `[std] features` values in `nitr.toml`, and asking
+# for a builtin that was not compiled in is a startup error that says so.
+[features]
+default = []
+all = ["crypto", "db", "fetch", "template"]
+
+# argon2 password hashing and the constant-time comparison primitives.
+crypto = ["dep:argon2", "dep:getrandom", "dep:subtle"]
+# The SQLite driver and `nitr migrate` (bundles SQLite itself).
+db = ["dep:rusqlite"]
+# The outbound HTTP client. By far the heaviest: reqwest pulls in over
+# half of the whole dependency graph.
+fetch = ["dep:futures-util", "dep:reqwest", "dep:url"]
+# The minijinja template engine.
+template = ["dep:minijinja"]
+
+[lib]
+name = "nitr_std"
+path = "src/lib.rs"
 
 [dependencies]
 nitr-core = { workspace = true }
 
-argon2 = { workspace = true }
 base64 = { workspace = true }
 bitflags = { workspace = true }
 bytes = { workspace = true }
 cookie = { workspace = true }
-futures-util = { workspace = true }
-getrandom = { workspace = true }
+# Signed cookies and `nitr.etag` need these regardless of the `crypto`
+# feature, so they are not optional.
 hmac = { workspace = true }
 sha2 = { workspace = true }
-subtle = { workspace = true }
-minijinja = { workspace = true }
 mlua = { workspace = true }
-reqwest = { workspace = true }
-rusqlite = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-url = { workspace = true }
+
+argon2 = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+getrandom = { workspace = true, optional = true }
+minijinja = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+rusqlite = { workspace = true, optional = true }
+subtle = { workspace = true, optional = true }
+url = { workspace = true, optional = true }

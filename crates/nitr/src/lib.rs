@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 #![deny(warnings)]
 #![deny(rust_2018_idioms)]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 //! Nitr: a Rust web server embedding Lua for fast, efficient and safe
 //! dynamic backends.

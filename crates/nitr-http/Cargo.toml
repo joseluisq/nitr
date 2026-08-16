@@ -8,26 +8,58 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+documentation = "https://docs.rs/nitr-http"
 readme = "../../README.md"
+categories = ["web-programming::http-server", "network-programming"]
 keywords = ["http-server", "lua-server"]
-include = ["src/**/*.rs", "Cargo.toml"]
+include = ["src/**/*.rs", "Cargo.toml", "LICENSE-APACHE", "LICENSE-MIT"]
+
+# The crates gate `doc_cfg` behind `--cfg docsrs`.
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]
+
+# Server-layer capabilities. The `nitr-std` builtins are re-exported so a
+# dependent picks its whole feature set in one place.
+[features]
+default = []
+all = [
+    "compression",
+    "crypto",
+    "db",
+    "fetch",
+    "multipart",
+    "template",
+]
+
+# On-the-fly brotli/gzip response compression. Precompressed `.br`/`.gz`
+# sidecars are served either way: that needs no encoder, only a `stat`.
+compression = ["dep:brotli", "dep:flate2"]
+# `req:multipart(fn)` file uploads.
+multipart = ["dep:multer"]
+
+# Pass-through to the standard library.
+crypto = ["nitr-std/crypto"]
+db = ["nitr-std/db"]
+fetch = ["nitr-std/fetch"]
+template = ["nitr-std/template"]
+
+[lib]
+name = "nitr_http"
+path = "src/lib.rs"
 
 [dependencies]
 nitr-core = { workspace = true }
 nitr-std = { workspace = true }
 
 async-channel = { workspace = true }
-brotli = { workspace = true }
 futures-util = { workspace = true }
 bytes = { workspace = true }
-flate2 = { workspace = true }
 http-body-util = { workspace = true }
 httpdate = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 matchit = { workspace = true }
 mime_guess = { workspace = true }
-multer = { workspace = true }
 mlua = { workspace = true }
 percent-encoding = { workspace = true }
 serde = { workspace = true }
@@ -37,3 +69,7 @@ toml = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
+
+brotli = { workspace = true, optional = true }
+flate2 = { workspace = true, optional = true }
+multer = { workspace = true, optional = true }

@@ -18,7 +18,8 @@ use mlua::{
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, LOCATION};
 use reqwest::{Client as HttpClient, Method as HttpMethod, StatusCode, Url, redirect};
 
-use crate::fetch::policy::{ConnectPolicy, FetchOptions, GuardedResolver, check_url};
+use crate::config::FetchOptions;
+use crate::fetch::policy::{ConnectPolicy, GuardedResolver, check_url};
 use crate::fetch::response::LuaResponse;
 
 /// Maximum redirects followed per outbound request.
@@ -490,6 +491,7 @@ pub(crate) fn create_await_all_fn(lua: &Lua, opts: Arc<FetchOptions>) -> mlua::R
             // to the bigger of the two.
             enum Job {
                 Fetch(Box<(Arc<HttpClient>, RequestSpec, Arc<FetchOptions>)>),
+                #[cfg(feature = "db")]
                 Query(crate::db::PendingQuery),
             }
 
@@ -505,13 +507,16 @@ pub(crate) fn create_await_all_fn(lua: &Lua, opts: Arc<FetchOptions>) -> mlua::R
                         fetch.spec.clone(),
                         fetch.opts.clone(),
                     ))));
-                } else if let Ok(query) = handle.borrow::<crate::db::LuaPendingQuery>() {
-                    jobs.push(Job::Query(query.take()?));
-                } else {
-                    return Err(mlua::Error::RuntimeError(
-                        "await_all expects fetch(...) or db:query_async(...) handles".into(),
-                    ));
+                    continue;
                 }
+                #[cfg(feature = "db")]
+                if let Ok(query) = handle.borrow::<crate::db::LuaPendingQuery>() {
+                    jobs.push(Job::Query(query.take()?));
+                    continue;
+                }
+                return Err(mlua::Error::RuntimeError(
+                    "await_all expects fetch(...) or db:query_async(...) handles".into(),
+                ));
             }
 
             let results = futures_util::future::try_join_all(jobs.into_iter().map(|job| {
@@ -523,6 +528,7 @@ pub(crate) fn create_await_all_fn(lua: &Lua, opts: Arc<FetchOptions>) -> mlua::R
                             let resp = send_with_retries(&client, spec, &opts).await?;
                             lua.create_userdata(resp).map(Value::UserData)
                         }
+                        #[cfg(feature = "db")]
                         Job::Query(query) => query.run(&lua).await,
                     }
                 }

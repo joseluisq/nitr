@@ -159,6 +159,15 @@ async fn main() -> anyhow::Result<()> {
 /// Deliberately separate from `nitr run`: applying schema changes at boot
 /// means a rolling deployment has two instances racing to change the same
 /// schema, each believing it is alone.
+#[cfg(not(feature = "db"))]
+fn migrate(_cfg: &Config, _status_only: bool) -> anyhow::Result<()> {
+    bail!(
+        "this build has no database support: rebuild with the `db` Cargo \
+         feature (or `all`) to use `nitr migrate`"
+    )
+}
+
+#[cfg(feature = "db")]
 fn migrate(cfg: &Config, status_only: bool) -> anyhow::Result<()> {
     let db = cfg
         .database
