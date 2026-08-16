@@ -61,7 +61,20 @@ minijinja = { version = "2.24.0", features = ["loader"] }
 multer = "3.1"
 percent-encoding = "2.3"
 mlua = { version = "0.12", features = ["async", "macros", "lua54", "serialize", "vendored", "anyhow", "send"] }
-reqwest = { version = "0.12.15", features = ["json"] }
+# TLS comes from rustls (ring provider), not the `default-tls` backend.
+# `default-tls` means `native-tls`, which is OpenSSL on every unix except
+# macOS, and `openssl-sys` needs a prebuilt libssl for the *target*: the
+# illumos/BSD cross images ship none, so the build script aborts. rustls is
+# pure Rust and needs nothing from the sysroot. `default-features = false`
+# drops `default-tls`, so the other three defaults are re-listed by hand.
+# `-native-roots` keeps reading the platform trust store, as native-tls did.
+reqwest = { version = "0.12.15", default-features = false, features = [
+    "json",
+    "charset",
+    "http2",
+    "system-proxy",
+    "rustls-tls-native-roots",
+] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.140"
