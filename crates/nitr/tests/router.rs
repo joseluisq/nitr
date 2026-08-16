@@ -68,9 +68,7 @@ return app
 "#;
 
 const CFG_SCRIPT: &str = r#"
-function(db)
-    return { name = "from-config" }
-end
+return { name = "from-config" }
 "#;
 
 fn write_temp_script(name: &str, content: &str) -> PathBuf {

@@ -123,10 +123,9 @@ return app
     let config = write_temp(
         "cfg.lua",
         r#"
-        function(db)
-            db:execute("CREATE TABLE IF NOT EXISTS t (v TEXT)")
-            return {}
-        end
+        local db = ...
+        db:execute("CREATE TABLE IF NOT EXISTS t (v TEXT)")
+        return {}
         "#,
     );
 

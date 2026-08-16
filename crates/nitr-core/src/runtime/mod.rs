@@ -220,10 +220,12 @@ impl Runtime {
         crate::ns::mount(&self.lua, name, value)
     }
 
-    /// It sets the Lua configuration function that will be called at server startup.
+    /// It sets the Lua configuration script that runs once at server startup.
     ///
-    /// It loads the Lua script from the path and evaluates it to allocate the function,
-    /// then it's immediately invoked with the provided arguments if any.
+    /// The script is a plain Lua chunk in the same shape handler scripts
+    /// use: statements at the top level ending in `return { ... }`, with
+    /// the provided arguments available as its varargs (`local db = ...`).
+    ///
     /// The Lua table containing the configuration fields can be accessed later
     /// using the [`cfg()`](Self::cfg) method.
     pub async fn register_cfg_fn(&mut self, cfg_src: &Path, args: impl IntoLuaMulti) -> Result {
@@ -234,34 +236,45 @@ impl Runtime {
             ))
         })?;
 
-        // Create config handler and call it.
-        let value = self
-            .eval_chunk(data, cfg_src)
+        let chunk = self
+            .load_chunk(data, cfg_src)
             .map_err(|err| load_error(cfg_src, err))?;
-        let cfg_fn = match value {
-            Value::Function(f) => f,
+        // The chunk itself receives the arguments as its varargs, so the
+        // script sees `db` via `local db = ...` at the top. A failure while
+        // it runs (a misspelled `db:` method, a nil index) gets the same
+        // in-context rendering as a parse error.
+        let value = chunk
+            .call_async::<Value>(args)
+            .await
+            .map_err(|err| load_error(cfg_src, err))?;
+        let cfg = match value {
+            Value::Table(cfg) => cfg,
+            // The pre-1.0 wrapper form; point migrations at the new shape.
+            Value::Function(_) => {
+                return Err(Error::Script(format!(
+                    "the configuration script {} returned a function; the \
+                     `function(db) ... end` wrapper is no longer supported — \
+                     take arguments via `local db = ...` at the top level and \
+                     end the script with `return {{ ... }}`",
+                    cfg_src.display()
+                )));
+            }
             other => {
                 return Err(Error::Script(format!(
-                    "the configuration script {} must evaluate to a function, got {}",
+                    "the configuration script {} must return a table, got {}",
                     cfg_src.display(),
                     other.type_name()
                 )));
             }
         };
-        // A failure while the function runs (a misspelled `db:` method, a
-        // nil index) gets the same in-context rendering as a parse error.
-        let cfg = cfg_fn
-            .call_async::<Table>(args)
-            .await
-            .map_err(|err| load_error(cfg_src, err))?;
 
         self.cfg = Some(cfg);
         Ok(())
     }
 
-    /// Loads and runs a chunk the way `eval` does — expression form first
-    /// (`function(db) ... end` configuration scripts), statement block
-    /// second — but with precise diagnostics: when *both* parses fail, the
+    /// Loads and runs a chunk the way `eval` does — expression form first,
+    /// statement block second — but with precise diagnostics: when *both*
+    /// parses fail, the
     /// error that got further into the file wins. mlua's own `eval` reports
     /// only the block fallback, which for an expression-form script always
     /// blames the top-level `function(` line instead of the actual typo.
@@ -269,17 +282,24 @@ impl Runtime {
     /// The chunk is named after the file (`@` marks a real path) so errors
     /// report `config.lua:12` instead of an anonymous chunk.
     fn eval_chunk(&self, data: Vec<u8>, path: &Path) -> mlua::Result<Value> {
+        self.load_chunk(data, path)?.call(())
+    }
+
+    /// The compile half of [`eval_chunk`](Self::eval_chunk): the dual parse
+    /// without the call, for callers that pass the chunk arguments (a
+    /// loaded chunk is itself a vararg function) or must call it async.
+    fn load_chunk(&self, data: Vec<u8>, path: &Path) -> mlua::Result<Function> {
         let name = format!("@{}", path.display());
         // `return ` on the same line keeps every line number intact.
         let mut wrapped = Vec::with_capacity(data.len() + 7);
         wrapped.extend_from_slice(b"return ");
         wrapped.extend_from_slice(&data);
         let expr_err = match self.lua.load(wrapped).set_name(&name).into_function() {
-            Ok(f) => return f.call(()),
+            Ok(f) => return Ok(f),
             Err(err) => err,
         };
         match self.lua.load(data).set_name(&name).into_function() {
-            Ok(f) => f.call(()),
+            Ok(f) => Ok(f),
             Err(block_err) => {
                 let line = |err: &mlua::Error| {
                     crate::error::ErrorInfo::from_error(&Error::Lua(err.clone()))
@@ -544,7 +564,7 @@ mod tests {
     #[test]
     fn both_script_forms_still_evaluate() {
         let rt = Runtime::new().expect("runtime");
-        // Expression form (configuration scripts).
+        // Expression form.
         let path = write_temp_script("expr-ok.lua", "function(x)\n    return x\nend");
         assert!(matches!(
             rt.eval_script(&path).expect("expression form"),
@@ -626,11 +646,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn config_snapshot_round_trips() {
+    async fn config_accepts_plain_script() {
+        // Handler-style shape: top-level statements, args via `...`,
+        // trailing `return { ... }` — no `function(...)` wrapper.
         let cfg_script = write_temp_script(
-            "cfg.lua",
-            "function() return { greeting = 'hi', nested = { n = 7 } } end",
+            "cfg_plain.lua",
+            "local greeting = ...\n\
+             local upper = greeting:upper()\n\
+             return { greeting = greeting, upper = upper }",
         );
+        let mut rt = test_runtime(None);
+        rt.register_cfg_fn(&cfg_script, "hi")
+            .await
+            .expect("run plain config script");
+        std::fs::remove_file(&cfg_script).ok();
+
+        let cfg = rt.cfg().expect("cfg table");
+        assert_eq!(cfg.get::<String>("greeting").expect("greeting"), "hi");
+        assert_eq!(cfg.get::<String>("upper").expect("upper"), "HI");
+    }
+
+    #[tokio::test]
+    async fn config_rejects_non_table_result() {
+        let cfg_script = write_temp_script("cfg_bad.lua", "return 42");
+        let mut rt = test_runtime(None);
+        let err = rt
+            .register_cfg_fn(&cfg_script, Value::Nil)
+            .await
+            .expect_err("number is not a valid configuration");
+        std::fs::remove_file(&cfg_script).ok();
+        assert!(
+            err.to_string().contains("must return a table"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_rejects_the_dropped_wrapper_form() {
+        // The old `function(db) ... end` shape must fail with a message
+        // that points migrations at the plain-script form.
+        let cfg_script = write_temp_script(
+            "cfg_wrapped.lua",
+            "function(db)\n    return { ok = true }\nend",
+        );
+        let mut rt = test_runtime(None);
+        let err = rt
+            .register_cfg_fn(&cfg_script, Value::Nil)
+            .await
+            .expect_err("wrapper form is no longer supported");
+        std::fs::remove_file(&cfg_script).ok();
+        let message = err.to_string();
+        assert!(message.contains("no longer supported"), "got: {message}");
+        assert!(message.contains("local db = ..."), "got: {message}");
+    }
+
+    #[tokio::test]
+    async fn config_snapshot_round_trips() {
+        let cfg_script =
+            write_temp_script("cfg.lua", "return { greeting = 'hi', nested = { n = 7 } }");
         let mut source = test_runtime(None);
         source
             .register_cfg_fn(&cfg_script, Value::Nil)

@@ -60,10 +60,7 @@ async fn serves_lua_handlers_end_to_end() {
         return app
         "#,
     );
-    let config = write_temp_script(
-        "config.lua",
-        "function() return { motto = 'fast and safe' } end",
-    );
+    let config = write_temp_script("config.lua", "return { motto = 'fast and safe' }");
 
     let (listener, addr) = reserve_addr();
     let server = nitr::Server::builder()

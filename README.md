@@ -98,14 +98,13 @@ return app
 
 ### The configuration script (optional)
 
-Runs exactly **once** at startup, before requests are served. Use it for setup (e.g. schema migrations); the returned table is available to handlers as `nitr.cfg`. It must return plain data (tables, strings, numbers, booleans) — it is snapshotted and shared with every Lua state. The database connection is passed in as its argument.
+Runs exactly **once** at startup, before requests are served. Use it for setup (e.g. schema migrations); the returned table is available to handlers as `nitr.cfg`. It must return plain data (tables, strings, numbers, booleans) — it is snapshotted and shared with every Lua state. The database connection arrives as the script's vararg.
 
 ```lua
 -- scripts/config.lua
-function(db)
-    db:execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT)")
-    return { started_at = os.date("%Y-%m-%dT%H:%M:%S") }
-end
+local db = ...
+db:execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT)")
+return { started_at = os.date("%Y-%m-%dT%H:%M:%S") }
 ```
 
 ## Lua API

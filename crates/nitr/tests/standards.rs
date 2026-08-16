@@ -157,7 +157,7 @@ impl Harness {
         std::fs::write(
             &config_script,
             format!(
-                "return function() return {{ upload_dir = {:?} }} end",
+                "return {{ upload_dir = {:?} }}",
                 dir.join("uploads").to_string_lossy()
             ),
         )

@@ -71,7 +71,7 @@ async fn main() -> nitr::Result {
     let config_script = std::env::temp_dir().join("nitr-data-io-config.lua");
     std::fs::write(
         &config_script,
-        format!("return function() return {{ upstream = \"http://{upstream}/\" }} end"),
+        format!("return {{ upstream = \"http://{upstream}/\" }}"),
     )?;
 
     let mut cfg = Config {

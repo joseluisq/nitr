@@ -553,7 +553,7 @@ async fn fetch_harness(upstream: SocketAddr, tune: impl FnOnce(&mut nitr::Config
     let config_script = scratch(&format!("fetch_config_{port}.lua"));
     std::fs::write(
         &config_script,
-        format!("return function() return {{ upstream = \"http://{upstream}/\" }} end"),
+        format!("return {{ upstream = \"http://{upstream}/\" }}"),
     )
     .expect("write config script");
 
@@ -701,7 +701,7 @@ async fn a_query_and_a_fetch_can_run_together() {
     let config_script = scratch("await_config.lua");
     std::fs::write(
         &config_script,
-        format!("return function() return {{ upstream = \"http://{addr}/\" }} end"),
+        format!("return {{ upstream = \"http://{addr}/\" }}"),
     )
     .expect("write config script");
     cfg.config_script = Some(config_script);
