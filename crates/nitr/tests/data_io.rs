@@ -9,14 +9,22 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("nitr-data-io-{}", std::process::id()));
+    // The counter keeps every call on its own directory: `fs::write`
+    // truncates before writing, so a path two tests share is a race.
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("nitr-data-io-{}-{id}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("scratch dir");
     dir.join(name)
 }
 
-fn free_addr() -> SocketAddr {
+/// Binds port 0 (the OS picks a free port) and keeps the listener alive.
+/// The server adopts it via `.listener(...)`, so the port can never be
+/// taken by another test between choosing it and serving on it.
+fn reserve_addr() -> (std::net::TcpListener, SocketAddr) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind port 0");
-    listener.local_addr().expect("local addr")
+    let addr = listener.local_addr().expect("local addr");
+    (listener, addr)
 }
 
 async fn wait_until_listening(addr: SocketAddr) {
@@ -42,14 +50,15 @@ impl Harness {
         let handler = scratch(script_name);
         std::fs::write(&handler, script).expect("write handler");
         cfg.handler_script = handler;
-        cfg.listen = free_addr();
+        let (listener, addr) = reserve_addr();
+        cfg.listen = addr;
         cfg.workers = 4;
         cfg.shutdown.grace = 5;
         cfg.shutdown.stream_grace = 0;
-        let addr = cfg.listen;
 
         let server = nitr::Server::builder()
             .config(cfg)
+            .listener(listener)
             .build()
             .await
             .expect("build server");
@@ -378,7 +387,8 @@ async fn a_pending_migration_refuses_the_boot() {
     let handler = scratch("db_app_pending.lua");
     std::fs::write(&handler, DB_SCRIPT).expect("write handler");
     cfg.handler_script = handler;
-    cfg.listen = free_addr();
+    // `build()` never binds, so any address will do for a build-only test.
+    cfg.listen = "127.0.0.1:0".parse().expect("addr");
 
     let err = nitr::Server::builder()
         .config(cfg.clone())

@@ -4,6 +4,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 const APP_SCRIPT: &str = r#"
 local app = nitr.app()
@@ -21,27 +22,38 @@ return app
 "#;
 
 fn write_temp_script(name: &str, content: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("nitr-protect-{}-{name}", std::process::id()));
+    // `fs::write` truncates before writing, so a path two tests share is a
+    // race; the counter keeps every call on its own file.
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    let path =
+        std::env::temp_dir().join(format!("nitr-protect-{}-{id}-{name}", std::process::id()));
     std::fs::write(&path, content).expect("write temp script");
     path
 }
 
-fn free_addr() -> SocketAddr {
+/// Binds port 0 (the OS picks a free port) and keeps the listener alive.
+/// The server adopts it via `.listener(...)`, so the port can never be
+/// taken by another test between choosing it and serving on it.
+fn reserve_addr() -> (std::net::TcpListener, SocketAddr) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind port 0");
-    listener.local_addr().expect("local addr")
+    let addr = listener.local_addr().expect("local addr");
+    (listener, addr)
 }
 
 async fn start(
     cfg: nitr::Config,
     handler: &PathBuf,
-    addr: SocketAddr,
 ) -> (
+    SocketAddr,
     tokio::sync::oneshot::Sender<()>,
     tokio::task::JoinHandle<nitr::Result>,
 ) {
+    let (listener, addr) = reserve_addr();
     let server = nitr::Server::builder()
         .config(cfg)
         .listen(addr)
+        .listener(listener)
         .handler_script(handler)
         .builtins(nitr::Builtins::JSON | nitr::Builtins::HTTP | nitr::Builtins::LOG)
         .workers(1)
@@ -52,19 +64,18 @@ async fn start(
     let served = tokio::spawn(server.serve_with_shutdown(async {
         let _ = stop_rx.await;
     }));
-    (stop_tx, served)
+    (addr, stop_tx, served)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn request_ids_and_size_limits() {
     let handler = write_temp_script("app.lua", APP_SCRIPT);
-    let addr = free_addr();
 
     let mut cfg = nitr::Config::default();
     cfg.limits.max_uri_bytes = 128;
     cfg.limits.max_body_bytes = 1024;
 
-    let (stop_tx, served) = start(cfg, &handler, addr).await;
+    let (addr, stop_tx, served) = start(cfg, &handler).await;
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
 
@@ -124,13 +135,12 @@ async fn request_ids_and_size_limits() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn trusted_request_ids_pass_through() {
     let handler = write_temp_script("trusted.lua", APP_SCRIPT);
-    let addr = free_addr();
 
     let cfg = nitr::Config {
         trust_request_id: true,
         ..Default::default()
     };
-    let (stop_tx, served) = start(cfg, &handler, addr).await;
+    let (addr, stop_tx, served) = start(cfg, &handler).await;
     let client = reqwest::Client::new();
 
     let resp = client
@@ -158,14 +168,13 @@ async fn trusted_request_ids_pass_through() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rate_limiting_answers_429_with_retry_after() {
     let handler = write_temp_script("limited.lua", APP_SCRIPT);
-    let addr = free_addr();
 
     let mut cfg = nitr::Config::default();
     cfg.rate_limit.enabled = true;
     cfg.rate_limit.requests = 3;
     cfg.rate_limit.window = 60;
 
-    let (stop_tx, served) = start(cfg, &handler, addr).await;
+    let (addr, stop_tx, served) = start(cfg, &handler).await;
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
 

@@ -3,6 +3,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 const APP_SCRIPT: &str = r#"
 local SECRET = "s3cret"
@@ -63,23 +64,33 @@ return app
 "#;
 
 fn write_temp_script(name: &str, content: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("nitr-helpers-{}-{name}", std::process::id()));
+    // `fs::write` truncates before writing, so a path two tests share is a
+    // race; the counter keeps every call on its own file.
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    let path =
+        std::env::temp_dir().join(format!("nitr-helpers-{}-{id}-{name}", std::process::id()));
     std::fs::write(&path, content).expect("write temp script");
     path
 }
 
-fn free_addr() -> SocketAddr {
+/// Binds port 0 (the OS picks a free port) and keeps the listener alive.
+/// The server adopts it via `.listener(...)`, so the port can never be
+/// taken by another test between choosing it and serving on it.
+fn reserve_addr() -> (std::net::TcpListener, SocketAddr) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind port 0");
-    listener.local_addr().expect("local addr")
+    let addr = listener.local_addr().expect("local addr");
+    (listener, addr)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn helpers_cookies_and_negotiation_end_to_end() {
     let handler = write_temp_script("app.lua", APP_SCRIPT);
-    let addr = free_addr();
+    let (listener, addr) = reserve_addr();
 
     let server = nitr::Server::builder()
         .listen(addr)
+        .listener(listener)
         .handler_script(&handler)
         .builtins(nitr::Builtins::JSON | nitr::Builtins::HTTP)
         .workers(1)

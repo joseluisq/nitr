@@ -4,9 +4,14 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 fn write_temp(name: &str, content: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("nitr-p6-{}-{name}", std::process::id()));
+    // `fs::write` truncates before writing, so a path two tests share is a
+    // race; the counter keeps every call on its own file.
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("nitr-p6-{}-{id}-{name}", std::process::id()));
     std::fs::write(&path, content).expect("write temp file");
     path
 }
@@ -22,14 +27,18 @@ async fn wait_until_listening(addr: std::net::SocketAddr) {
     panic!("the server never started listening on {addr}");
 }
 
-fn free_addr() -> SocketAddr {
+/// Binds port 0 (the OS picks a free port) and keeps the listener alive.
+/// The server adopts it via `.listener(...)`, so the port can never be
+/// taken by another test between choosing it and serving on it.
+fn reserve_addr() -> (std::net::TcpListener, SocketAddr) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind port 0");
-    listener.local_addr().expect("local addr")
+    let addr = listener.local_addr().expect("local addr");
+    (listener, addr)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn await_all_fetch_options_redirects_and_transactions() {
-    let addr = free_addr();
+    let (listener, addr) = reserve_addr();
     let db_path = std::env::temp_dir().join(format!("nitr-p6-{}.db", std::process::id()));
     std::fs::remove_file(&db_path).ok();
 
@@ -131,6 +140,7 @@ return app
     let server = nitr::Server::builder()
         .config(cfg)
         .listen(addr)
+        .listener(listener)
         .handler_script(&handler)
         .config_script(&config)
         .database(&db_path)
@@ -229,9 +239,10 @@ return app
 
     // Default policy: private/loopback addresses are refused.
     let handler = write_temp("deny.lua", APP);
-    let addr = free_addr();
+    let (listener, addr) = reserve_addr();
     let server = nitr::Server::builder()
         .listen(addr)
+        .listener(listener)
         .handler_script(&handler)
         .builtins(nitr::Builtins::JSON | nitr::Builtins::HTTP | nitr::Builtins::FETCH)
         .workers(1)
@@ -282,7 +293,7 @@ return app
     // Allow-list: hosts outside fetch.allowed_hosts are refused even with
     // private networks allowed.
     let handler = write_temp("allowlist.lua", APP);
-    let addr = free_addr();
+    let (listener, addr) = reserve_addr();
     let mut cfg = nitr::Config::default();
     cfg.fetch.allowed_hosts = Some(vec!["api.example.com".into()]);
     cfg.fetch.allow_private_networks = true;
@@ -290,6 +301,7 @@ return app
     let server = nitr::Server::builder()
         .config(cfg)
         .listen(addr)
+        .listener(listener)
         .handler_script(&handler)
         .builtins(nitr::Builtins::JSON | nitr::Builtins::HTTP | nitr::Builtins::FETCH)
         .workers(1)

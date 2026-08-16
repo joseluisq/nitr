@@ -6,6 +6,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -47,14 +48,27 @@ return app
 "#;
 
 fn write_temp_script(name: &str, content: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("nitr-resilience-{}-{name}", std::process::id()));
+    // Every test here is a thread of one process, and the shared `build()`
+    // helper passes the same `name` for all of them. `fs::write` truncates
+    // before writing, so two tests on one path hand one server a half-written
+    // script. The counter keeps every call on its own file.
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "nitr-resilience-{}-{id}-{name}",
+        std::process::id()
+    ));
     std::fs::write(&path, content).expect("write temp script");
     path
 }
 
-fn free_addr() -> SocketAddr {
+/// Binds port 0 (the OS picks a free port) and keeps the listener alive.
+/// The server adopts it via `.listener(...)`, so the port can never be
+/// taken by another test between choosing it and serving on it.
+fn reserve_addr() -> (std::net::TcpListener, SocketAddr) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind port 0");
-    listener.local_addr().expect("local addr")
+    let addr = listener.local_addr().expect("local addr");
+    (listener, addr)
 }
 
 /// Waits for the spawned server to actually bind, so a test that opens a
@@ -90,11 +104,13 @@ fn testutil(lua: &mlua::Lua) -> mlua::Result<mlua::Table> {
 }
 
 /// Builds a one-state server on a free port with the shared app script.
-async fn build(cfg: nitr::Config) -> (nitr::Server, SocketAddr, PathBuf) {
+async fn build(mut cfg: nitr::Config) -> (nitr::Server, SocketAddr, PathBuf) {
     let handler = write_temp_script("app.lua", APP_SCRIPT);
-    let addr = cfg.listen;
+    let (listener, addr) = reserve_addr();
+    cfg.listen = addr;
     let server = nitr::Server::builder()
         .config(cfg)
+        .listener(listener)
         .handler_script(&handler)
         .builtins(nitr::Builtins::JSON | nitr::Builtins::HTTP)
         .module("testutil", testutil)
@@ -105,8 +121,9 @@ async fn build(cfg: nitr::Config) -> (nitr::Server, SocketAddr, PathBuf) {
 }
 
 fn base_config(workers: usize) -> nitr::Config {
+    // `build()` reserves the real address; this placeholder is never bound.
     let mut cfg = nitr::Config {
-        listen: free_addr(),
+        listen: "127.0.0.1:0".parse().expect("addr"),
         workers,
         ..Default::default()
     };

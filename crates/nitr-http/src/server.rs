@@ -49,6 +49,10 @@ pub struct Server {
     max_streams: usize,
     /// Pre-Lua protection: rate limiting, size limits, request ids.
     protection: Arc<Protection>,
+    /// A caller-supplied, already-bound listener (see
+    /// [`ServerBuilder::listener`]); when absent, `serve` binds
+    /// `cfg.listen` itself.
+    listener: Option<std::net::TcpListener>,
     /// Cleared as soon as a drain starts, so a load balancer can stop
     /// routing before requests begin to fail. Read by
     /// [`is_ready()`](Self::is_ready), which a readiness probe surfaces.
@@ -100,6 +104,7 @@ pub struct ServerBuilder {
     builtins: Option<Builtins>,
     setup_fns: Vec<SetupFn>,
     modules: Vec<Module>,
+    listener: Option<std::net::TcpListener>,
 }
 
 impl Server {
@@ -186,13 +191,26 @@ impl Server {
     /// Serves until the given future resolves, then shuts down gracefully:
     /// the listener stops accepting and in-flight requests get a grace
     /// period to complete.
-    pub async fn serve_with_shutdown(self, shutdown: impl Future<Output = ()>) -> Result {
-        let listener = TcpListener::bind(self.cfg.listen).await.map_err(|err| {
-            Error::Config(format!("unable to listen on {}: {err}", self.cfg.listen))
-        })?;
+    pub async fn serve_with_shutdown(mut self, shutdown: impl Future<Output = ()>) -> Result {
+        let listener = match self.listener.take() {
+            // A pre-bound listener arrives blocking; tokio requires
+            // non-blocking before it will adopt it.
+            Some(std_listener) => std_listener
+                .set_nonblocking(true)
+                .and_then(|()| TcpListener::from_std(std_listener))
+                .map_err(|err| {
+                    Error::Config(format!("unable to adopt the given listener: {err}"))
+                })?,
+            None => TcpListener::bind(self.cfg.listen).await.map_err(|err| {
+                Error::Config(format!("unable to listen on {}: {err}", self.cfg.listen))
+            })?,
+        };
+        // The listener's own address, not `cfg.listen`: with a pre-bound
+        // listener (or port 0) the config value is not where we serve.
+        let bound = listener.local_addr().unwrap_or(self.cfg.listen);
         tracing::info!(
             "listening on http://{} with {} Lua state(s)",
-            self.cfg.listen,
+            bound,
             current_pool(&self.pool).size()
         );
 
@@ -326,6 +344,19 @@ impl ServerBuilder {
     /// Address the server binds to.
     pub fn listen(mut self, addr: std::net::SocketAddr) -> Self {
         self.cfg.listen = addr;
+        self
+    }
+
+    /// Serves on an already-bound listener instead of binding
+    /// [`listen`](Self::listen).
+    ///
+    /// This closes the window between choosing a port and binding it: a
+    /// caller can bind port 0 (the OS picks a free one), read the real
+    /// address, and hand the listener over — nothing else can take the
+    /// port in between. That makes it the right tool for tests and for
+    /// socket-activation setups where the supervisor owns the socket.
+    pub fn listener(mut self, listener: std::net::TcpListener) -> Self {
+        self.listener = Some(listener);
         self
     }
 
@@ -463,6 +494,7 @@ impl ServerBuilder {
             pool: Arc::new(RwLock::new(Arc::new(pool))),
             streams: Arc::new(Semaphore::new(max_streams)),
             max_streams,
+            listener: self.listener,
             ready: Arc::new(AtomicBool::new(true)),
             cache,
         })

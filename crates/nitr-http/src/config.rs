@@ -788,7 +788,12 @@ mod tests {
     use nitr_std::Builtins;
 
     fn write_temp_config(name: &str, content: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("nitr-test-{}-{name}", std::process::id()));
+        // `fs::write` truncates before writing, so a path two tests share is
+        // a race; the counter keeps every call on its own file.
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("nitr-test-{}-{id}-{name}", std::process::id()));
         std::fs::write(&path, content).expect("write temp config");
         path
     }

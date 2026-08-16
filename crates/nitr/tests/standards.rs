@@ -103,9 +103,13 @@ fn scratch_dir() -> PathBuf {
     dir
 }
 
-fn free_addr() -> SocketAddr {
+/// Binds port 0 (the OS picks a free port) and keeps the listener alive.
+/// The server adopts it via `.listener(...)`, so the port can never be
+/// taken by another test between choosing it and serving on it.
+fn reserve_addr() -> (std::net::TcpListener, SocketAddr) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind port 0");
-    listener.local_addr().expect("local addr")
+    let addr = listener.local_addr().expect("local addr");
+    (listener, addr)
 }
 
 async fn wait_until_listening(addr: SocketAddr) {
@@ -119,8 +123,10 @@ async fn wait_until_listening(addr: SocketAddr) {
 }
 
 fn base_config() -> nitr::Config {
+    // `Harness::start` reserves the real address; this placeholder is
+    // never bound.
     let mut cfg = nitr::Config {
-        listen: free_addr(),
+        listen: "127.0.0.1:0".parse().expect("addr"),
         workers: 2,
         ..Default::default()
     };
@@ -141,7 +147,7 @@ struct Harness {
 }
 
 impl Harness {
-    async fn start(cfg: nitr::Config) -> Self {
+    async fn start(mut cfg: nitr::Config) -> Self {
         let dir = scratch_dir();
         let handler = dir.join("app.lua");
         std::fs::write(&handler, APP_SCRIPT).expect("write handler");
@@ -158,9 +164,11 @@ impl Harness {
         .expect("write config script");
         std::fs::create_dir_all(dir.join("uploads")).expect("uploads dir");
 
-        let addr = cfg.listen;
+        let (tcp_listener, addr) = reserve_addr();
+        cfg.listen = addr;
         let server = nitr::Server::builder()
             .config(cfg)
+            .listener(tcp_listener)
             .handler_script(&handler)
             .config_script(&config_script)
             .builtins(nitr::Builtins::JSON | nitr::Builtins::HTTP)

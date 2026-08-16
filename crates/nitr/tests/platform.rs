@@ -4,16 +4,26 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 fn scratch_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("nitr-platform-{}-{name}", std::process::id()));
+    // The counter keeps every call on its own directory, so no two tests
+    // can ever write into (or truncate files in) the same tree.
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    let dir =
+        std::env::temp_dir().join(format!("nitr-platform-{}-{id}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("mkdir");
     dir
 }
 
-fn free_addr() -> SocketAddr {
+/// Binds port 0 (the OS picks a free port) and keeps the listener alive.
+/// The server adopts it via `.listener(...)`, so the port can never be
+/// taken by another test between choosing it and serving on it.
+fn reserve_addr() -> (std::net::TcpListener, SocketAddr) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind port 0");
-    listener.local_addr().expect("local addr")
+    let addr = listener.local_addr().expect("local addr");
+    (listener, addr)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -41,9 +51,10 @@ return app
     let handler = std::env::temp_dir().join(format!("nitr-platform-{}.lua", std::process::id()));
     std::fs::write(&handler, app).expect("write handler");
 
-    let addr = free_addr();
+    let (listener, addr) = reserve_addr();
     let server = nitr::Server::builder()
         .listen(addr)
+        .listener(listener)
         .handler_script(&handler)
         .builtins(nitr::Builtins::JSON | nitr::Builtins::HTTP)
         .workers(1)

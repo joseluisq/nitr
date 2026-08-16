@@ -3,9 +3,14 @@
 //! modules mount beside the builtins, and the crypto/auth primitives.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 fn write_script(name: &str, content: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("nitr-ns-{}-{name}", std::process::id()));
+    // `fs::write` truncates before writing, so a path two tests share is a
+    // race; the counter keeps every call on its own file.
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("nitr-ns-{}-{id}-{name}", std::process::id()));
     std::fs::write(&path, content).expect("write temp script");
     path
 }

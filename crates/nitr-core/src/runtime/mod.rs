@@ -392,7 +392,12 @@ mod tests {
     use super::*;
 
     fn write_temp_script(name: &str, content: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("nitr-rt-test-{}-{name}", std::process::id()));
+        // `fs::write` truncates before writing, so a path two tests share is
+        // a race; the counter keeps every call on its own file.
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("nitr-rt-test-{}-{id}-{name}", std::process::id()));
         std::fs::write(&path, content).expect("write temp script");
         path
     }

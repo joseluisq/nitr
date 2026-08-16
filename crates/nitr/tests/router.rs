@@ -4,6 +4,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 const APP_SCRIPT: &str = r#"
 local app = nitr.app()
@@ -73,25 +74,34 @@ end
 "#;
 
 fn write_temp_script(name: &str, content: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("nitr-router-{}-{name}", std::process::id()));
+    // `fs::write` truncates before writing, so a path two tests share is a
+    // race; the counter keeps every call on its own file.
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("nitr-router-{}-{id}-{name}", std::process::id()));
     std::fs::write(&path, content).expect("write temp script");
     path
 }
 
 /// Grabs a free loopback port from the OS.
-fn free_addr() -> SocketAddr {
+/// Binds port 0 (the OS picks a free port) and keeps the listener alive.
+/// The server adopts it via `.listener(...)`, so the port can never be
+/// taken by another test between choosing it and serving on it.
+fn reserve_addr() -> (std::net::TcpListener, SocketAddr) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind port 0");
-    listener.local_addr().expect("local addr")
+    let addr = listener.local_addr().expect("local addr");
+    (listener, addr)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn routes_middleware_and_errors_end_to_end() {
     let handler = write_temp_script("app.lua", APP_SCRIPT);
     let config = write_temp_script("cfg.lua", CFG_SCRIPT);
-    let addr = free_addr();
+    let (listener, addr) = reserve_addr();
 
     let server = nitr::Server::builder()
         .listen(addr)
+        .listener(listener)
         .handler_script(&handler)
         .config_script(&config)
         .builtins(nitr::Builtins::JSON)
@@ -219,8 +229,9 @@ async fn use_after_a_route_fails_at_startup() {
         "#,
     );
 
+    // `build()` never binds, so any address will do for a build-error test.
     let err = nitr::Server::builder()
-        .listen(free_addr())
+        .listen("127.0.0.1:0".parse().expect("addr"))
         .handler_script(&handler)
         .builtins(nitr::Builtins::JSON)
         .workers(1)
@@ -247,8 +258,9 @@ async fn duplicate_routes_fail_at_startup() {
         "#,
     );
 
+    // `build()` never binds, so any address will do for a build-error test.
     let err = nitr::Server::builder()
-        .listen(free_addr())
+        .listen("127.0.0.1:0".parse().expect("addr"))
         .handler_script(&handler)
         .builtins(nitr::Builtins::JSON)
         .workers(1)

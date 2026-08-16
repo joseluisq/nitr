@@ -240,8 +240,12 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
+        // The counter keeps every call on its own directory, so no two
+        // tests can ever write into (or wipe) the same tree.
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir()
-            .join(format!("nitr-migrate-{}", std::process::id()))
+            .join(format!("nitr-migrate-{}-{id}", std::process::id()))
             .join(name);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch dir");

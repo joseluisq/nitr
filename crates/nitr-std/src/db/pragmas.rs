@@ -100,7 +100,11 @@ mod tests {
     use super::*;
 
     fn temp_db(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("nitr-pragma-{}", std::process::id()));
+        // The counter keeps every call on its own directory, so no two
+        // tests can ever open (or delete) the same database file.
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("nitr-pragma-{}-{id}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir.join(name)
     }
