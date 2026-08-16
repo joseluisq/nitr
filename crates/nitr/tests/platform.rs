@@ -37,16 +37,20 @@ async fn static_files_and_spa_end_to_end() {
     let spa = scratch_dir("spa");
     std::fs::write(spa.join("index.html"), "<div id=app></div>").expect("write spa index");
 
+    // `{:?}` renders the path as a quoted, escaped literal: Windows paths
+    // contain backslashes, which a bare `display()` inside a double-quoted
+    // Lua string would turn into invalid escape sequences (`"C:\Users"`).
+    // Rust's debug escaping doubles them, which is exactly Lua's syntax too.
     let app = format!(
         r#"
 local app = nitr.app()
-app:static("/", "{site}")
-app:static("/spa", "{spa}", {{ spa = true }})
+app:static("/", {site:?})
+app:static("/spa", {spa:?}, {{ spa = true }})
 app:get("/api/ping", function(req) return nitr.json({{ pong = true }}) end)
 return app
 "#,
-        site = site.display(),
-        spa = spa.display(),
+        site = site.to_string_lossy(),
+        spa = spa.to_string_lossy(),
     );
     let handler = std::env::temp_dir().join(format!("nitr-platform-{}.lua", std::process::id()));
     std::fs::write(&handler, app).expect("write handler");
