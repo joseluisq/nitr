@@ -5,6 +5,7 @@
 //! globals, so scripts always read `nitr.*` and nothing is intermixed with
 //! the Lua standard library.
 
+#![deny(missing_docs)]
 #![forbid(unsafe_code)]
 #![deny(warnings)]
 #![deny(rust_2018_idioms)]
@@ -43,6 +44,14 @@ pub use cache::{Cache, CacheOptions};
 pub use config::{FetchOptions, SqlitePragmas};
 pub use http::{RequestCookies, ResponseCookies, best_match};
 pub use utils::error_lua_value;
+
+/// Internal functions exposed for the fuzz targets in `fuzz/` only.
+/// Not part of the public API; no stability promise applies here.
+#[doc(hidden)]
+pub mod fuzzing {
+    pub use crate::http::{sign, verify};
+    pub use crate::path::{basename, dirname, is_absolute, join, normalize};
+}
 
 #[cfg(feature = "db")]
 pub use db::migrate;
@@ -212,6 +221,8 @@ fn not_compiled_in(name: &str) -> nitr_core::Error {
     ))
 }
 
+/// Registers the selected builtins on the global `nitr` namespace table,
+/// using the [`BuiltinsEnv`] for the resources some of them need.
 pub fn register_builtins(lua: &mlua::Lua, builtins: Builtins, env: &BuiltinsEnv) -> Result {
     let nitr = nitr_core::nitr_table(lua)?;
     for builtin in builtins.iter() {

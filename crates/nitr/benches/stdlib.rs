@@ -556,3 +556,95 @@ return app
         bencher.bench_local(|| divan::black_box(get(&rt, &client, "/write")));
     }
 }
+
+/// Per-request HTTP ergonomics added by phases 3 and 14: cookie-header
+/// parsing (rebuilt on every `req.cookies` access), `Accept` negotiation,
+/// and the full signed-cookie session round trip (verify → mutate →
+/// re-sign). These run inside ordinary handlers, so their cost is paid on
+/// the request path, not at load time.
+mod http_request {
+    use super::*;
+    use common::dispatch;
+
+    const APP: &str = r#"
+local app = nitr.app()
+
+app:get("/cookies", function(req)
+    local jar = req.cookies
+    return nitr.text(jar.c5 or "none")
+end)
+
+app:get("/accepts", function(req)
+    return nitr.text(req:accepts("application/json", "text/html", "text/plain") or "none")
+end)
+
+app:get("/session", function(req)
+    local session = nitr.session(req, { secret = "bench-secret-0123456789" })
+    session.n = (session.n or 0) + 1
+    local resp = nitr.text(tostring(session.n))
+    session:save(resp)
+    return resp
+end)
+
+return app
+"#;
+
+    fn headers(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[divan::bench]
+    fn request_cookies(bencher: divan::Bencher<'_, '_>) {
+        let rt = tokio_runtime();
+        let script = write_file("stdlib-http.lua", APP);
+        let client = client(&rt, &script, Builtins::minimal());
+        let cookie: String = (1..=10)
+            .map(|i| format!("c{i}=value-{i}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let hdrs = headers(&[("cookie", &cookie)]);
+
+        bencher.bench_local(|| {
+            divan::black_box(dispatch(&rt, &client, "GET", "/cookies", &hdrs, None, 200))
+        });
+    }
+
+    #[divan::bench]
+    fn accept_negotiation(bencher: divan::Bencher<'_, '_>) {
+        let rt = tokio_runtime();
+        let script = write_file("stdlib-http.lua", APP);
+        let client = client(&rt, &script, Builtins::minimal());
+        let hdrs = headers(&[(
+            "accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,*/*;q=0.8",
+        )]);
+
+        bencher.bench_local(|| {
+            divan::black_box(dispatch(&rt, &client, "GET", "/accepts", &hdrs, None, 200))
+        });
+    }
+
+    #[divan::bench]
+    fn session_roundtrip(bencher: divan::Bencher<'_, '_>) {
+        let rt = tokio_runtime();
+        let script = write_file("stdlib-http.lua", APP);
+        let client = client(&rt, &script, Builtins::minimal());
+        // One unauthenticated request yields the signed cookie the
+        // measured requests then carry: verify + re-sign per iteration.
+        let first = get(&rt, &client, "/session");
+        let cookie = first
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("set-cookie"))
+            .map(|(_, v)| v.split(';').next().unwrap_or_default().to_string())
+            .expect("a session cookie");
+        let hdrs = headers(&[("cookie", &cookie)]);
+
+        bencher.bench_local(|| {
+            divan::black_box(dispatch(&rt, &client, "GET", "/session", &hdrs, None, 200))
+        });
+    }
+}

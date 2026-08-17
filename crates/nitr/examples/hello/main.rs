@@ -1,5 +1,5 @@
 //! Minimal Nitr embedding: a Lua-scripted backend with a custom Rust
-//! extension module mounted at `nitr.hello`.
+//! extension module mounted at `nitr.ext.hello`.
 //!
 //! Run from the repository root:
 //!
@@ -30,7 +30,7 @@ async fn main() -> nitr::Result {
         .handler_script("crates/nitr/examples/hello/handler.lua")
         .builtins(Builtins::DEBUG | Builtins::JSON)
         // A Rust extension module: the returned table is mounted at
-        // `nitr.hello` in every pooled Lua state, next to the builtins.
+        // `nitr.ext.hello` in every pooled Lua state, next to the builtins.
         .module("hello", |lua| {
             let t = lua.create_table()?;
             t.set(

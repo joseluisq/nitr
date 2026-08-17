@@ -157,9 +157,9 @@ local app = nitr.app()
 
 app:get("/greet/:name", function(req)
     return nitr.json({
-        greeting = nitr.demo.greet(req.params.name),
-        counter = nitr.demo.next(),
-        kind = type(nitr.demo),
+        greeting = nitr.ext.demo.greet(req.params.name),
+        counter = nitr.ext.demo.next(),
+        kind = type(nitr.ext.demo),
     })
 end)
 
@@ -214,29 +214,41 @@ return app
     std::fs::remove_file(&script).ok();
 }
 
-/// A module may not shadow a builtin (or another module): the collision is
-/// a build-time error.
+/// Modules live in `nitr.ext.*`, so a module may share a builtin's name —
+/// the std surface can never collide with user code — while two modules
+/// with the same name still fail at build time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn module_name_collisions_fail_at_build_time() {
+async fn module_names_are_isolated_from_the_std() {
     let script = write_script(
         "collide.lua",
-        "local app = nitr.app()\napp:get('/', function(req) return nitr.text('ok') end)\nreturn app",
+        "local app = nitr.app()\n\
+         app:get('/', function(req)\n\
+             return nitr.json({ std = type(nitr.json), ext = nitr.ext.json.kind })\n\
+         end)\nreturn app",
     );
 
-    for name in ["json", "app"] {
-        let err = nitr::Server::builder()
-            .handler_script(&script)
-            .builtins(nitr::Builtins::JSON | nitr::Builtins::HTTP)
-            .module(name, |lua| lua.create_table())
-            .workers(1)
-            .build()
-            .await
-            .expect_err("a colliding module name must be rejected");
-        assert!(
-            err.to_string().contains("already exists"),
-            "unexpected error for `{name}`: {err}"
-        );
-    }
+    // A module named `json` coexists with the `nitr.json` builtin: it
+    // mounts at `nitr.ext.json`, one level away from the std.
+    let server = nitr::Server::builder()
+        .handler_script(&script)
+        .builtins(nitr::Builtins::JSON | nitr::Builtins::HTTP)
+        .module("json", |lua| {
+            let t = lua.create_table()?;
+            t.set("kind", "extension")?;
+            Ok(t)
+        })
+        .workers(1)
+        .build()
+        .await
+        .expect("a module may share a builtin's name");
+    let resp = server
+        .test_client()
+        .request("GET", "/", &[], None)
+        .await
+        .expect("request");
+    let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json");
+    assert_eq!(body["std"], "userdata");
+    assert_eq!(body["ext"], "extension");
 
     // Two modules with the same name collide with each other too.
     let err = nitr::Server::builder()

@@ -586,3 +586,7 @@ functions = [
 name = "nitr.cfg"
 feature = "cfg"
 desc = "The configuration snapshot returned by `config.lua` (nil without one)."
+
+[[table]]
+name = "nitr.ext"
+desc = "User-defined Rust extension modules (`ServerBuilder::module`), one level below the standard library so no future builtin can collide with them. Each module is a table: `nitr.ext.<name>`. Absent until a module is registered."

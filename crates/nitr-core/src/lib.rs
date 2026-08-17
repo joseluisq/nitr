@@ -5,6 +5,7 @@
 //! dependencies so it can be embedded on its own; the `nitr` facade crate
 //! is the usual entrypoint for applications.
 
+#![deny(missing_docs)]
 #![forbid(unsafe_code)]
 #![deny(warnings)]
 #![deny(rust_2018_idioms)]

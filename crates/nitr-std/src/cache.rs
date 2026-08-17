@@ -91,6 +91,7 @@ impl std::fmt::Debug for Cache {
 }
 
 impl Cache {
+    /// Creates an empty cache bounded by the given limits.
     pub fn new(opts: CacheOptions) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner::default())),

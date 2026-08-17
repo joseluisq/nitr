@@ -20,13 +20,13 @@ end)
 
 -- Suspends without burning instructions, so the state stays checked out.
 app:get("/slow", function(req)
-    nitr.testutil.sleep(3000)
+    nitr.ext.testutil.sleep(3000)
     return nitr.text("slow")
 end)
 
 -- A panic raised in Rust, on the far side of the extension boundary.
 app:get("/panic", function(req)
-    nitr.testutil.boom()
+    nitr.ext.testutil.boom()
     return nitr.text("unreachable")
 end)
 

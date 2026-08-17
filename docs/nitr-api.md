@@ -201,6 +201,10 @@ The `nitr test` framework: available in test files only.
 
 The configuration snapshot returned by `config.lua` (nil without one).
 
+### `nitr.ext`
+
+User-defined Rust extension modules (`ServerBuilder::module`), one level below the standard library so no future builtin can collide with them. Each module is a table: `nitr.ext.<name>`. Absent until a module is registered.
+
 ## Types
 
 ### `nitr.Request`

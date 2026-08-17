@@ -35,7 +35,7 @@ async fn main() -> nitr::Result {
         .builtins(Builtins::JSON | Builtins::HTTP)
         // A custom Rust module: the returned table is mounted at
         // `nitr.time` in every pooled Lua state, so handlers call
-        // `nitr.time.sleep(ms)` — an async function that suspends the
+        // `nitr.ext.time.sleep(ms)` — an async function that suspends the
         // Lua coroutine on the tokio timer without blocking the runtime.
         .module("time", |lua| {
             let t = lua.create_table()?;

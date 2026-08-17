@@ -660,3 +660,6 @@ function nitr.test.after_each(fn) end
 ---The configuration snapshot returned by `config.lua` (nil without one). (set when a `config_script` is configured)
 nitr.cfg = {}
 
+---User-defined Rust extension modules (`ServerBuilder::module`), one level below the standard library so no future builtin can collide with them. Each module is a table: `nitr.ext.<name>`. Absent until a module is registered.
+nitr.ext = {}
+

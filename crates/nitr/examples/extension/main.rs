@@ -2,7 +2,7 @@
 //! *Nitr + their own domain functions* without forking Nitr.
 //!
 //! `ServerBuilder::module(name, f)` runs `f` once per pooled Lua state (and
-//! again on every reload) and mounts the table it returns at `nitr.<name>`,
+//! again on every reload) and mounts the table it returns at `nitr.ext.<name>`,
 //! right next to the builtins. A third-party extension crate is nothing
 //! more than a public function shaped like [`kv_module`] below.
 //!
@@ -49,7 +49,7 @@ impl Kv {
     }
 }
 
-/// Builds the `nitr.kv` module. This is the shape an extension crate
+/// Builds the `nitr.ext.kv` module. This is the shape an extension crate
 /// (`nitr-postgres`, `nitr-redis`, …) would export.
 fn kv_module(kv: Kv) -> impl Fn(&Lua) -> mlua::Result<Table> + Send + Sync + 'static {
     move |lua| {

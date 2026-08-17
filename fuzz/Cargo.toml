@@ -1,0 +1,39 @@
+# Fuzz targets for the parsers an attacker fully controls. Not a workspace
+# member: built by cargo-fuzz on nightly.
+#
+#   cargo install cargo-fuzz
+#   cargo +nightly fuzz run cookie_verify -- -max_total_time=60
+[package]
+name = "nitr-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+nitr-std = { path = "../crates/nitr-std" }
+
+[[bin]]
+name = "cookie_verify"
+path = "fuzz_targets/cookie_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "accept_negotiation"
+path = "fuzz_targets/accept_negotiation.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "path_lexical"
+path = "fuzz_targets/path_lexical.rs"
+test = false
+doc = false
+bench = false

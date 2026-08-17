@@ -8,7 +8,7 @@
 
 Nitr serves HTTP requests with Lua 5.4 scripts. An application is two files: an optional `config.lua` that runs **once** at startup, and an `app.lua` that builds the application (routes and middleware) once per Lua state. The server keeps a fixed pool of independent Lua states (one per CPU core by default), so requests execute in parallel without locking, and every script runs under configurable safety limits (restricted stdlib, memory cap, execution timeout).
 
-Everything Nitr exposes to Lua lives on one global namespace table, `nitr` — `nitr.app()`, `nitr.json`, `nitr.db`, `nitr.crypto`, and so on. Nitr registers no other globals, so scripts never collide with the Lua standard library, and your own Rust extensions mount on the very same namespace.
+Everything Nitr exposes to Lua lives on one global namespace table, `nitr` — `nitr.app()`, `nitr.json`, `nitr.db`, `nitr.crypto`, and so on. Nitr registers no other globals, so scripts never collide with the Lua standard library, and your own Rust extensions mount on the same namespace under `nitr.ext.*` — separated from the standard library, so nothing Nitr ships can ever collide with your modules.
 
 Nitr is both a **binary** (`nitr`, configured via `nitr.toml`) and a **library crate** (embed the server and register your own Rust modules as `nitr.*` APIs).
 
@@ -27,7 +27,7 @@ Nitr is both a **binary** (`nitr`, configured via `nitr.toml`) and a **library c
 - **Dev mode (`--dev`)**: instant hot reload (a `notify` watcher rebuilds on save — scripts, `routes/`, templates) and error details in responses.
 - **Editor completion for everything:** `nitr init` writes generated LuaCATS type definitions (`nitr-types.lua`) covering the whole `nitr.*` surface — completion, signatures and inline docs in any editor with the Lua Language Server. Generated from the same [single API description](docs/nitr-api.md) as the reference docs; a test fails if an undocumented builtin ships.
 - **A test framework worth using:** `nitr.test` gives `describe`/`it`/`expect` matchers, `before_each`/`after_each`, `t.request(..., { json = ... })` and `resp:json()`, `nitr test --filter <name>` — failures name the assertion, both values, and the file:line. Requests dispatch through the real router, middleware included.
-- **Extensible:** `ServerBuilder::module("name", ...)` mounts a Rust table at `nitr.name` in every Lua state, third-party extension crates need no fork.
+- **Extensible:** `ServerBuilder::module("name", ...)` mounts a Rust table at `nitr.ext.name` in every Lua state — user modules live under `nitr.ext.*`, one level below the std, so no future builtin can ever collide with them, third-party extension crates need no fork.
 
 ## Cargo features
 
@@ -216,7 +216,7 @@ async fn main() -> nitr::Result {
         .listen(([127, 0, 0, 1], 3000).into())
         .handler_script("scripts/handler.lua")
         .builtins(Builtins::JSON | Builtins::FETCH)
-        // Expose your own Rust code as `nitr.greet` in every Lua state:
+        // Expose your own Rust code as `nitr.ext.greet` in every Lua state:
         .module("greet", |lua| {
             let t = lua.create_table()?;
             t.set("hello", lua.create_function(|_, name: String| {
@@ -231,13 +231,13 @@ async fn main() -> nitr::Result {
 }
 ```
 
-Modules are the extension boundary: the closure runs once per pooled state (and on every reload), and a name that collides with a builtin or another module fails at build time. See [examples/extension](crates/nitr/examples/extension) for a stateful module shared across states, and [examples/stdlib](crates/nitr/examples/stdlib) for a tour of `nitr.*`.
+Modules are the extension boundary: the closure runs once per pooled state (and on every reload), mounting at `nitr.ext.<name>` — separate from the standard library, so no builtin can ever collide with a user module — and two modules sharing a name fail at build time. See [examples/extension](crates/nitr/examples/extension) for a stateful module shared across states, and [examples/stdlib](crates/nitr/examples/stdlib) for a tour of `nitr.*`.
 
 For lower-level embedding, `nitr::Runtime` exposes the Lua state, `register_module()`, script loading, and the budgeted `call_function()` directly — no HTTP involved. Errors are a typed `nitr::Error` enum.
 
 ## Documentation
 
-Design documents live in [docs/](docs/): [architecture](docs/architecture.md), [crate API](docs/crate-api.md), [configuration](docs/configuration.md), [security model](docs/security.md), [performance](docs/performance.md), and the [roadmap](docs/roadmap.md).
+Current references: the [`nitr.*` API](docs/nitr-api.md) (generated), the [stability policy](docs/stability.md) and the [threat model](docs/threat-model.md). The original proposal documents are archived in [.docs/](.docs/).
 
 ## Benchmarks
 

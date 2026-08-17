@@ -66,14 +66,15 @@ fn split_root(path: &str) -> (String, String) {
     (root.to_string(), rest.to_string())
 }
 
-fn is_absolute(path: &str) -> bool {
+/// Whether the path is absolute (`/x`, `C:\x`, or UNC).
+pub fn is_absolute(path: &str) -> bool {
     let (root, _) = split_root(path);
     // A bare drive (`C:`) is drive-relative, not absolute.
     !root.is_empty() && !(root.len() == 2 && root.ends_with(':'))
 }
 
 /// Splits off the final component, e.g. `"/a/b/c.txt"` → `"c.txt"`.
-fn basename(path: &str) -> String {
+pub fn basename(path: &str) -> String {
     let (_, rest) = split_root(path);
     Path::new(&rest)
         .file_name()
@@ -83,7 +84,7 @@ fn basename(path: &str) -> String {
 
 /// The directory part, without the trailing separator: `"/a/b/c"` →
 /// `"/a/b"`, `"c"` → `"."`, `"/c"` → `"/"`, `"C:\\x"` → `"C:\\"`.
-fn dirname(path: &str) -> String {
+pub fn dirname(path: &str) -> String {
     let windows = is_windows_style(path);
     let (root, rest) = split_root(path);
     let parent = Path::new(&rest)
@@ -112,7 +113,7 @@ fn extension(path: &str) -> Option<String> {
 /// of the first segment. A later absolute segment does NOT reset the
 /// result (unlike `std::path::Path::join`): joining untrusted input
 /// should never silently discard the base.
-fn join(segments: &[String]) -> String {
+pub fn join(segments: &[String]) -> String {
     let windows = segments
         .iter()
         .find(|s| !s.is_empty())
@@ -140,7 +141,7 @@ fn join(segments: &[String]) -> String {
 /// path (or drive) or the start of a relative one, which is what makes
 /// the result safe to hand to a mount: after `normalize`, a checked
 /// prefix cannot be escaped with dot-dot segments.
-fn normalize(path: &str) -> String {
+pub fn normalize(path: &str) -> String {
     let windows = is_windows_style(path);
     let (root, rest) = split_root(path);
     let rooted = !root.is_empty();

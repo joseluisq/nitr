@@ -1,5 +1,5 @@
 -- Handler for the `hello` example: builds the app once, routes run per request.
--- `nitr.hello` is the custom Rust module registered via ServerBuilder::module().
+-- `nitr.ext.hello` is the custom Rust module registered via ServerBuilder::module().
 local app = nitr.app()
 
 app:get("/", function(req)
@@ -7,7 +7,7 @@ app:get("/", function(req)
         status = 200,
         headers = { ["Content-Type"] = "application/json" },
         body = nitr.json:encode({
-            greeting = nitr.hello.greet(req.query.name or "world"),
+            greeting = nitr.ext.hello.greet(req.query.name or "world"),
             method = req.method,
             path = req.path,
         }),

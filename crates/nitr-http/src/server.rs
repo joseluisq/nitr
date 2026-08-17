@@ -455,10 +455,12 @@ impl ServerBuilder {
 
     /// Registers a Rust extension module: the closure runs once per pooled
     /// state (and again on every reload) and its returned table is mounted
-    /// at `nitr.<name>`, next to the builtins. Registration fails at build
-    /// time when the name collides with a builtin or another module.
+    /// at `nitr.ext.<name>` — one level below the standard library, so a
+    /// module can never collide with a builtin (present or future).
+    /// Registration fails at build time when two modules share a name.
     ///
     /// ```ignore
+    /// // Scripts call it as nitr.ext.greet.hello("world").
     /// Server::builder().module("greet", |lua| {
     ///     let t = lua.create_table()?;
     ///     t.set("hello", lua.create_function(|_, name: String| {
@@ -705,8 +707,8 @@ fn new_runtime(
     };
     nitr_std::register_builtins(rt.lua(), builtins, &env)?;
     app::register_nitr_app(rt.lua())?;
-    // Extension modules mount after the builtins so a name collision is
-    // caught here, at build time.
+    // Extension modules mount under `nitr.ext`; two modules sharing a
+    // name is caught here, at build time.
     for (name, module) in modules {
         rt.register_module(name, module.as_ref())?;
     }

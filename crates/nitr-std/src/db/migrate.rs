@@ -27,6 +27,7 @@ pub struct Migration {
     pub version: i64,
     /// File name, used in messages and stored in the ledger.
     pub name: String,
+    /// Full path of the migration file on disk.
     pub path: PathBuf,
     sql: String,
 }
@@ -47,7 +48,9 @@ impl Migration {
 /// What `--status` reports about one migration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum State {
+    /// Recorded in the ledger with a matching checksum.
     Applied,
+    /// Not yet applied.
     Pending,
     /// Applied, but the file has changed since — the database and the
     /// repository no longer agree.

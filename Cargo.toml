@@ -1,5 +1,7 @@
 [workspace]
 resolver = "2"
+# `fuzz/` is its own crate: cargo-fuzz builds it on nightly.
+exclude = ["fuzz"]
 members = [
     "crates/nitr-core",
     "crates/nitr-std",

@@ -188,8 +188,9 @@ impl Runtime {
 
     /// Registers a Rust extension module: the closure runs now (and its
     /// result is a table by Lua module convention), mounted at
-    /// `nitr.<name>`. Fails when the name is already taken, so extensions
-    /// cannot shadow builtins or each other.
+    /// `nitr.ext.<name>` — one level below the standard library, so a
+    /// module can never collide with a builtin. Fails when the name is
+    /// already taken, so two extensions cannot shadow each other.
     ///
     /// This is the embedding-side extension point; HTTP applications use
     /// `ServerBuilder::module()` in the `nitr-http` crate, which applies
@@ -619,7 +620,7 @@ mod tests {
     }
 
     #[test]
-    fn modules_mount_under_nitr_and_reject_collisions() {
+    fn modules_mount_under_nitr_ext_and_reject_collisions() {
         let rt = test_runtime(None);
         rt.register_module("greet", |lua| {
             let t = lua.create_table()?;
@@ -633,7 +634,7 @@ mod tests {
 
         let out: String = rt
             .lua()
-            .load("return nitr.greet.hello('nitr')")
+            .load("return nitr.ext.greet.hello('nitr')")
             .eval()
             .expect("call module");
         assert_eq!(out, "hi nitr");

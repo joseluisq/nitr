@@ -1,0 +1,63 @@
+name: fuzz
+# Short per-PR fuzzing of the parsers an attacker fully controls
+# (signed-cookie verification, Accept negotiation, lexical paths).
+# A short run finds shallow bugs only — the corpus under fuzz/corpus is
+# retained across runs via the cache so depth accumulates over time.
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - .github/workflows/fuzz.yml
+      - Cargo.toml
+      - crates/**
+      - fuzz/**
+  pull_request:
+    paths:
+      - .github/workflows/fuzz.yml
+      - Cargo.toml
+      - crates/**
+      - fuzz/**
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - cookie_verify
+          - accept_negotiation
+          - path_lexical
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+
+    - name: Install nightly toolchain and cargo-fuzz
+      uses: moonrepo/setup-rust@v1
+      with:
+        channel: nightly
+        cache-target: release
+        bins: cargo-fuzz
+
+    # The corpus persists between runs, so every PR starts from the
+    # deepest coverage reached so far instead of from scratch.
+    - name: Restore the fuzz corpus
+      uses: actions/cache@v4
+      with:
+        path: fuzz/corpus
+        key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+        restore-keys: |
+          fuzz-corpus-${{ matrix.target }}-
+
+    - name: Fuzz for 90 seconds
+      run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=90
+
+    - name: Minimize the corpus
+      run: cargo +nightly fuzz cmin ${{ matrix.target }}

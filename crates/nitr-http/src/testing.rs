@@ -28,9 +28,11 @@ pub struct TestClient {
 /// A fully collected response from [`TestClient::request`].
 #[derive(Debug)]
 pub struct TestResponse {
+    /// HTTP status code.
     pub status: u16,
     /// Header pairs in response order (repeated names appear repeatedly).
     pub headers: Vec<(String, String)>,
+    /// The collected response body.
     pub body: Bytes,
 }
 

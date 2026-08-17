@@ -435,7 +435,7 @@ pub(crate) fn build_cookie(name: &str, value: &str, opts: Option<&Table>) -> mlu
 /// Encodes and signs a cookie value: `b64(value) . b64(hmac)`, with the
 /// cookie name bound into the MAC so values cannot be swapped between
 /// cookies.
-pub(crate) fn sign(name: &str, value: &str, secret: &str) -> String {
+pub fn sign(name: &str, value: &str, secret: &str) -> String {
     let payload = B64.encode(value);
     format!(
         "{payload}.{}",
@@ -445,7 +445,7 @@ pub(crate) fn sign(name: &str, value: &str, secret: &str) -> String {
 
 /// Verifies a value produced by [`sign()`]; the MAC comparison is
 /// constant-time (`hmac::Mac::verify_slice`).
-pub(crate) fn verify(name: &str, signed: &str, secret: &str) -> Option<String> {
+pub fn verify(name: &str, signed: &str, secret: &str) -> Option<String> {
     let (payload, sig) = signed.rsplit_once('.')?;
     let sig = B64.decode(sig).ok()?;
     new_mac(name, payload, secret).verify_slice(&sig).ok()?;

@@ -1,6 +1,7 @@
 //! The Nitr HTTP server layer: hyper server and builder, configuration,
 //! and the request/response bridge between HTTP and the Lua runtime.
 
+#![deny(missing_docs)]
 #![forbid(unsafe_code)]
 #![deny(warnings)]
 #![deny(rust_2018_idioms)]
@@ -25,6 +26,7 @@ pub(crate) mod watch;
 
 pub mod testing;
 
+/// The hyper `Service` dispatching requests to the Lua pool.
 pub mod service;
 
 pub use config::{

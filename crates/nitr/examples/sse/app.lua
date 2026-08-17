@@ -2,7 +2,7 @@
 -- response; send(event, data) writes one event (tables are JSON-encoded).
 --
 -- `nitr.time` is a custom Rust module registered by main.rs via
--- ServerBuilder::module() — nitr.time.sleep(ms) suspends this state's
+-- ServerBuilder::module() — nitr.ext.time.sleep(ms) suspends this state's
 -- coroutine on the tokio timer, so the pacing costs no execution budget
 -- and blocks nothing.
 
@@ -29,7 +29,7 @@ app:get("/events", function(req)
     return nitr.sse(function(send)
         for i = 1, 5 do
             send("tick", { count = i })
-            nitr.time.sleep(1000)
+            nitr.ext.time.sleep(1000)
         end
         send("done", "stream finished")
     end)

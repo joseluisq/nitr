@@ -66,6 +66,9 @@ fn check_print_config_shows_the_effective_layering() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+// The full scaffold uses the database and templates; a build without
+// those features cannot run it.
+#[cfg(all(feature = "db", feature = "template"))]
 #[test]
 fn build_produces_a_self_contained_artifact() {
     // The full scaffold: config script, routes/, templates, migrations —
@@ -141,6 +144,7 @@ fn build_produces_a_self_contained_artifact() {
 /// it, and a graceful exit removes it.
 /// The full scaffold's own test suite passes under the framework, and
 /// `--filter` narrows the run.
+#[cfg(all(feature = "db", feature = "template"))]
 #[test]
 fn scaffolded_app_tests_pass_and_filter() {
     let dir = scaffold("test-framework", false);

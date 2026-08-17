@@ -60,6 +60,19 @@ fn new_state(bencher: divan::Bencher<'_, '_>) {
     bencher.bench_local(|| divan::black_box(Runtime::new().expect("create a Lua runtime")));
 }
 
+/// Checking a state out of the pool and returning it: the per-request
+/// synchronization every single dispatch pays before any Lua runs.
+#[divan::bench]
+fn pool_checkout(bencher: divan::Bencher<'_, '_>) {
+    let rt = tokio_runtime();
+    let pool = nitr::RuntimePool::new(vec![Runtime::new().expect("create a Lua runtime")]);
+    bencher.bench_local(|| {
+        rt.block_on(async {
+            divan::black_box(pool.get().await);
+        })
+    });
+}
+
 /// A self-contained script of about the size of a real `app.lua`: no
 /// `nitr` namespace, because a bare runtime has none — what is measured is
 /// reading the file, compiling the chunk, and building its closures. Paid
