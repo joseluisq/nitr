@@ -236,6 +236,8 @@ async fn per_route_on_error_overrides_app_handler() {
 async fn budget_overruns_are_classified_as_timeouts() {
     let h = Harness::start(APP_SCRIPT, false, |cfg| {
         cfg.lua.exec_timeout_ms = 200;
+        // Config validation refuses a pool wait above the request budget.
+        cfg.limits.pool_wait_ms = 200;
     })
     .await;
     let client = reqwest::Client::new();

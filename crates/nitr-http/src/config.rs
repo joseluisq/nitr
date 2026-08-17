@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use nitr_core::RuntimeOpts;
 use nitr_core::{Error, Result};
@@ -20,7 +20,7 @@ const DEFAULT_EXEC_TIMEOUT_MS: u64 = 30_000;
 /// Precedence (strongest first): CLI flags / builder setters, `NITR_*`
 /// environment variables (see [`apply_env()`](Self::apply_env)), the TOML
 /// file, and finally the built-in defaults.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Address the server binds to.
@@ -76,6 +76,73 @@ pub struct Config {
     pub tests_dir: Option<PathBuf>,
     /// Lua runtime settings.
     pub lua: LuaConfig,
+    /// Health and readiness endpoints (`[health]` section).
+    pub health: HealthConfig,
+    /// Log output (`[log]` section).
+    pub log: LogConfig,
+    /// File the server writes its process id to at startup (and removes at
+    /// exit), so `nitr reload` and scripts can find the process without
+    /// grepping the process table.
+    pub pidfile: Option<PathBuf>,
+}
+
+/// Health and readiness endpoints (`[health]` section), answered entirely
+/// in Rust.
+///
+/// Two deliberately separate questions: liveness ("is the process alive?")
+/// never touches a Lua state — a probe that queued behind a saturated pool
+/// would cause the restart it exists to prevent — and readiness ("should
+/// it receive traffic?") flips to `503` the moment a graceful drain
+/// starts, so a rolling deploy shifts traffic before requests can fail.
+/// An application cannot influence either answer.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HealthConfig {
+    /// Whether the endpoints are served at all.
+    pub enabled: bool,
+    /// Liveness path: `200 ok` while the process runs.
+    pub liveness: String,
+    /// Readiness path: `200 ok` while accepting traffic, `503 draining`
+    /// once a graceful shutdown begins.
+    pub readiness: String,
+    /// A separate address to serve the endpoints on, keeping them off the
+    /// public port. When unset they answer on the main listener.
+    pub bind: Option<SocketAddr>,
+}
+
+impl Default for HealthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            liveness: "/healthz".into(),
+            readiness: "/readyz".into(),
+            bind: None,
+        }
+    }
+}
+
+/// Log output (`[log]` section).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LogConfig {
+    /// Output format.
+    pub format: LogFormat,
+    /// Minimum level (`trace`/`debug`/`info`/`warn`/`error`), or any
+    /// `tracing` filter directive. The `RUST_LOG` environment variable
+    /// wins over this; without either, `info` (`debug` in dev mode).
+    pub level: Option<String>,
+}
+
+/// How log lines are rendered.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    /// Human-readable single-line text (the default).
+    #[default]
+    Text,
+    /// One JSON object per line, with the request/error fields as real
+    /// keys — what makes the structured fields usable by a log shipper.
+    Json,
 }
 
 /// Standard library selection (`[std]` section): which built-in `nitr.*`
@@ -85,7 +152,7 @@ pub struct Config {
 /// features they need (or replace them with their own modules). Without an
 /// explicit list only the minimal set is enabled to keep the footprint
 /// small.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StdConfig {
     /// Enabled standard library features. Valid names: `"dbg"`, `"fetch"`,
@@ -101,7 +168,7 @@ pub struct StdConfig {
 
 /// Request-size and connection limits (`[limits]` section), enforced in
 /// Rust before a request reaches Lua.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LimitsConfig {
     /// Maximum declared request body size in bytes (413 beyond it).
@@ -154,7 +221,7 @@ impl Default for LimitsConfig {
 ///
 /// On `SIGTERM`/`SIGINT` the server stops accepting, lets in-flight
 /// requests finish, and only then exits. These bound how long it waits.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ShutdownConfig {
     /// Seconds to let ordinary in-flight requests finish.
@@ -189,7 +256,7 @@ impl ShutdownConfig {
 /// Outbound-request policy for the `fetch` builtin (`[fetch]` section).
 /// By default, requests to loopback/private/link-local addresses are
 /// refused (SSRF protection) and every redirect hop is re-checked.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FetchConfig {
     /// When set, only these exact host names may be fetched.
@@ -269,7 +336,7 @@ impl FetchConfig {
 /// Static file serving (`[static]` section): requests under `mount` are
 /// served from `dir` entirely in Rust, before any Lua dispatch. Scripts
 /// can add further mounts with `app:static(mount, dir, opts?)`.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StaticConfig {
     /// Directory served as static files; unset disables the section.
@@ -289,7 +356,7 @@ pub struct StaticConfig {
 /// defaults are what a server should have shipped with: WAL so readers do
 /// not block the writer, a busy timeout so contention is a brief wait
 /// rather than an error, and foreign keys actually enforced.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DatabaseConfig {
     /// Path to the SQLite file.
     pub path: PathBuf,
@@ -416,7 +483,7 @@ impl<'de> Deserialize<'de> for DatabaseConfig {
 /// Bounded and owned by Rust, so it is shared *data* rather than shared
 /// *state*: entries are serialized on the way in, no Lua value crosses
 /// between states, and the memory cannot grow past these limits.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CacheConfig {
     /// Maximum number of live entries; the least recently used is evicted
@@ -445,7 +512,7 @@ impl Default for CacheConfig {
 /// CPU-spending one, and that should be a decision, not a surprise. One
 /// line enables it. Precompressed sidecars (`app.js.br` next to `app.js`)
 /// are served regardless of this section — they cost nothing at runtime.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CompressionConfig {
     /// Whether responses are compressed on the fly.
@@ -485,7 +552,7 @@ impl Default for CompressionConfig {
 /// Enforced in Rust: a preflight never reaches a Lua state, and the policy
 /// is auditable in one place instead of spread across middleware.
 /// Disabled until `origins` is set.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CorsConfig {
     /// Allowed origins, or `["*"]` for any. Unset disables CORS entirely.
@@ -505,7 +572,7 @@ pub struct CorsConfig {
 
 /// Per-client-IP fixed-window rate limiting (`[rate_limit]` section).
 /// Disabled by default; rejections answer 429 with a `Retry-After` header.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RateLimitConfig {
     /// Whether rate limiting is enforced.
@@ -531,7 +598,7 @@ impl Default for RateLimitConfig {
 }
 
 /// Lua runtime settings (`[lua]` section).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LuaConfig {
     /// Lua standard libraries loaded into every state.
@@ -567,6 +634,9 @@ impl Default for Config {
             static_files: StaticConfig::default(),
             tests_dir: None,
             lua: LuaConfig::default(),
+            health: HealthConfig::default(),
+            log: LogConfig::default(),
+            pidfile: None,
         }
     }
 }
@@ -606,7 +676,8 @@ impl Config {
     /// values: `NITR_LISTEN`, `NITR_HANDLER_SCRIPT`, `NITR_CONFIG_SCRIPT`,
     /// `NITR_TEMPLATES_DIR`, `NITR_DATABASE`, `NITR_WORKERS`, `NITR_MAX_STREAMS`,
     /// `NITR_DEV_MODE`, `NITR_LUA_MEMORY_LIMIT`, `NITR_LUA_EXEC_TIMEOUT_MS`,
-    /// `NITR_POOL_WAIT_MS`, `NITR_SHUTDOWN_GRACE`, `NITR_COMPRESSION`.
+    /// `NITR_POOL_WAIT_MS`, `NITR_SHUTDOWN_GRACE`, `NITR_COMPRESSION`,
+    /// `NITR_LOG_FORMAT`, `NITR_LOG_LEVEL`, `NITR_PIDFILE`.
     pub fn apply_env(&mut self) -> Result {
         if let Some(v) = env_var("NITR_LISTEN") {
             self.listen = parse_env("NITR_LISTEN", &v)?;
@@ -651,6 +722,23 @@ impl Config {
         if let Some(v) = env_var("NITR_COMPRESSION") {
             self.compression.enabled = parse_env("NITR_COMPRESSION", &v)?;
         }
+        if let Some(v) = env_var("NITR_LOG_FORMAT") {
+            self.log.format = match v.as_str() {
+                "text" => LogFormat::Text,
+                "json" => LogFormat::Json,
+                other => {
+                    return Err(Error::Config(format!(
+                        "invalid NITR_LOG_FORMAT `{other}`: expected \"text\" or \"json\""
+                    )));
+                }
+            };
+        }
+        if let Some(v) = env_var("NITR_LOG_LEVEL") {
+            self.log.level = Some(v);
+        }
+        if let Some(v) = env_var("NITR_PIDFILE") {
+            self.pidfile = Some(PathBuf::from(v));
+        }
         Ok(())
     }
 
@@ -689,7 +777,141 @@ impl Config {
                 )));
             }
         }
+        if let Some(max_streams) = self.max_streams
+            && max_streams > self.workers.max(1)
+        {
+            return Err(Error::Config(format!(
+                "max_streams = {max_streams} exceeds workers = {}: every streaming \
+                 response holds a pooled Lua state, so the extra slots could never \
+                 be used",
+                self.workers.max(1)
+            )));
+        }
+        // Waiting for a state longer than a handler is allowed to run means
+        // the queue can only ever grow: work is admitted slower than it can
+        // possibly be retired.
+        if self.limits.pool_wait_ms > self.lua.exec_timeout_ms
+            && self.limits.pool_wait_ms != 0
+            && self.lua.exec_timeout_ms != 0
+        {
+            return Err(Error::Config(format!(
+                "[limits] pool_wait_ms = {} exceeds [lua] exec_timeout_ms = {}: a \
+                 request would wait for a state longer than any handler may run",
+                self.limits.pool_wait_ms, self.lua.exec_timeout_ms
+            )));
+        }
+        if self.health.enabled {
+            for (name, path) in [
+                ("liveness", &self.health.liveness),
+                ("readiness", &self.health.readiness),
+            ] {
+                if !path.starts_with('/') {
+                    return Err(Error::Config(format!(
+                        "[health] {name} = `{path}` must start with `/`"
+                    )));
+                }
+            }
+            if self.health.liveness == self.health.readiness {
+                return Err(Error::Config(
+                    "[health] liveness and readiness must be different paths: they \
+                     answer different questions (see the [health] docs)"
+                        .into(),
+                ));
+            }
+        }
+        self.validate_paths()
+    }
+
+    /// Rejects paths that cannot work before any of them is opened, so a
+    /// typo'd path is a startup error naming the setting, not a confusing
+    /// failure minutes later.
+    fn validate_paths(&self) -> Result {
+        let checks: [(&str, Option<&PathBuf>, bool); 4] = [
+            ("handler_script", Some(&self.handler_script), false),
+            ("config_script", self.config_script.as_ref(), false),
+            ("templates_dir", self.templates_dir.as_ref(), true),
+            ("[static] dir", self.static_files.dir.as_ref(), true),
+        ];
+        for (name, path, want_dir) in checks {
+            let Some(path) = path else { continue };
+            if !path.exists() {
+                return Err(Error::Config(format!(
+                    "{name} points at {}, which does not exist",
+                    path.display()
+                )));
+            }
+            if want_dir != path.is_dir() {
+                let (wanted, got) = if want_dir {
+                    ("a directory", "a file")
+                } else {
+                    ("a file", "a directory")
+                };
+                return Err(Error::Config(format!(
+                    "{name} must be {wanted}, but {} is {got}",
+                    path.display()
+                )));
+            }
+        }
+        // The database file itself may not exist yet (SQLite creates it),
+        // but its parent directory must — SQLite will not create that.
+        if let Some(db) = &self.database
+            && let Some(parent) = db.path.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.is_dir()
+        {
+            return Err(Error::Config(format!(
+                "the database directory {} does not exist (SQLite creates the \
+                 file, not its directory)",
+                parent.display()
+            )));
+        }
         Ok(())
+    }
+
+    /// Re-anchors the application's relative paths under `root`.
+    ///
+    /// Used when running from a `nitr build` bundle: the scripts, templates
+    /// and static files live in the extraction directory, while the
+    /// database path is deliberately left alone — it is mutable state and
+    /// stays external to the artifact, resolving against the working
+    /// directory as usual.
+    pub fn rebase(&mut self, root: &Path) {
+        let anchor = |path: &mut PathBuf| {
+            if path.is_relative() {
+                *path = root.join(&path);
+            }
+        };
+        anchor(&mut self.handler_script);
+        if let Some(path) = &mut self.config_script {
+            anchor(path);
+        }
+        if let Some(path) = &mut self.templates_dir {
+            anchor(path);
+        }
+        if let Some(path) = &mut self.static_files.dir {
+            anchor(path);
+        }
+        if let Some(db) = &mut self.database
+            && let Some(dir) = &mut db.migrations_dir
+        {
+            anchor(dir);
+        }
+        if let Some(path) = &mut self.tests_dir {
+            anchor(path);
+        }
+    }
+
+    /// The effective configuration after file, environment, and flag
+    /// layering, rendered as TOML — the answer to "which value actually
+    /// won?".
+    pub fn effective_toml(&self) -> Result<String> {
+        // Route through JSON first to drop the `None`s: TOML has no null,
+        // and an absent key is exactly what an unset option means.
+        let json = serde_json::to_value(self)
+            .map_err(|err| Error::Config(format!("cannot serialize the configuration: {err}")))?;
+        let json = strip_nulls(json);
+        toml::to_string_pretty(&json)
+            .map_err(|err| Error::Config(format!("cannot render the configuration: {err}")))
     }
 
     /// Resolves the configured `[std] features` list into [`Builtins`] flags.
@@ -773,6 +995,23 @@ impl LuaConfig {
     }
 }
 
+/// Removes `null`s (and the entries they were) from a JSON tree, so the
+/// result can render as TOML, which has no null.
+fn strip_nulls(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .filter(|(_, v)| !v.is_null())
+                .map(|(k, v)| (k, strip_nulls(v)))
+                .collect(),
+        ),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(strip_nulls).collect())
+        }
+        other => other,
+    }
+}
+
 fn env_var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
 }
@@ -800,6 +1039,147 @@ mod tests {
             std::env::temp_dir().join(format!("nitr-test-{}-{id}-{name}", std::process::id()));
         std::fs::write(&path, content).expect("write temp config");
         path
+    }
+
+    /// A config whose paths exist, so `validate()` reaches the check under
+    /// test instead of failing on a missing default handler script.
+    fn valid_base() -> Config {
+        let handler = write_temp_config("handler.lua", "-- test handler");
+        Config {
+            handler_script: handler,
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn contradictions_are_startup_errors() {
+        let ok = valid_base();
+        ok.validate().expect("a sane config validates");
+
+        let mut cfg = valid_base();
+        cfg.workers = 2;
+        cfg.max_streams = Some(5);
+        let err = cfg.validate().expect_err("max_streams > workers");
+        assert!(err.to_string().contains("max_streams"), "got: {err}");
+
+        let mut cfg = valid_base();
+        cfg.limits.pool_wait_ms = 60_000;
+        cfg.lua.exec_timeout_ms = 5_000;
+        let err = cfg.validate().expect_err("pool_wait > exec budget");
+        assert!(err.to_string().contains("pool_wait_ms"), "got: {err}");
+
+        let mut cfg = valid_base();
+        cfg.health.readiness = cfg.health.liveness.clone();
+        let err = cfg.validate().expect_err("identical probe paths");
+        assert!(err.to_string().contains("liveness"), "got: {err}");
+
+        let mut cfg = valid_base();
+        cfg.health.liveness = "healthz".into();
+        let err = cfg.validate().expect_err("path without slash");
+        assert!(err.to_string().contains("must start with"), "got: {err}");
+
+        // Disabled health skips its checks entirely.
+        let mut cfg = valid_base();
+        cfg.health.enabled = false;
+        cfg.health.liveness = "not-a-path".into();
+        cfg.validate().expect("disabled health is not validated");
+    }
+
+    #[test]
+    fn missing_paths_are_named_at_startup() {
+        let mut cfg = valid_base();
+        cfg.handler_script = PathBuf::from("/nonexistent/app.lua");
+        let err = cfg.validate().expect_err("missing handler");
+        assert!(err.to_string().contains("handler_script"), "got: {err}");
+
+        let mut cfg = valid_base();
+        cfg.templates_dir = Some(PathBuf::from("/nonexistent/templates"));
+        let err = cfg.validate().expect_err("missing templates");
+        assert!(err.to_string().contains("templates_dir"), "got: {err}");
+
+        // A file where a directory belongs is as wrong as nothing at all.
+        let mut cfg = valid_base();
+        cfg.templates_dir = Some(cfg.handler_script.clone());
+        let err = cfg.validate().expect_err("file as templates_dir");
+        assert!(err.to_string().contains("directory"), "got: {err}");
+
+        // The database file may not exist yet, but its directory must.
+        let mut cfg = valid_base();
+        cfg.database = Some(DatabaseConfig::new("/nonexistent/dir/app.db"));
+        let err = cfg.validate().expect_err("missing db dir");
+        assert!(err.to_string().contains("database directory"), "got: {err}");
+    }
+
+    #[test]
+    fn unknown_keys_are_rejected_not_ignored() {
+        let path = write_temp_config("typo.toml", "max_body_byte = 1\n");
+        let err = Config::from_file(&path).expect_err("unknown key");
+        assert!(err.to_string().contains("max_body_byte"), "got: {err}");
+
+        // Inside a section too.
+        let path = write_temp_config("typo2.toml", "[limits]\nmax_body_byte = 1\n");
+        let err = Config::from_file(&path).expect_err("unknown section key");
+        assert!(err.to_string().contains("max_body_byte"), "got: {err}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn effective_config_prints_and_round_trips() {
+        let mut cfg = valid_base();
+        cfg.log.format = LogFormat::Json;
+        cfg.pidfile = Some(PathBuf::from("/run/nitr.pid"));
+        let rendered = cfg.effective_toml().expect("render");
+        // Nones are absent, not null.
+        assert!(!rendered.contains("null"), "got: {rendered}");
+        assert!(rendered.contains("format = \"json\""), "got: {rendered}");
+        assert!(
+            rendered.contains("pidfile = \"/run/nitr.pid\""),
+            "got: {rendered}"
+        );
+        // The output is itself a loadable configuration.
+        let path = write_temp_config("effective.toml", &rendered);
+        let reparsed = Config::from_file(&path).expect("reparse");
+        assert_eq!(reparsed.log.format, LogFormat::Json);
+        assert_eq!(reparsed.listen, cfg.listen);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn rebase_moves_app_paths_and_leaves_the_database() {
+        let mut cfg = Config {
+            handler_script: PathBuf::from("app.lua"),
+            config_script: Some(PathBuf::from("config.lua")),
+            templates_dir: Some(PathBuf::from("templates")),
+            database: Some(DatabaseConfig::new("data/app.db")),
+            ..Config::default()
+        };
+        cfg.static_files.dir = Some(PathBuf::from("public"));
+        cfg.rebase(Path::new("/bundle"));
+        assert_eq!(cfg.handler_script, PathBuf::from("/bundle/app.lua"));
+        assert_eq!(
+            cfg.config_script.as_deref(),
+            Some(Path::new("/bundle/config.lua"))
+        );
+        assert_eq!(
+            cfg.templates_dir.as_deref(),
+            Some(Path::new("/bundle/templates"))
+        );
+        assert_eq!(
+            cfg.static_files.dir.as_deref(),
+            Some(Path::new("/bundle/public"))
+        );
+        // Mutable state stays external to the artifact.
+        assert_eq!(
+            cfg.database.as_ref().unwrap().path,
+            PathBuf::from("data/app.db")
+        );
+        // Absolute paths are already anchored; rebase leaves them alone.
+        let mut cfg = Config {
+            handler_script: PathBuf::from("/abs/app.lua"),
+            ..Config::default()
+        };
+        cfg.rebase(Path::new("/bundle"));
+        assert_eq!(cfg.handler_script, PathBuf::from("/abs/app.lua"));
     }
 
     #[test]

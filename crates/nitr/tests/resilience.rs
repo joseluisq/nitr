@@ -238,6 +238,8 @@ async fn a_panic_becomes_a_500_and_recycles_the_state() {
 async fn a_user_coroutine_cannot_escape_the_execution_budget() {
     let mut cfg = base_config(1);
     cfg.lua.exec_timeout_ms = 1_000;
+    // Config validation refuses a pool wait above the request budget.
+    cfg.limits.pool_wait_ms = 1_000;
     let (server, addr, handler) = build(cfg).await;
 
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();

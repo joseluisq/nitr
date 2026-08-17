@@ -1,121 +1,173 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
+use clap::{Parser, Subcommand};
 
 use nitr::{BuiltinsEnv, Config, Runtime, Server};
 
+mod bundle;
 mod diag;
 
 const DEFAULT_CONFIG_FILE: &str = "nitr.toml";
 
-const USAGE: &str = "\
-Usage: nitr [COMMAND] [OPTIONS]
-
-Commands:
-  run              Start the server (default)
-  dev              Start the server in development mode (hot reload)
-  check            Load the configuration and scripts, then exit
-  test             Run the Lua tests against an in-process server
-  migrate          Apply pending SQL migrations from migrations/
-  init [DIR]       Scaffold a new Nitr application
-
-Options:
-  -c, --config <PATH>  Path to the TOML config file (default: ./nitr.toml)
-      --dev            Enable development mode (hot reload)
-      --status         With `migrate`: report what has run and what is pending
-  -h, --help           Print this help message
-
-Signals:
-  SIGHUP           Zero-downtime reload: rebuilds the Lua runtime pool";
-
-struct Args {
-    command: Command,
+/// The Nitr server: drop a binary and a few Lua files onto a machine and
+/// you have a complete small HTTP application.
+#[derive(Parser)]
+#[command(
+    name = "nitr",
+    disable_version_flag = true,
+    after_help = "Signals:\n  SIGHUP           Zero-downtime reload: rebuilds the Lua runtime pool"
+)]
+struct Cli {
+    /// Print the version and exit.
+    #[arg(short = 'v', long = "version", global = true)]
+    version: bool,
+    /// Path to the TOML config file (default: ./nitr.toml).
+    #[arg(short = 'c', long = "config", global = true, value_name = "PATH")]
     config: Option<PathBuf>,
+    /// Enable development mode (hot reload).
+    #[arg(long, global = true)]
     dev: bool,
-    status: bool,
+    #[command(subcommand)]
+    command: Option<Command>,
 }
 
+#[derive(Subcommand)]
 enum Command {
+    /// Start the server (the default when no command is given).
     Run,
-    Check,
+    /// Start the server in development mode (hot reload).
+    Dev,
+    /// Load the configuration and scripts, then exit.
+    Check {
+        /// Print the effective configuration after file, environment, and
+        /// flag layering — the answer to "which value actually won?".
+        #[arg(long)]
+        print_config: bool,
+    },
+    /// Run the Lua tests against an in-process server.
     Test,
-    Migrate,
-    Init(PathBuf),
+    /// Apply pending SQL migrations from migrations/.
+    Migrate {
+        /// Report what has run and what is pending, applying nothing.
+        #[arg(long)]
+        status: bool,
+    },
+    /// Scaffold a new Nitr application.
+    Init {
+        /// Directory to scaffold into (default: the current directory).
+        dir: Option<PathBuf>,
+    },
+    /// Package the application and this binary into one runnable file.
+    Build {
+        /// Path of the artifact to write.
+        #[arg(short, long, value_name = "PATH")]
+        output: PathBuf,
+    },
+    /// Ask a running server (found via its `pidfile`) to reload.
+    Reload,
 }
 
-fn parse_args() -> anyhow::Result<Args> {
-    let mut args = Args {
-        command: Command::Run,
-        config: None,
-        dev: false,
-        status: false,
-    };
-    let mut iter = std::env::args().skip(1).peekable();
-    let mut command_seen = false;
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "run" if !command_seen => command_seen = true,
-            "dev" if !command_seen => {
-                command_seen = true;
-                args.dev = true;
+fn load_config(cli: &Cli) -> anyhow::Result<Config> {
+    // A bundled executable carries its own application; the config file
+    // and every path in it come from the extracted archive.
+    let mut cfg = match bundle::load()? {
+        Some(cfg) => cfg,
+        None => match &cli.config {
+            Some(path) => Config::from_file(path)?,
+            None => {
+                let default = Path::new(DEFAULT_CONFIG_FILE);
+                if default.is_file() {
+                    Config::from_file(default)?
+                } else {
+                    Config::default()
+                }
             }
-            "check" if !command_seen => {
-                command_seen = true;
-                args.command = Command::Check;
-            }
-            "test" if !command_seen => {
-                command_seen = true;
-                args.command = Command::Test;
-            }
-            "migrate" if !command_seen => {
-                command_seen = true;
-                args.command = Command::Migrate;
-            }
-            "init" if !command_seen => {
-                command_seen = true;
-                let dir = match iter.peek() {
-                    Some(next) if !next.starts_with('-') => {
-                        PathBuf::from(iter.next().expect("peeked"))
-                    }
-                    _ => PathBuf::from("."),
-                };
-                args.command = Command::Init(dir);
-            }
-            "-c" | "--config" => {
-                let path = iter
-                    .next()
-                    .with_context(|| format!("missing value for {arg}"))?;
-                args.config = Some(PathBuf::from(path));
-            }
-            "--dev" => args.dev = true,
-            "--status" => args.status = true,
-            "-h" | "--help" => {
-                println!("{USAGE}");
-                std::process::exit(0);
-            }
-            _ => bail!("unknown argument `{arg}`\n{USAGE}"),
-        }
-    }
-    Ok(args)
-}
-
-fn load_config(args: &Args) -> anyhow::Result<Config> {
-    let mut cfg = match &args.config {
-        Some(path) => Config::from_file(path)?,
-        None => {
-            let default = Path::new(DEFAULT_CONFIG_FILE);
-            if default.is_file() {
-                Config::from_file(default)?
-            } else {
-                Config::default()
-            }
-        }
+        },
     };
     cfg.apply_env()?;
-    if args.dev {
+    if cli.dev || matches!(cli.command, Some(Command::Dev)) {
         cfg.dev_mode = true;
     }
     Ok(cfg)
+}
+
+/// Installs the tracing subscriber per the `[log]` configuration.
+/// `RUST_LOG` wins over the configured level; without either the default
+/// is `info` (`debug` in dev mode).
+fn init_logging(cfg: Option<&Config>, dev: bool) {
+    let fallback = || {
+        let configured = cfg.and_then(|c| c.log.level.clone());
+        tracing_subscriber::EnvFilter::new(configured.unwrap_or_else(|| {
+            if dev || cfg.is_some_and(|c| c.dev_mode) {
+                "debug".into()
+            } else {
+                "info".into()
+            }
+        }))
+    };
+    let filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| fallback());
+    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    match cfg.map(|c| c.log.format) {
+        Some(nitr::LogFormat::Json) => builder.json().init(),
+        _ => builder.init(),
+    }
+}
+
+/// Writes the pidfile on creation, removes it on drop — including the
+/// error path, so a crashed server does not leave a stale pid behind for
+/// `nitr reload` to signal.
+struct Pidfile(PathBuf);
+
+impl Pidfile {
+    fn write(path: &Path) -> anyhow::Result<Self> {
+        std::fs::write(path, format!("{}\n", std::process::id()))
+            .with_context(|| format!("cannot write the pidfile {}", path.display()))?;
+        Ok(Self(path.to_path_buf()))
+    }
+}
+
+impl Drop for Pidfile {
+    fn drop(&mut self) {
+        std::fs::remove_file(&self.0).ok();
+    }
+}
+
+/// Sends SIGHUP to the process named by the configured `pidfile`.
+fn reload(cfg: &Config) -> anyhow::Result<()> {
+    let path = cfg.pidfile.as_ref().context(
+        "no `pidfile` is configured: set `pidfile` in nitr.toml so `nitr reload` \
+         can find the running server",
+    )?;
+    let raw = std::fs::read_to_string(path).with_context(|| {
+        format!(
+            "cannot read the pidfile {} (is the server running?)",
+            path.display()
+        )
+    })?;
+    let pid: u32 = raw
+        .trim()
+        .parse()
+        .with_context(|| format!("the pidfile {} does not contain a pid", path.display()))?;
+
+    #[cfg(unix)]
+    {
+        let status = std::process::Command::new("kill")
+            .args(["-HUP", &pid.to_string()])
+            .status()
+            .context("cannot run `kill`")?;
+        if !status.success() {
+            bail!("kill -HUP {pid} failed: is the server still running?");
+        }
+        println!("sent SIGHUP to pid {pid}: the server is rebuilding its runtime pool");
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        bail!("`nitr reload` needs Unix signals, which this platform does not have");
+    }
 }
 
 #[tokio::main]
@@ -130,38 +182,71 @@ async fn main() {
 }
 
 async fn run_main() -> anyhow::Result<()> {
-    let args = parse_args()?;
+    let cli = Cli::parse();
+    if cli.version {
+        println!("nitr {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new(if args.dev { "debug" } else { "info" })
-            }),
-        )
-        .init();
+    // `init` runs before any configuration exists; everything else loads
+    // the configuration first so `[log]` can shape the subscriber.
+    if let Some(Command::Init { dir }) = &cli.command {
+        init_logging(None, cli.dev);
+        return init(dir.as_deref().unwrap_or(Path::new(".")));
+    }
 
-    match &args.command {
-        Command::Init(dir) => return init(dir),
-        Command::Run => {
-            let cfg = load_config(&args)?;
-            let server = Server::builder().config(cfg).build().await?;
-            server.serve().await?;
+    let cfg = match load_config(&cli) {
+        Ok(cfg) => {
+            init_logging(Some(&cfg), cli.dev);
+            cfg
         }
-        Command::Check => {
-            let cfg = load_config(&args)?;
+        Err(err) => {
+            init_logging(None, cli.dev);
+            return Err(err);
+        }
+    };
+
+    match cli.command.unwrap_or(Command::Run) {
+        Command::Init { .. } => unreachable!("handled above"),
+        Command::Run | Command::Dev => {
+            let pidfile_path = cfg.pidfile.clone();
+            let server = Server::builder().config(cfg).build().await?;
+            // Written only once the build succeeded: a pid that never
+            // served is not one `nitr reload` should be signalling.
+            let pidfile = pidfile_path.as_deref().map(Pidfile::write).transpose()?;
+            let result = server.serve().await;
+            drop(pidfile);
+            result?;
+        }
+        Command::Check { print_config } => {
+            if print_config {
+                print!("{}", cfg.effective_toml()?);
+                return Ok(());
+            }
             check(cfg).await?;
         }
         Command::Test => {
-            let cfg = load_config(&args)?;
             let failures = run_tests(cfg).await?;
             if failures > 0 {
                 std::process::exit(1);
             }
         }
-        Command::Migrate => {
-            let cfg = load_config(&args)?;
-            migrate(&cfg, args.status)?;
+        Command::Migrate { status } => migrate(&cfg, status)?,
+        Command::Build { output } => {
+            let cfg_path = cli
+                .config
+                .as_deref()
+                .unwrap_or(Path::new(DEFAULT_CONFIG_FILE));
+            if !cfg_path.is_file() {
+                bail!(
+                    "`nitr build` needs a configuration file ({} not found): the \
+                     bundle records it as the application manifest",
+                    cfg_path.display()
+                );
+            }
+            bundle::build(cfg_path, &cfg, &output)?;
         }
+        Command::Reload => reload(&cfg)?,
     }
     Ok(())
 }

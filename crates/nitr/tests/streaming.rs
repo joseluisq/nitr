@@ -98,6 +98,8 @@ async fn streaming_bodies_end_to_end() {
         ..Default::default()
     };
     cfg.lua.exec_timeout_ms = 400;
+    // Config validation refuses a pool wait above the request budget.
+    cfg.limits.pool_wait_ms = 400;
 
     let server = nitr::Server::builder()
         .config(cfg)

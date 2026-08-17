@@ -157,6 +157,27 @@ database = "scripts/file.db"
 # Directory `nitr test` discovers *.lua test files in (default: "tests").
 #tests_dir = "tests"
 
+# Health and readiness endpoints, answered entirely in Rust (a handler
+# cannot influence them). Enabled by default on the main listener.
+# Liveness never touches a Lua state; readiness flips to 503 the moment a
+# graceful drain starts, so a rolling deploy shifts traffic first.
+#[health]
+#enabled = true
+#liveness = "/healthz"
+#readiness = "/readyz"
+#bind = "127.0.0.1:9090"   # optional: keep the probes off the public port
+
+# Log output. "json" emits one object per line with the request/error
+# fields as real keys, for log shippers; "text" (default) is for humans.
+# RUST_LOG overrides `level`.
+#[log]
+#format = "text"
+#level = "info"            # default: info (debug in dev mode)
+
+# File the server writes its pid to at startup (removed at exit); what
+# `nitr reload` uses to find the process.
+#pidfile = "/run/nitr/nitr.pid"
+
 # Development mode: hot-reload the handler script on change.
 # Default: false (also enabled by the --dev flag).
 dev_mode = true

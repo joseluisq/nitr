@@ -205,6 +205,32 @@ impl Server {
                 Error::Config(format!("unable to listen on {}: {err}", self.cfg.listen))
             })?,
         };
+        let graceful = GracefulShutdown::new();
+        let mut shutdown = std::pin::pin!(shutdown);
+
+        // SIGHUP triggers a zero-downtime pool swap (Unix only; the
+        // channel simply stays silent elsewhere). The stream is created
+        // HERE, synchronously, so that by the time the "listening" line is
+        // logged the default disposition (terminate!) is gone — a reload
+        // sent the moment the server looks up must never kill it.
+        let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel::<()>(1);
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let tx = reload_tx.clone();
+            match signal(SignalKind::hangup()) {
+                Ok(mut hangup) => {
+                    tokio::spawn(async move {
+                        while hangup.recv().await.is_some() {
+                            let _ = tx.try_send(());
+                        }
+                    });
+                }
+                Err(err) => tracing::warn!("failed to install the SIGHUP reload handler: {err}"),
+            }
+        }
+        let _reload_tx = reload_tx;
+
         // The listener's own address, not `cfg.listen`: with a pre-bound
         // listener (or port 0) the config value is not where we serve.
         let bound = listener.local_addr().unwrap_or(self.cfg.listen);
@@ -214,27 +240,31 @@ impl Server {
             current_pool(&self.pool).size()
         );
 
-        let graceful = GracefulShutdown::new();
-        let mut shutdown = std::pin::pin!(shutdown);
+        // Health endpoints: on the main listener by default, or on their
+        // own address so the probes stay off the public port.
+        let health_state = self.cfg.health.enabled.then(|| {
+            Arc::new(crate::health::HealthState {
+                cfg: self.cfg.health.clone(),
+                ready: self.ready.clone(),
+            })
+        });
+        let mut probe_task = None;
+        let main_health = match (&health_state, self.cfg.health.bind) {
+            (Some(state), Some(addr)) => {
+                let probe_listener = TcpListener::bind(addr).await.map_err(|err| {
+                    Error::Config(format!("unable to bind [health] bind = {addr}: {err}"))
+                })?;
+                tracing::info!("health endpoints on http://{addr}");
+                probe_task = Some(tokio::spawn(crate::health::serve_probes(
+                    probe_listener,
+                    state.clone(),
+                )));
+                None
+            }
+            (Some(state), None) => Some(state.clone()),
+            (None, _) => None,
+        };
 
-        // SIGHUP triggers a zero-downtime pool swap (Unix only; the
-        // channel simply stays silent elsewhere).
-        let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel::<()>(1);
-        #[cfg(unix)]
-        {
-            let tx = reload_tx.clone();
-            tokio::spawn(async move {
-                use tokio::signal::unix::{SignalKind, signal};
-                let Ok(mut hangup) = signal(SignalKind::hangup()) else {
-                    tracing::warn!("failed to install the SIGHUP reload handler");
-                    return;
-                };
-                while hangup.recv().await.is_some() {
-                    let _ = tx.try_send(());
-                }
-            });
-        }
-        let _reload_tx = reload_tx;
         // Connection cap: the listener stops accepting while at the limit
         // instead of queueing unbounded connections.
         let conn_slots = Arc::new(Semaphore::new(self.cfg.limits.max_connections.max(1)));
@@ -270,6 +300,7 @@ impl Server {
                         self.pool.clone(),
                         self.streams.clone(),
                         self.protection.clone(),
+                        main_health.clone(),
                         peer_addr,
                     );
                     let conn = http1::Builder::new()
@@ -292,7 +323,9 @@ impl Server {
         }
 
         // Step 1 happened by leaving the accept loop: the listener is
-        // dropped below and no new connection is taken.
+        // dropped below and no new connection is taken. The probe listener
+        // stays up through the drain — readiness must be observable as
+        // "draining" while it happens — and dies with the process.
         drop(listener);
         // Step 2: stop advertising readiness *before* requests can fail, so
         // a load balancer drains us on its own terms. Responses issued from
@@ -319,6 +352,10 @@ impl Server {
             _ = graceful.shutdown() => true,
             _ = deadline => false,
         };
+
+        if let Some(task) = probe_task {
+            task.abort();
+        }
 
         if drained {
             tracing::info!("drained cleanly, shutting down");

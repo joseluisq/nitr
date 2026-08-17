@@ -12,6 +12,7 @@ pub(crate) mod compress;
 pub(crate) mod config;
 pub(crate) mod cors;
 pub(crate) mod handler;
+pub(crate) mod health;
 #[cfg(feature = "multipart")]
 pub(crate) mod multipart;
 pub(crate) mod protect;
@@ -26,7 +27,8 @@ pub mod testing;
 pub mod service;
 
 pub use config::{
-    CacheConfig, CompressionConfig, Config, CorsConfig, DatabaseConfig, FetchConfig, LimitsConfig,
-    LuaConfig, RateLimitConfig, ShutdownConfig, StaticConfig, StdConfig,
+    CacheConfig, CompressionConfig, Config, CorsConfig, DatabaseConfig, FetchConfig, HealthConfig,
+    LimitsConfig, LogConfig, LogFormat, LuaConfig, RateLimitConfig, ShutdownConfig, StaticConfig,
+    StdConfig,
 };
 pub use server::{Server, ServerBuilder};

@@ -29,6 +29,9 @@ pub struct Svc {
     streams: Arc<Semaphore>,
     /// Pre-Lua protection (rate limiting, size limits) and request ids.
     protection: Arc<Protection>,
+    /// Health endpoints served on this (main) listener; `None` when they
+    /// are disabled or bound to their own address.
+    health: Option<Arc<crate::health::HealthState>>,
     peer_addr: SocketAddr,
 }
 
@@ -37,12 +40,14 @@ impl Svc {
         pool: Arc<std::sync::RwLock<Arc<RuntimePool>>>,
         streams: Arc<Semaphore>,
         protection: Arc<Protection>,
+        health: Option<Arc<crate::health::HealthState>>,
         peer_addr: SocketAddr,
     ) -> Self {
         Self {
             pool,
             streams,
             protection,
+            health,
             peer_addr,
         }
     }
@@ -54,6 +59,15 @@ impl Service<Request<Incoming>> for Svc {
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
+        // Probes answer before anything request-shaped happens: no rate
+        // limiting, no pool checkout, no Lua. A liveness check that could
+        // queue behind a saturated pool would cause the restart it is
+        // meant to prevent.
+        if let Some(health) = &self.health
+            && let Some(resp) = health.answer(req.method(), req.uri().path())
+        {
+            return Box::pin(async move { Ok(resp) });
+        }
         let pool = crate::server::current_pool(&self.pool);
         let streams = self.streams.clone();
         let protection = self.protection.clone();
