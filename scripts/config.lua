@@ -39,5 +39,5 @@ end
 return {
     status = status,
     users = users,
-    server_time = os.date("%d-%m-%YT%H:%M:%S"),
+    server_time = nitr.time.format(nitr.time.now(), "%d-%m-%YT%H:%M:%S"),
 }

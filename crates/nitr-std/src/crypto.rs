@@ -8,10 +8,12 @@
 use argon2::Argon2;
 use argon2::password_hash::{PasswordHash, PasswordHasher as _, PasswordVerifier as _, SaltString};
 use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as B64;
+use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD as B64URL};
+use chacha20poly1305::aead::{Aead as _, Payload};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hmac::{Hmac, Mac as _};
 use mlua::{Lua, LuaString, ObjectLike as _, Table, Value};
-use sha2::{Digest as _, Sha256};
+use sha2::{Digest as _, Sha256, Sha384, Sha512};
 use subtle::ConstantTimeEq as _;
 
 /// Upper bound for `nitr.crypto.random_bytes(n)`: large enough for any
@@ -98,6 +100,70 @@ pub(crate) fn create_crypto_table(lua: &Lua) -> mlua::Result<Table> {
         })?,
     )?;
 
+    // AEAD (XChaCha20-Poly1305): authenticated encryption for data handed
+    // to a client. `seal` returns a printable token; `open` returns nil on
+    // any tampering — with the ciphertext, the nonce, or the optional
+    // associated data.
+    crypto.set(
+        "seal",
+        lua.create_function(
+            |lua, (key, plaintext, aad): (LuaString, LuaString, Option<LuaString>)| {
+                let cipher = aead_cipher(&key)?;
+                let mut nonce = [0u8; 24];
+                getrandom::getrandom(&mut nonce).map_err(rng_err)?;
+                let nonce = XNonce::from(nonce);
+                let aad = aad
+                    .as_ref()
+                    .map(|s| s.as_bytes().to_vec())
+                    .unwrap_or_default();
+                let ciphertext = cipher
+                    .encrypt(
+                        &nonce,
+                        Payload {
+                            msg: &plaintext.as_bytes(),
+                            aad: &aad,
+                        },
+                    )
+                    .map_err(|_| mlua::Error::RuntimeError("encryption failed".into()))?;
+                let mut sealed = nonce.to_vec();
+                sealed.extend_from_slice(&ciphertext);
+                lua.create_string(B64URL.encode(sealed))
+            },
+        )?,
+    )?;
+
+    crypto.set(
+        "open",
+        lua.create_function(
+            |lua, (key, sealed, aad): (LuaString, LuaString, Option<LuaString>)| {
+                let cipher = aead_cipher(&key)?;
+                let aad = aad
+                    .as_ref()
+                    .map(|s| s.as_bytes().to_vec())
+                    .unwrap_or_default();
+                let Ok(raw) = B64URL.decode(&*sealed.as_bytes()) else {
+                    return Ok(Value::Nil);
+                };
+                if raw.len() < 24 {
+                    return Ok(Value::Nil);
+                }
+                let (nonce, ciphertext) = raw.split_at(24);
+                match cipher.decrypt(
+                    XNonce::from_slice(nonce),
+                    Payload {
+                        msg: ciphertext,
+                        aad: &aad,
+                    },
+                ) {
+                    Ok(plaintext) => Ok(Value::String(lua.create_string(plaintext)?)),
+                    Err(_) => Ok(Value::Nil),
+                }
+            },
+        )?,
+    )?;
+
+    crypto.set("jwt", create_jwt_table(lua)?)?;
+
     crypto.set(
         "password_verify",
         lua.create_function(|_, (password, hash): (LuaString, String)| {
@@ -111,6 +177,191 @@ pub(crate) fn create_crypto_table(lua: &Lua) -> mlua::Result<Table> {
     )?;
 
     Ok(crypto)
+}
+
+/// Builds the AEAD cipher, insisting on a full-strength key. Deriving a
+/// key from a short passphrase here would hide the mistake; the error
+/// tells the caller how to make a real one.
+fn aead_cipher(key: &LuaString) -> mlua::Result<XChaCha20Poly1305> {
+    let key = key.as_bytes();
+    if key.len() != 32 {
+        return Err(mlua::Error::RuntimeError(format!(
+            "seal/open take a 32-byte key, got {} bytes — generate one with \
+             nitr.crypto.random_bytes(32) or derive one with nitr.crypto.sha256",
+            key.len()
+        )));
+    }
+    // Fully qualified: importing `KeyInit` would make the `Hmac`
+    // constructors ambiguous (`Mac` supplies its own `new_from_slice`).
+    Ok(<XChaCha20Poly1305 as chacha20poly1305::KeyInit>::new(
+        key.as_ref().into(),
+    ))
+}
+
+/// The HMAC algorithms `nitr.crypto.jwt` supports. Asymmetric algorithms
+/// (and `none`) are deliberately absent: a format needs a key-management
+/// story before RS256 helps anyone, and `alg: none` is the classic CVE.
+const JWT_ALGORITHMS: &[&str] = &["HS256", "HS384", "HS512"];
+
+fn jwt_mac(alg: &str, key: &[u8], data: &[u8]) -> Vec<u8> {
+    // Never panics: HMAC accepts keys of any length.
+    match alg {
+        "HS256" => {
+            let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
+            mac.update(data);
+            mac.finalize().into_bytes().to_vec()
+        }
+        "HS384" => {
+            let mut mac = Hmac::<Sha384>::new_from_slice(key).expect("HMAC accepts any key length");
+            mac.update(data);
+            mac.finalize().into_bytes().to_vec()
+        }
+        "HS512" => {
+            let mut mac = Hmac::<Sha512>::new_from_slice(key).expect("HMAC accepts any key length");
+            mac.update(data);
+            mac.finalize().into_bytes().to_vec()
+        }
+        other => unreachable!("algorithm `{other}` was validated before use"),
+    }
+}
+
+fn unix_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64())
+}
+
+/// `verify`'s failure path: `nil` plus a reason, so callers can
+/// distinguish "expired" from "forged" when deciding what to log.
+fn jwt_reject(lua: &Lua, reason: &str) -> mlua::Result<(Value, Value)> {
+    Ok((Value::Nil, Value::String(lua.create_string(reason)?)))
+}
+
+/// Builds `nitr.crypto.jwt`: verification first, signing second.
+fn create_jwt_table(lua: &Lua) -> mlua::Result<Table> {
+    let jwt = lua.create_table()?;
+
+    jwt.set(
+        "sign",
+        lua.create_function(
+            |lua, (claims, key, opts): (Table, LuaString, Option<Table>)| {
+                let alg = match &opts {
+                    Some(opts) => opts
+                        .get::<Option<String>>("alg")?
+                        .unwrap_or_else(|| "HS256".into()),
+                    None => "HS256".into(),
+                };
+                if !JWT_ALGORITHMS.contains(&alg.as_str()) {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "unsupported JWT algorithm `{alg}` (supported: {})",
+                        JWT_ALGORITHMS.join(", ")
+                    )));
+                }
+                let header = B64URL.encode(format!(r#"{{"alg":"{alg}","typ":"JWT"}}"#));
+                let payload = serde_json::to_string(&Value::Table(claims))
+                    .map_err(|err| {
+                        mlua::Error::RuntimeError(format!(
+                            "JWT claims must be JSON-serializable: {err}"
+                        ))
+                    })
+                    .map(|json| B64URL.encode(json))?;
+                let signing_input = format!("{header}.{payload}");
+                let sig = B64URL.encode(jwt_mac(&alg, &key.as_bytes(), signing_input.as_bytes()));
+                lua.create_string(format!("{signing_input}.{sig}"))
+            },
+        )?,
+    )?;
+
+    // jwt.verify(token, key, { algorithms = {...}, leeway? }) ->
+    //   claims, nil | nil, reason
+    //
+    // The explicit `algorithms` allow-list is required, and the algorithm
+    // named by the token's own header is honored only if the list contains
+    // it — the two properties whose absence makes hand-rolled JWT
+    // verification a recurring CVE. Expiry and not-before are checked by
+    // default.
+    jwt.set(
+        "verify",
+        lua.create_function(|lua, (token, key, opts): (LuaString, LuaString, Table)| {
+            let allowed: Vec<String> =
+                opts.get::<Option<Vec<String>>>("algorithms")?
+                    .ok_or_else(|| {
+                        mlua::Error::RuntimeError(
+                            "jwt.verify requires an `algorithms` allow-list, e.g. \
+                             { algorithms = { \"HS256\" } }"
+                                .into(),
+                        )
+                    })?;
+            for alg in &allowed {
+                if !JWT_ALGORITHMS.contains(&alg.as_str()) {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "unsupported JWT algorithm `{alg}` in the allow-list \
+                             (supported: {})",
+                        JWT_ALGORITHMS.join(", ")
+                    )));
+                }
+            }
+            let leeway: f64 = opts.get::<Option<f64>>("leeway")?.unwrap_or(0.0);
+
+            let token = token.to_string_lossy().to_string();
+            let mut parts = token.split('.');
+            let (Some(header), Some(payload), Some(sig), None) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                return jwt_reject(lua, "malformed token");
+            };
+
+            let Some(header_json) = B64URL
+                .decode(header)
+                .ok()
+                .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
+            else {
+                return jwt_reject(lua, "malformed header");
+            };
+            // The header's algorithm is checked against the caller's
+            // list, never trusted on its own.
+            let alg = header_json
+                .get("alg")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !allowed.iter().any(|a| a == alg) {
+                return jwt_reject(lua, "algorithm not allowed");
+            }
+
+            let signing_input = format!("{header}.{payload}");
+            let expected = jwt_mac(alg, &key.as_bytes(), signing_input.as_bytes());
+            let ok = B64URL
+                .decode(sig)
+                .is_ok_and(|sig| sig.len() == expected.len() && bool::from(sig.ct_eq(&expected)));
+            if !ok {
+                return jwt_reject(lua, "invalid signature");
+            }
+
+            let Some(claims) = B64URL
+                .decode(payload)
+                .ok()
+                .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
+            else {
+                return jwt_reject(lua, "malformed claims");
+            };
+            let now = unix_now();
+            if let Some(exp) = claims.get("exp").and_then(|v| v.as_f64())
+                && now > exp + leeway
+            {
+                return jwt_reject(lua, "token expired");
+            }
+            if let Some(nbf) = claims.get("nbf").and_then(|v| v.as_f64())
+                && now < nbf - leeway
+            {
+                return jwt_reject(lua, "token not yet valid");
+            }
+
+            use mlua::LuaSerdeExt as _;
+            Ok((lua.to_value(&claims)?, Value::Nil))
+        })?,
+    )?;
+
+    Ok(jwt)
 }
 
 /// Builds the `nitr.auth` table: `basic(req)` returns `user, pass` (or
@@ -221,6 +472,236 @@ mod tests {
                 .call::<bool>(("hunter2", "not-a-hash".to_string()))
                 .expect("ok")
         );
+    }
+
+    #[test]
+    fn seal_and_open_round_trip_and_reject_tampering() {
+        let lua = Lua::new();
+        let crypto = create_crypto_table(&lua).expect("crypto table");
+        let seal: mlua::Function = crypto.get("seal").expect("fn");
+        let open: mlua::Function = crypto.get("open").expect("fn");
+        let key = "0123456789abcdef0123456789abcdef"; // 32 bytes
+
+        let sealed: String = seal.call((key, "top secret", "ctx")).expect("seal");
+        let opened: Option<String> = open.call((key, sealed.clone(), "ctx")).expect("open");
+        assert_eq!(opened.as_deref(), Some("top secret"));
+
+        // Wrong key, wrong aad, tampered ciphertext, garbage: all nil.
+        let other_key = "ffffffffffffffffffffffffffffffff";
+        for (k, sealed, aad) in [
+            (other_key, sealed.clone(), Some("ctx")),
+            (key, sealed.clone(), Some("other")),
+            (key, sealed.clone(), None),
+            (key, format!("A{}", &sealed[1..]), Some("ctx")),
+            (key, "garbage".to_string(), Some("ctx")),
+        ] {
+            let opened: Option<String> = open.call((k, sealed, aad)).expect("open");
+            assert_eq!(opened, None);
+        }
+
+        // Same plaintext seals differently every time (random nonce).
+        let a: String = seal.call((key, "x", Value::Nil)).expect("seal");
+        let b: String = seal.call((key, "x", Value::Nil)).expect("seal");
+        assert_ne!(a, b);
+
+        // A short key is an error, not a silently weak derivation.
+        assert!(seal.call::<String>(("short", "x", Value::Nil)).is_err());
+    }
+
+    #[test]
+    fn jwt_signs_and_verifies_with_an_allow_list() {
+        let lua = Lua::new();
+        let crypto = create_crypto_table(&lua).expect("crypto table");
+        let jwt: Table = crypto.get("jwt").expect("jwt");
+        let sign: mlua::Function = jwt.get("sign").expect("fn");
+        let verify: mlua::Function = jwt.get("verify").expect("fn");
+        let far_future = 4_000_000_000i64;
+
+        let claims: Table = lua
+            .load(format!("{{ sub = \"42\", exp = {far_future} }}"))
+            .eval()
+            .expect("claims");
+        let token: String = sign.call((claims, "s3cret-key")).expect("sign");
+        assert_eq!(token.split('.').count(), 3);
+
+        let allow: Table = lua
+            .load(r#"{ algorithms = { "HS256" } }"#)
+            .eval()
+            .expect("opts");
+        let (claims, err): (Value, Option<String>) = verify
+            .call((token.clone(), "s3cret-key", allow))
+            .expect("verify");
+        assert_eq!(err, None);
+        let Value::Table(claims) = claims else {
+            panic!("expected claims table");
+        };
+        assert_eq!(claims.get::<String>("sub").expect("sub"), "42");
+
+        // Wrong key, tampered payload, algorithm not in the list.
+        for (token, key, opts) in [
+            (
+                token.clone(),
+                "wrong-key",
+                r#"{ algorithms = { "HS256" } }"#,
+            ),
+            (
+                format!("{token}x"),
+                "s3cret-key",
+                r#"{ algorithms = { "HS256" } }"#,
+            ),
+            (
+                token.clone(),
+                "s3cret-key",
+                r#"{ algorithms = { "HS384" } }"#,
+            ),
+        ] {
+            let opts: Table = lua.load(opts).eval().expect("opts");
+            let (claims, err): (Value, Option<String>) =
+                verify.call((token, key, opts)).expect("verify");
+            assert!(claims.is_nil());
+            assert!(err.is_some());
+        }
+
+        // The allow-list is mandatory, and `none` is not an algorithm.
+        let empty: Table = lua.load("{}").eval().expect("opts");
+        assert!(
+            verify
+                .call::<(Value, Value)>((token.clone(), "s3cret-key", empty))
+                .is_err()
+        );
+        let none: Table = lua
+            .load(r#"{ algorithms = { "none" } }"#)
+            .eval()
+            .expect("opts");
+        assert!(
+            verify
+                .call::<(Value, Value)>((token, "s3cret-key", none))
+                .is_err()
+        );
+
+        // Expired tokens are rejected by default; leeway is opt-in.
+        let expired: Table = lua
+            .load("{ sub = \"42\", exp = 1000000 }")
+            .eval()
+            .expect("claims");
+        let token: String = sign.call((expired, "s3cret-key")).expect("sign");
+        let allow: Table = lua
+            .load(r#"{ algorithms = { "HS256" } }"#)
+            .eval()
+            .expect("opts");
+        let (claims, err): (Value, Option<String>) =
+            verify.call((token, "s3cret-key", allow)).expect("verify");
+        assert!(claims.is_nil());
+        assert_eq!(err.as_deref(), Some("token expired"));
+    }
+
+    #[test]
+    fn jwt_time_claims_honor_nbf_and_leeway() {
+        let lua = Lua::new();
+        let crypto = create_crypto_table(&lua).expect("crypto table");
+        let jwt: Table = crypto.get("jwt").expect("jwt");
+        let sign: mlua::Function = jwt.get("sign").expect("fn");
+        let verify: mlua::Function = jwt.get("verify").expect("fn");
+        let allow = |extra: &str| -> Table {
+            lua.load(format!(r#"{{ algorithms = {{ "HS256" }}{extra} }}"#))
+                .eval()
+                .expect("opts")
+        };
+
+        // Not valid yet…
+        let future_nbf: Table = lua
+            .load("{ sub = \"42\", nbf = 4000000000 }")
+            .eval()
+            .expect("claims");
+        let token: String = sign.call((future_nbf, "key")).expect("sign");
+        let (claims, err): (Value, Option<String>) = verify
+            .call((token.clone(), "key", allow("")))
+            .expect("verify");
+        assert!(claims.is_nil());
+        assert_eq!(err.as_deref(), Some("token not yet valid"));
+
+        // …unless the caller opts into enough leeway.
+        let (claims, err): (Value, Option<String>) = verify
+            .call((token, "key", allow(", leeway = 4000000000")))
+            .expect("verify");
+        assert!(err.is_none(), "got: {err:?}");
+        assert!(!claims.is_nil());
+
+        // Leeway also forgives a just-expired token.
+        let expired: Table = lua
+            .load("{ sub = \"42\", exp = 1000000 }")
+            .eval()
+            .expect("claims");
+        let token: String = sign.call((expired, "key")).expect("sign");
+        let (claims, err): (Value, Option<String>) = verify
+            .call((token, "key", allow(", leeway = 4000000000")))
+            .expect("verify");
+        assert!(err.is_none(), "got: {err:?}");
+        assert!(!claims.is_nil());
+    }
+
+    #[test]
+    fn jwt_survives_hostile_tokens_without_panicking() {
+        let lua = Lua::new();
+        let crypto = create_crypto_table(&lua).expect("crypto table");
+        let jwt: Table = crypto.get("jwt").expect("jwt");
+        let verify: mlua::Function = jwt.get("verify").expect("fn");
+        let allow: Table = lua
+            .load(r#"{ algorithms = { "HS256" } }"#)
+            .eval()
+            .expect("opts");
+
+        // The classic `alg: none` downgrade: a matching header with an
+        // empty signature must not verify.
+        let none_token = format!(
+            "{}.{}.",
+            B64URL.encode(r#"{"alg":"none","typ":"JWT"}"#),
+            B64URL.encode(r#"{"sub":"42"}"#)
+        );
+
+        for hostile in [
+            "".to_string(),
+            "a".to_string(),
+            "a.b".to_string(),
+            "a.b.c.d".to_string(),
+            "!!!.###.$$$".to_string(),
+            "e30.e30.e30".to_string(), // `{}` header: no alg at all
+            none_token,
+            format!("{}.x.y", B64URL.encode("[1,2]")), // non-object header
+            "\u{feff}garbage\u{0000}".to_string(),
+        ] {
+            let (claims, err): (Value, Option<String>) = verify
+                .call((hostile.clone(), "key", &allow))
+                .unwrap_or_else(|e| panic!("panicked on {hostile:?}: {e}"));
+            assert!(claims.is_nil(), "accepted {hostile:?}");
+            assert!(err.is_some(), "no reason for {hostile:?}");
+        }
+    }
+
+    #[test]
+    fn seal_handles_degenerate_inputs() {
+        let lua = Lua::new();
+        let crypto = create_crypto_table(&lua).expect("crypto table");
+        let seal: mlua::Function = crypto.get("seal").expect("fn");
+        let open: mlua::Function = crypto.get("open").expect("fn");
+        let key = "0123456789abcdef0123456789abcdef";
+
+        // Empty plaintext is legal and still authenticated.
+        let sealed: String = seal.call((key, "", Value::Nil)).expect("seal");
+        let opened: Option<String> = open.call((key, sealed, Value::Nil)).expect("open");
+        assert_eq!(opened.as_deref(), Some(""));
+
+        // Truncated/garbage boxes come back nil, never a panic: shorter
+        // than a nonce, valid base64 of nothing, raw garbage.
+        for garbage in ["", "AAAA", "!!!not-base64!!!"] {
+            let opened: Option<String> = open.call((key, garbage, Value::Nil)).expect("open");
+            assert_eq!(opened, None, "accepted {garbage:?}");
+        }
+
+        // Unicode plaintext and AAD round-trip byte-exactly.
+        let sealed: String = seal.call((key, "ñandú 🦤", "ctx-ñ")).expect("seal");
+        let opened: Option<String> = open.call((key, sealed, "ctx-ñ")).expect("open");
+        assert_eq!(opened.as_deref(), Some("ñandú 🦤"));
     }
 
     #[test]

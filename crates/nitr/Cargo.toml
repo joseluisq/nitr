@@ -79,6 +79,11 @@ name = "standards"
 path = "tests/standards.rs"
 required-features = ["compression", "multipart"]
 
+[[test]]
+name = "stdlib"
+path = "tests/stdlib.rs"
+required-features = ["crypto"]
+
 [[example]]
 name = "aggregate"
 path = "examples/aggregate/main.rs"

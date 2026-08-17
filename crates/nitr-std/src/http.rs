@@ -289,7 +289,7 @@ impl RequestCookies {
         )
     }
 
-    fn get(&self, name: &str) -> Option<&str> {
+    pub(crate) fn get(&self, name: &str) -> Option<&str> {
         self.0
             .iter()
             .find(|(n, _)| n == name)
@@ -369,10 +369,36 @@ impl UserData for ResponseCookies {
     }
 }
 
+/// Attaches a serialized `Set-Cookie` value to a handler response table:
+/// through its `cookies` builder when present (helper-built responses), or
+/// by creating one (hand-built plain tables), so the server's response
+/// conversion picks it up either way.
+pub(crate) fn attach_cookie(resp: &Table, cookie: String) -> mlua::Result<()> {
+    match resp.raw_get::<Value>("cookies")? {
+        Value::UserData(ud) => {
+            let cookies = ud.borrow::<ResponseCookies>().map_err(|_| {
+                mlua::Error::RuntimeError(
+                    "the response `cookies` field is not a cookie builder".into(),
+                )
+            })?;
+            cookies.push(cookie)
+        }
+        Value::Nil => {
+            let cookies = ResponseCookies::default();
+            cookies.push(cookie)?;
+            resp.set("cookies", cookies)
+        }
+        other => Err(mlua::Error::RuntimeError(format!(
+            "invalid `cookies` field of type `{}` in the response table",
+            other.type_name()
+        ))),
+    }
+}
+
 /// Serializes one cookie, applying the recognized options: `http_only`,
 /// `secure`, `path`, `domain`, `max_age` (seconds), `same_site`
 /// (`"Strict"` / `"Lax"` / `"None"`).
-fn build_cookie(name: &str, value: &str, opts: Option<&Table>) -> mlua::Result<String> {
+pub(crate) fn build_cookie(name: &str, value: &str, opts: Option<&Table>) -> mlua::Result<String> {
     let mut builder = cookie::Cookie::build((name.to_owned(), value.to_owned()));
     if let Some(opts) = opts {
         if opts.get::<Option<bool>>("http_only")?.unwrap_or(false) {
@@ -409,7 +435,7 @@ fn build_cookie(name: &str, value: &str, opts: Option<&Table>) -> mlua::Result<S
 /// Encodes and signs a cookie value: `b64(value) . b64(hmac)`, with the
 /// cookie name bound into the MAC so values cannot be swapped between
 /// cookies.
-fn sign(name: &str, value: &str, secret: &str) -> String {
+pub(crate) fn sign(name: &str, value: &str, secret: &str) -> String {
     let payload = B64.encode(value);
     format!(
         "{payload}.{}",
@@ -419,7 +445,7 @@ fn sign(name: &str, value: &str, secret: &str) -> String {
 
 /// Verifies a value produced by [`sign()`]; the MAC comparison is
 /// constant-time (`hmac::Mac::verify_slice`).
-fn verify(name: &str, signed: &str, secret: &str) -> Option<String> {
+pub(crate) fn verify(name: &str, signed: &str, secret: &str) -> Option<String> {
     let (payload, sig) = signed.rsplit_once('.')?;
     let sig = B64.decode(sig).ok()?;
     new_mac(name, payload, secret).verify_slice(&sig).ok()?;

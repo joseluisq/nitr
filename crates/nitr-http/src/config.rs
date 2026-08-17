@@ -89,10 +89,13 @@ pub struct Config {
 #[serde(default, deny_unknown_fields)]
 pub struct StdConfig {
     /// Enabled standard library features. Valid names: `"dbg"`, `"fetch"`,
-    /// `"template"`, `"json"`, `"db"`, `"http"`, `"log"`, `"crypto"`.
-    /// `None` enables the minimal default set (`json`, `http`, `log`); an
-    /// explicit list is strict — unknown names or a listed feature missing
-    /// its required setting (e.g. `db` without `database`) fail at startup.
+    /// `"template"`, `"json"`, `"db"`, `"http"`, `"log"`, `"crypto"`,
+    /// `"cache"`, `"time"`, `"validate"`, `"base64"`, `"path"`, `"url"`.
+    /// `None` enables the minimal default set (`json`, `http`, `log`,
+    /// `time`, `validate`, `base64`, `path`, `url`); an explicit list is
+    /// strict —
+    /// unknown names or a listed feature missing its required setting
+    /// (e.g. `db` without `database`) fail at startup.
     pub features: Option<Vec<String>>,
 }
 
@@ -692,8 +695,9 @@ impl Config {
     /// Resolves the configured `[std] features` list into [`Builtins`] flags.
     ///
     /// With no explicit list, the minimal default set
-    /// ([`Builtins::minimal()`]: `json`, `http`, `log`) is enabled to keep
-    /// the standard library lightweight. An explicit list is strict:
+    /// ([`Builtins::minimal()`]: `json`, `http`, `log`, `time`,
+    /// `validate`, `base64`, `path`, `url`) is enabled to keep the
+    /// standard library lightweight. An explicit list is strict:
     /// unknown names or a listed feature without its required setting fail
     /// here.
     pub fn builtins(&self) -> Result<Builtins> {

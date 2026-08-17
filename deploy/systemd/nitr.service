@@ -1,0 +1,61 @@
+# Reference systemd unit for a Nitr application.
+#
+# Install: copy next to your app (e.g. /srv/myapp with nitr.toml, app.lua),
+# adjust the paths below, then:
+#
+#   useradd --system --home /srv/myapp --shell /usr/sbin/nologin nitr
+#   cp nitr.service /etc/systemd/system/myapp.service
+#   systemctl daemon-reload && systemctl enable --now myapp
+#
+# The non-obvious parts are commented where they matter.
+
+[Unit]
+Description=Nitr application server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=nitr
+Group=nitr
+WorkingDirectory=/srv/myapp
+ExecStart=/usr/local/bin/nitr run
+# SIGHUP is Nitr's zero-downtime reload: the Lua runtime pool is rebuilt
+# (config script re-runs, handler recompiles) while live connections keep
+# being served. `systemctl reload myapp` maps to it.
+ExecReload=/bin/kill -HUP $MAINPID
+
+# SIGTERM starts Nitr's graceful drain: stop accepting, flip readiness,
+# let in-flight requests finish. TimeoutStopSec MUST exceed the configured
+# [shutdown] grace + stream_grace (default 30 + 5), or systemd SIGKILLs
+# the process mid-drain and cuts the very requests the drain protects.
+KillSignal=SIGTERM
+TimeoutStopSec=40
+
+# A truncated drain exits non-zero (a request was cut); restart on that
+# and on crashes, but not on a clean `systemctl stop`.
+Restart=on-failure
+RestartSec=2
+
+# Hardening. Nitr embeds a scripting language, so assume handler code can
+# be wrong (not hostile — the sandbox handles capabilities, but defense in
+# depth is cheap here):
+NoNewPrivileges=true
+# The whole filesystem read-only except the state directory: the SQLite
+# database (and its -wal/-shm) is the one thing Nitr legitimately writes.
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/myapp/data
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+# Nitr needs only sockets: TCP in, TCP out (fetch), and Unix for the OS.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

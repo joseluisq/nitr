@@ -15,10 +15,12 @@ use std::path::PathBuf;
 
 use nitr_core::Result;
 
+pub(crate) mod base64;
 pub mod cache;
 pub(crate) mod config;
 #[cfg(feature = "crypto")]
 pub(crate) mod crypto;
+pub(crate) mod csrf;
 #[cfg(feature = "db")]
 pub(crate) mod db;
 #[cfg(feature = "fetch")]
@@ -26,9 +28,14 @@ pub(crate) mod fetch;
 pub(crate) mod http;
 pub(crate) mod json;
 pub(crate) mod log;
+pub(crate) mod path;
+pub(crate) mod session;
 #[cfg(feature = "template")]
 pub(crate) mod template;
+pub(crate) mod time;
+pub(crate) mod url;
 pub(crate) mod utils;
+pub(crate) mod validate;
 
 pub use cache::{Cache, CacheOptions};
 // The configuration types are always available: `nitr.toml` has one shape
@@ -77,22 +84,48 @@ bitflags::bitflags! {
         const HTTP = 1 << 5;
         /// `nitr.log.debug/info/warn/error(msg, fields?)` structured logging.
         const LOG = 1 << 6;
-        /// `nitr.crypto` primitives (hashing, HMAC, passwords) and the
-        /// `nitr.auth` header parsers.
+        /// `nitr.crypto` primitives (hashing, HMAC, passwords, AEAD, JWT)
+        /// and the `nitr.auth` header parsers.
         const CRYPTO = 1 << 7;
         /// `nitr.cache`: the bounded cache shared by every pooled state.
         const CACHE = 1 << 8;
+        /// `nitr.time`: safe clocks and time formatting/parsing, so
+        /// scripts never need the `os` Lua standard library for a date.
+        const TIME = 1 << 9;
+        /// `nitr.validate`: declarative request validation, compiled once
+        /// and checked in Rust.
+        const VALIDATE = 1 << 10;
+        /// `nitr.base64`: base64 encoding/decoding (standard and
+        /// URL-safe alphabets).
+        const BASE64 = 1 << 11;
+        /// `nitr.path`: lexical `/`-path manipulation — pure text, no
+        /// filesystem access.
+        const PATH = 1 << 12;
+        /// `nitr.url`: percent-encoding, query strings, and a lexical
+        /// URL splitter.
+        const URL = 1 << 13;
     }
 }
 
 impl Builtins {
     /// The minimal default feature set enabled when the configuration has
     /// no explicit `[std] features` list: the JSON codec, the HTTP response
-    /// helpers, and structured logging. These need no external resources
-    /// (templates directory, database file, outbound network) and keep the
-    /// standard library lightweight; everything else is opt-in.
+    /// helpers, structured logging, safe time, and validation. These need
+    /// no external resources (templates directory, database file, outbound
+    /// network) and keep the standard library lightweight; everything else
+    /// is opt-in. `time` and `validate` are here because they replace the
+    /// dangerous alternatives (`os.date`, hand-rolled input checks) — a
+    /// default that omitted them would push scripts toward widening the
+    /// sandbox instead.
     pub const fn minimal() -> Self {
-        Self::JSON.union(Self::HTTP).union(Self::LOG)
+        Self::JSON
+            .union(Self::HTTP)
+            .union(Self::LOG)
+            .union(Self::TIME)
+            .union(Self::VALIDATE)
+            .union(Self::BASE64)
+            .union(Self::PATH)
+            .union(Self::URL)
     }
 
     /// The field name a builtin mounts under on the `nitr` namespace table.
@@ -107,6 +140,11 @@ impl Builtins {
             Builtins::JSON => Some("json"),
             Builtins::DATABASE => Some("db"),
             Builtins::LOG => Some("log"),
+            Builtins::TIME => Some("time"),
+            Builtins::VALIDATE => Some("validate"),
+            Builtins::BASE64 => Some("base64"),
+            Builtins::PATH => Some("path"),
+            Builtins::URL => Some("url"),
             _ => None,
         }
     }
@@ -124,6 +162,11 @@ impl Builtins {
             "log" => Some(Builtins::LOG),
             "crypto" => Some(Builtins::CRYPTO),
             "cache" => Some(Builtins::CACHE),
+            "time" => Some(Builtins::TIME),
+            "validate" => Some(Builtins::VALIDATE),
+            "base64" => Some(Builtins::BASE64),
+            "path" => Some(Builtins::PATH),
+            "url" => Some(Builtins::URL),
             _ => None,
         }
     }
@@ -197,10 +240,20 @@ pub fn register_builtins(lua: &mlua::Lua, builtins: Builtins, env: &BuiltinsEnv)
             Builtins::TEMPLATE => return Err(not_compiled_in("template")),
             Builtins::JSON => nitr.set("json", json::create_json_fn(lua)?)?,
             // Registers the response helpers (`nitr.text`, `nitr.html`,
-            // `nitr.redirect`, `nitr.status`, `nitr.negotiate`, `nitr.sse`)
-            // and `nitr.error`.
-            Builtins::HTTP => http::register(lua, &nitr)?,
+            // `nitr.redirect`, `nitr.status`, `nitr.negotiate`, `nitr.sse`),
+            // `nitr.error`, and the signed-cookie ergonomics built on them:
+            // `nitr.csrf` and `nitr.session`.
+            Builtins::HTTP => {
+                http::register(lua, &nitr)?;
+                nitr.set("csrf", csrf::create_csrf_table(lua)?)?;
+                nitr.set("session", session::create_session_fn(lua)?)?;
+            }
             Builtins::LOG => nitr.set("log", log::create_log_table(lua)?)?,
+            Builtins::TIME => nitr.set("time", time::create_time_table(lua)?)?,
+            Builtins::VALIDATE => nitr.set("validate", validate::create_validate_table(lua)?)?,
+            Builtins::BASE64 => nitr.set("base64", base64::create_base64_table(lua)?)?,
+            Builtins::PATH => nitr.set("path", path::create_path_table(lua)?)?,
+            Builtins::URL => nitr.set("url", url::create_url_table(lua)?)?,
             // Registers both `nitr.crypto` and `nitr.auth`.
             #[cfg(feature = "crypto")]
             Builtins::CRYPTO => {
@@ -250,6 +303,11 @@ mod tests {
             ("http", Builtins::HTTP),
             ("log", Builtins::LOG),
             ("crypto", Builtins::CRYPTO),
+            ("time", Builtins::TIME),
+            ("validate", Builtins::VALIDATE),
+            ("base64", Builtins::BASE64),
+            ("path", Builtins::PATH),
+            ("url", Builtins::URL),
         ] {
             assert_eq!(Builtins::from_config_name(name), Some(flag));
         }

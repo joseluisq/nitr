@@ -7,7 +7,7 @@ database = "/tmp/nitr-app-package.db"
 tests_dir = "crates/nitr/examples/app-package/tests"
 
 # Opt into the `db` standard library feature on top of the minimal
-# defaults (json, http, log).
+# defaults (json, http, log, time, validate, base64, path, url).
 [std]
 features = ["json", "http", "log", "db"]
 

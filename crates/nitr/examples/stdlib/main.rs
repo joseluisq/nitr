@@ -14,6 +14,12 @@
 //! curl 'http://127.0.0.1:3000/secure'                      # 401
 //! curl 'http://127.0.0.1:3000/secure' -H 'authorization: Bearer s3cret'
 //! curl 'http://127.0.0.1:3000/whoami' -u 'ada:lovelace'
+//! curl 'http://127.0.0.1:3000/now'
+//! curl -X POST 'http://127.0.0.1:3000/signup' -d '{"email":"ada@example.com"}'
+//! curl -X POST 'http://127.0.0.1:3000/jwt'
+//! curl -c /tmp/jar -X POST 'http://127.0.0.1:3000/login'
+//! curl -b /tmp/jar 'http://127.0.0.1:3000/profile'
+//! curl 'http://127.0.0.1:3000/utils'
 //! ```
 
 use nitr::{Builtins, Server};
@@ -36,7 +42,7 @@ async fn main() -> nitr::Result {
     Server::builder()
         .listen(([127, 0, 0, 1], port).into())
         .handler_script("crates/nitr/examples/stdlib/app.lua")
-        .builtins(Builtins::JSON | Builtins::HTTP | Builtins::LOG | Builtins::CRYPTO)
+        .builtins(Builtins::minimal() | Builtins::LOG | Builtins::CRYPTO)
         .build()
         .await?
         .serve()

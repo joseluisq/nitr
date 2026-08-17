@@ -87,6 +87,25 @@ fn write_temp_script(name: &str, content: &str) -> PathBuf {
 /// Binds port 0 (the OS picks a free port) and keeps the listener alive.
 /// The server adopts it via `.listener(...)`, so the port can never be
 /// taken by another test between choosing it and serving on it.
+/// Removes ANSI SGR sequences (`ESC [ … m`), leaving the visible text.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // Skip to the terminating `m` of the escape sequence.
+            for c in chars.by_ref() {
+                if c == 'm' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn reserve_addr() -> (std::net::TcpListener, SocketAddr) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind port 0");
     let addr = listener.local_addr().expect("local addr");
@@ -263,11 +282,19 @@ async fn errinfo_classifies_caught_errors() {
     let concat = out["concat"].as_str().expect("concat");
     assert!(concat.starts_with("prefix: lua:"), "got: {concat}");
     assert!(concat.contains("app.lua"), "got: {concat}");
-    // Off a terminal (as under the test harness), `pretty` is the plain
-    // concise form — no escape codes may leak into captured output.
+    // `pretty` is the concise form, ANSI-colored exactly when the server
+    // process writes to a terminal with NO_COLOR unset. The server runs in
+    // this test process, so compute the same gate here instead of assuming
+    // one environment: `cargo test` in an interactive terminal keeps the
+    // real stdout fd, so the gate is genuinely open there.
+    use std::io::IsTerminal as _;
+    let colored = std::io::stdout().is_terminal()
+        && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
     let pretty = out["pretty"].as_str().expect("pretty");
-    assert!(!pretty.contains('\u{1b}'), "got: {pretty:?}");
-    assert!(pretty.starts_with("lua:"), "got: {pretty}");
+    assert_eq!(pretty.contains('\u{1b}'), colored, "got: {pretty:?}");
+    let plain = strip_ansi(pretty);
+    assert!(plain.starts_with("lua:"), "got: {plain}");
+    assert!(plain.contains("app.lua"), "got: {plain}");
 
     h.stop().await;
 }

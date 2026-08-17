@@ -34,6 +34,12 @@ bitflags = "2.9"
 # Rust encoder is all the response compressor needs.
 brotli = { version = "8.0", default-features = false, features = ["std"] }
 bytes = "1.12"
+# `nitr.time` formats and parses timestamps with the strftime syntax
+# `os.date` users already know; without default features there is no
+# timezone database — UTC and fixed offsets only, by design.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+# XChaCha20-Poly1305 for `nitr.crypto.seal`/`open`.
+chacha20poly1305 = "0.10"
 cookie = "0.18"
 flate2 = "1.1"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }

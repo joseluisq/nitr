@@ -122,6 +122,10 @@ pub(crate) struct LuaRequest {
     /// dispatched. Carried on the request because the Lua-facing parsers
     /// need them and Lua must not be able to raise them.
     pub(crate) limits: FormLimits,
+    /// The parsed urlencoded form, kept after the first `req:form()` so a
+    /// middleware (e.g. `nitr.csrf`) and the handler can both read it —
+    /// the body itself can only be consumed once.
+    pub(crate) cached_form: Option<Vec<(String, String)>>,
 }
 
 /// Bounds applied while parsing a request body into Lua values.
@@ -301,16 +305,23 @@ impl UserData for LuaRequest {
         // exactly one careful implementation, not one per application.
         // Repeated keys keep the last value, matching `req.query`.
         methods.add_async_method_mut("form", |lua, mut req, ()| async move {
-            let body = req
-                .req
-                .body_mut()
-                .collect()
-                .await
-                .into_lua_err()?
-                .to_bytes();
+            if req.cached_form.is_none() {
+                let body = req
+                    .req
+                    .body_mut()
+                    .collect()
+                    .await
+                    .into_lua_err()?
+                    .to_bytes();
+                req.cached_form = Some(
+                    url::form_urlencoded::parse(&body)
+                        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                        .collect(),
+                );
+            }
             let table = lua.create_table()?;
-            for (k, v) in url::form_urlencoded::parse(&body) {
-                table.set(k.as_ref(), v.as_ref())?;
+            for (k, v) in req.cached_form.as_deref().unwrap_or_default() {
+                table.set(k.as_str(), v.as_str())?;
             }
             Ok(table)
         });

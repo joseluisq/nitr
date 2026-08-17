@@ -42,9 +42,9 @@ every builtin to be there.
 | `multipart` | `req:multipart(fn)` file uploads | `multer` |
 | `all` | every feature above | — |
 
-`json`, `http`, `log`, `cache` and `dbg` are always compiled in: they need
-nothing the server does not already depend on, so gating them would save
-nothing. Precompressed `.br`/`.gz` sidecars are also served without the
+`json`, `http`, `log`, `cache`, `dbg`, `time`, `validate`, `base64`,
+`path` and `url` are always compiled in: they need nothing the server does
+not already depend on, so gating them would save nothing. Precompressed `.br`/`.gz` sidecars are also served without the
 `compression` feature — serving an already-compressed file needs no encoder.
 
 ```sh
@@ -152,7 +152,7 @@ Every Nitr API is a field of the global `nitr` table; nothing else is registered
 
 ### Standard library
 
-The `nitr.*` standard library provides building blocks — enable the features you need via `[std] features` in `nitr.toml` (default: the minimal `json`, `http`, `log` set), or replace them with your own modules:
+The `nitr.*` standard library provides building blocks — enable the features you need via `[std] features` in `nitr.toml` (default: the minimal `json`, `http`, `log`, `time`, `validate`, `base64`, `path`, `url` set), or replace them with your own modules:
 
 | Module | Description |
 | --- | --- |
@@ -165,8 +165,16 @@ The `nitr.*` standard library provides building blocks — enable the features y
 | `nitr.db:transaction(fn)` | Atomic transaction (nestable via savepoints); rolls back on error. Use the `tx` handle inside the body — the outer `nitr.db` refuses to run while a transaction is open, rather than silently joining it |
 | `nitr.db:query_async(sql, params?, kind?)` | An unsent query, so `nitr.await_all` can run it alongside a `fetch` instead of in series |
 | `nitr.log.debug/info/warn/error(msg, fields?)` | Structured logging into the request span |
-| `nitr.crypto.*` | `sha256`, `hmac_sha256`, `random_bytes`, `constant_time_eq`, `password_hash`/`password_verify` (argon2id) |
+| `nitr.crypto.*` | `sha256`, `hmac_sha256`, `random_bytes`, `constant_time_eq`, `password_hash`/`password_verify` (argon2id), `seal`/`open` (XChaCha20-Poly1305 AEAD) |
+| `nitr.crypto.jwt.sign/verify` | HMAC JWTs; `verify` requires an explicit `algorithms` allow-list and checks `exp`/`nbf` by default |
 | `nitr.auth.basic(req)` / `nitr.auth.bearer(req)` | Parse `Authorization` credentials |
+| `nitr.time.*` | `now`, `monotonic`, strftime `format`/`parse` (UTC), `http`/`parse_http`, `iso8601` — so scripts never need the `os` Lua library for a date |
+| `nitr.validate.schema({...})` → `schema:check(v)` | Declarative validation compiled once, checked in Rust; per-field error map, undeclared fields stripped |
+| `nitr.csrf({ secret })` / `nitr.csrf.token(req)` | CSRF middleware (signed double-submit cookie, constant-time, unsafe methods only) |
+| `nitr.session(req, { secret })` | Stateless signed-cookie session: assign fields, `session:save(resp)`, `session:clear()` |
+| `nitr.base64.encode/decode` | Base64, standard and URL-safe (`{ url = true }`) alphabets |
+| `nitr.path.*` | Lexical path ops (`join`, `basename`, `dirname`, `extension`, `normalize`, `is_absolute`) for POSIX and Windows styles; no filesystem access |
+| `nitr.url.*` | `encode`/`decode` (percent-encoding), `query_parse`/`query_build`, lexical `parse` |
 | `nitr.dbg(value)` | Debug-print a Lua value to the log |
 
 ## Configuration
@@ -183,7 +191,8 @@ workers = 4                             # Lua states; default: CPU cores
 dev_mode = false                        # hot reload + error details
 
 [std]
-# `nitr.*` standard library features; default: ["json", "http", "log"]
+# `nitr.*` standard library features; default: ["json", "http", "log",
+# "time", "validate", "base64", "path", "url"]
 features = ["dbg", "fetch", "template", "json", "db", "http", "log", "crypto"]
 
 [lua]

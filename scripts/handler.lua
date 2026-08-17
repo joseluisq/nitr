@@ -28,7 +28,7 @@ app:get("/", function(req)
         ")")
 
     -- JSON codec: `nitr.json:decode` / `nitr.json:encode`.
-    local obj = nitr.json:decode('{"current_time":"' .. os.date("%d-%m-%YT%H:%M:%S") .. '"}')
+    local obj = nitr.json:decode('{"current_time":"' .. nitr.time.format(nitr.time.now(), "%d-%m-%YT%H:%M:%S") .. '"}')
     printf("[info] decoded current_time: %s", obj.current_time)
 
     -- Called as a function, `nitr.json(value)` builds the JSON response.
@@ -49,7 +49,7 @@ app:get("/hello/:name", function(req)
     -- Template rendering via minijinja (`templates_dir` in nitr.toml).
     local body = nitr.template:render("response.j2", {
         remote_addr = req.remote_addr,
-        datetime = os.date("%d-%m-%YT%H:%M:%S"),
+        datetime = nitr.time.format(nitr.time.now(), "%d-%m-%YT%H:%M:%S"),
     })
     return nitr.html(body)
 end)

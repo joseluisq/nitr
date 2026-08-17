@@ -169,20 +169,26 @@ dev_mode = true
 # to enable. The standard
 # library provides building blocks — opt into the features your scripts
 # need (or replace them with your own modules). When the list is omitted,
-# only a minimal set is enabled: "json", "http", "log". Valid names:
-# "dbg", "fetch", "template", "json", "db", "http", "log", "crypto",
-# "cache".
+# only a minimal set is enabled: "json", "http", "log", "time",
+# "validate", "base64", "path", "url". Valid names: "dbg", "fetch",
+# "template", "json", "db", "http", "log", "crypto", "cache", "time",
+# "validate", "base64", "path", "url".
 # Listing a feature is strict: a listed feature missing its configuration
 # (e.g. "db" without `database`) fails at startup.
 [std]
-features = ["dbg", "fetch", "template", "json", "db", "http", "log", "crypto", "cache"]
+features = [
+    "dbg", "fetch", "template", "json", "db", "http", "log", "crypto",
+    "cache", "time", "validate", "base64", "path", "url",
+]
 
 [lua]
 # Lua standard libraries loaded into every state.
 # Default: ["math", "table", "string", "utf8", "coroutine", "package"]
-# "io" and "os" give scripts ambient filesystem/process access and must be
-# opted into explicitly. The dev scripts use os.date, so "os" is added here.
-stdlib = ["math", "table", "string", "utf8", "coroutine", "package", "os"]
+# "io" and "os" give scripts ambient filesystem/process access and are
+# deliberately NOT enabled: `nitr.time` covers dates and clocks, so
+# nothing here needs `os.date` — and with it would come `os.execute`,
+# `os.remove` and `os.getenv`.
+stdlib = ["math", "table", "string", "utf8", "coroutine", "package"]
 
 # Per-state Lua memory limit in bytes. Default: 8388608 (8 MiB)
 #memory_limit = 8388608
