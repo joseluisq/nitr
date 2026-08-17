@@ -134,15 +134,40 @@ async fn disabled_health_passes_through_to_the_app() {
 /// no longer answers them, and the probe port answers nothing else.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn separate_bind_keeps_probes_off_the_public_port() {
-    // Reserve a port for the probes, then release it for the server to
-    // bind (a small race, but the port was just allocated to us).
-    let probe_addr = {
-        let (listener, addr) = reserve_addr();
-        drop(listener);
-        addr
+    // Reserving a port and releasing it for the server to rebind is a
+    // race: another test (or process) can take it in between. Retry with
+    // a fresh port instead of hoping — resilience beats a lucky draw.
+    let mut attempt = 0;
+    let (h, probe_addr) = loop {
+        attempt += 1;
+        let probe_addr = {
+            let (listener, addr) = reserve_addr();
+            drop(listener);
+            addr
+        };
+        let h = Harness::start(|cfg| cfg.health.bind = Some(probe_addr)).await;
+        // The probe listener comes up with the server; if something stole
+        // the port, the serve task has already failed — start over.
+        let mut listening = false;
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(probe_addr).await.is_ok() {
+                listening = true;
+                break;
+            }
+            if h.served.is_finished() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        if listening {
+            break (h, probe_addr);
+        }
+        h.stop().await;
+        assert!(
+            attempt < 5,
+            "no probe port could be bound in {attempt} attempts"
+        );
     };
-    let h = Harness::start(|cfg| cfg.health.bind = Some(probe_addr)).await;
-    wait_until_listening(probe_addr).await;
     let client = reqwest::Client::new();
 
     // Probes on the probe port; the app never answers there.

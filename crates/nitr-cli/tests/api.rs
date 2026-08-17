@@ -45,26 +45,58 @@ fn registered_paths(lua: &mlua::Lua) -> BTreeSet<String> {
     out
 }
 
+/// Every builtin this binary was compiled with. `Builtins::all()` would
+/// demand every Cargo feature: the completeness check must hold for
+/// whatever feature set is actually being tested.
+fn compiled_builtins() -> nitr::Builtins {
+    #[allow(unused_mut)]
+    let mut builtins = nitr::Builtins::minimal() | nitr::Builtins::DEBUG | nitr::Builtins::CACHE;
+    #[cfg(feature = "fetch")]
+    {
+        builtins |= nitr::Builtins::FETCH;
+    }
+    #[cfg(feature = "db")]
+    {
+        builtins |= nitr::Builtins::DATABASE;
+    }
+    #[cfg(feature = "template")]
+    {
+        builtins |= nitr::Builtins::TEMPLATE;
+    }
+    #[cfg(feature = "crypto")]
+    {
+        builtins |= nitr::Builtins::CRYPTO;
+    }
+    builtins
+}
+
 #[test]
 fn every_registered_entry_is_described() {
     let api = apidef::parse().expect("parse nitr-api.toml");
     let known = api.known_paths();
 
+    // Unique per process AND per thread-safe use: nothing here may collide
+    // with a concurrently running test binary.
+    let db = std::env::temp_dir().join(format!("nitr-api-test-{}.db", std::process::id()));
     let lua = mlua::Lua::new();
     let env = nitr::BuiltinsEnv {
         templates_dir: Some(std::env::temp_dir()),
-        database: Some(
-            std::env::temp_dir().join(format!("nitr-api-test-{}.db", std::process::id())),
-        ),
+        database: Some(db.clone()),
         ..Default::default()
     };
-    nitr::stdlib::register_builtins(&lua, nitr::Builtins::all(), &env)
-        .expect("register all builtins");
+    nitr::stdlib::register_builtins(&lua, compiled_builtins(), &env)
+        .expect("register compiled builtins");
 
     let missing: Vec<String> = registered_paths(&lua)
         .into_iter()
         .filter(|path| !known.contains(path))
         .collect();
+    // The state (and its SQLite connection) must close before the file is
+    // removed, or the delete races the WAL checkpoint.
+    drop(lua);
+    for suffix in ["", "-wal", "-shm"] {
+        std::fs::remove_file(std::path::Path::new(&format!("{}{suffix}", db.display()))).ok();
+    }
     assert!(
         missing.is_empty(),
         "registered but not described in nitr-api.toml (document them there): {missing:?}"
