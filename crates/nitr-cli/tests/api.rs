@@ -126,7 +126,13 @@ fn generated_files_are_current() {
     }
 
     for (path, expected) in &outputs {
-        let on_disk = std::fs::read_to_string(path).unwrap_or_default();
+        // A Windows checkout may carry `\r\n` (git autocrlf) while the
+        // generator emits `\n`: the comparison is about content, so line
+        // endings are normalized away. `.gitattributes` pins the files to
+        // LF, but a runner's existing checkout may predate that.
+        let on_disk = std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .replace("\r\n", "\n");
         assert_eq!(
             &on_disk,
             expected,
