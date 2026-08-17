@@ -8,6 +8,29 @@ fn nitr() -> Command {
     Command::new(env!("CARGO_BIN_EXE_nitr"))
 }
 
+/// Whether the compiled `nitr` binary can actually execute here. Under a
+/// cross-compiled test run (the CI's qemu matrix) the *test binary* is
+/// emulated, but a child process it spawns is a foreign ELF the host
+/// cannot exec — every end-to-end test would fail on the exec, not on
+/// anything it means to assert. Those tests skip instead.
+fn binary_runs() -> bool {
+    nitr()
+        .arg("-v")
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// Skips the calling test (with a note) when the binary cannot run.
+macro_rules! require_runnable_binary {
+    () => {
+        if !binary_runs() {
+            eprintln!("skipping: the target binary cannot execute on this host (cross-compiled)");
+            return;
+        }
+    };
+}
+
 /// A scratch application directory scaffolded by `nitr init`.
 fn scaffold(name: &str, minimal: bool) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("nitr-cli-{}-{name}", std::process::id()));
@@ -29,6 +52,7 @@ fn scaffold(name: &str, minimal: bool) -> PathBuf {
 
 #[test]
 fn version_flag_prints_the_crate_version() {
+    require_runnable_binary!();
     for flag in ["-v", "--version"] {
         let out = nitr().arg(flag).output().expect("run nitr");
         assert!(out.status.success());
@@ -43,6 +67,7 @@ fn version_flag_prints_the_crate_version() {
 
 #[test]
 fn check_print_config_shows_the_effective_layering() {
+    require_runnable_binary!();
     let dir = scaffold("print-config", true);
     let out = nitr()
         .current_dir(&dir)
@@ -71,6 +96,7 @@ fn check_print_config_shows_the_effective_layering() {
 #[cfg(all(feature = "db", feature = "template"))]
 #[test]
 fn build_produces_a_self_contained_artifact() {
+    require_runnable_binary!();
     // The full scaffold: config script, routes/, templates, migrations —
     // the richest thing a bundle must carry.
     let dir = scaffold("build", false);
@@ -147,6 +173,7 @@ fn build_produces_a_self_contained_artifact() {
 #[cfg(all(feature = "db", feature = "template"))]
 #[test]
 fn scaffolded_app_tests_pass_and_filter() {
+    require_runnable_binary!();
     let dir = scaffold("test-framework", false);
     let migrate = nitr()
         .current_dir(&dir)
@@ -207,6 +234,7 @@ fn scaffolded_app_tests_pass_and_filter() {
 #[cfg(unix)]
 #[test]
 fn pidfile_reload_and_cleanup() {
+    require_runnable_binary!();
     let dir = scaffold("pidfile", true);
     // Port 0 so parallel test runs cannot collide; the pidfile is the
     // contract under test, not the address.
