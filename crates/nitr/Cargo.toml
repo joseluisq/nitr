@@ -104,12 +104,33 @@ name = "stdlib"
 path = "examples/stdlib/main.rs"
 required-features = ["crypto", "fetch"]
 
+# Benchmarks. `harness = false` because divan brings its own runner instead
+# of libtest's. The builtins each target needs are compiled in
+# unconditionally, so no benchmark declares `required-features`: the
+# feature-gated groups inside `stdlib.rs` and `dispatch.rs` are `cfg`-ed
+# out instead, which keeps the rest measurable on a minimal build.
+[[bench]]
+name = "runtime"
+path = "benches/runtime.rs"
+harness = false
+
+[[bench]]
+name = "dispatch"
+path = "benches/dispatch.rs"
+harness = false
+
+[[bench]]
+name = "stdlib"
+path = "benches/stdlib.rs"
+harness = false
+
 [dependencies]
 nitr-core = { workspace = true }
 nitr-http = { workspace = true }
 nitr-std = { workspace = true }
 
 [dev-dependencies]
+divan = { workspace = true }
 flate2 = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }

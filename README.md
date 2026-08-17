@@ -1,4 +1,4 @@
-# Nitr [![devel](https://github.com/joseluisq/nitr/actions/workflows/devel.yml/badge.svg)](https://github.com/joseluisq/nitr/actions/workflows/devel.yml)
+# Nitr [![devel](https://github.com/joseluisq/nitr/actions/workflows/devel.yml/badge.svg)](https://github.com/joseluisq/nitr/actions/workflows/devel.yml) [![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/joseluisq/nitr?utm_source=badge)
 
 > A Rust web server embedding [Lua](https://www.lua.org/) for fast, efficient and safe smaller dynamic backends.
 
@@ -236,6 +236,23 @@ For lower-level embedding, `nitr::Runtime` exposes the Lua state, `register_modu
 ## Documentation
 
 Design documents live in [docs/](docs/): [architecture](docs/architecture.md), [crate API](docs/crate-api.md), [configuration](docs/configuration.md), [security model](docs/security.md), [performance](docs/performance.md), and the [roadmap](docs/roadmap.md).
+
+## Benchmarks
+
+Benchmarks live in [crates/nitr/benches](crates/nitr/benches) and are written with [divan](https://github.com/nvzqz/divan), through the CodSpeed compatibility layer. Three targets, all dispatching through the same in-process client `nitr test` uses:
+
+| Target | What it measures |
+| --- | --- |
+| `runtime` | Sandboxed state creation, script compilation, one call into Lua, server startup |
+| `dispatch` | Route matching, path parameters, middleware, 404/405, JSON in and out, response compression |
+| `stdlib` | The `nitr.*` builtins: json, base64, url, path, time, validate, cache, cookies, crypto, template, db |
+
+```sh
+cargo bench --features all                  # locally, wall-clock
+cargo bench --features all --bench dispatch # one target
+```
+
+Every push and pull request runs them on [CodSpeed](https://app.codspeed.io/joseluisq/nitr) under CPU simulation, so a regression shows up as a diff on the pull request instead of as a surprise in production.
 
 ## Name origins
 

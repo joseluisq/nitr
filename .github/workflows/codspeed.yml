@@ -1,0 +1,57 @@
+name: codspeed
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - .github/workflows/codspeed.yml
+      - .cargo/config.toml
+      - Cargo.lock
+      - Cargo.toml
+      - crates/**
+  pull_request:
+    paths:
+      - .github/workflows/codspeed.yml
+      - .cargo/config.toml
+      - Cargo.lock
+      - Cargo.toml
+      - crates/**
+  merge_group:
+    branches:
+      - master
+  # Lets CodSpeed trigger a backtest run to seed the initial baseline.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # OpenID Connect authentication with CodSpeed: no upload token to store.
+  id-token: write
+
+jobs:
+  benchmarks:
+    name: Benchmarks
+    runs-on: ubuntu-24.04
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+
+    - name: Install stable toolchain and cargo-codspeed
+      uses: moonrepo/setup-rust@v1
+      with:
+        channel: stable
+        cache-target: release
+        bins: cargo-codspeed
+
+    # `--features all` turns on every optional builtin, so the
+    # feature-gated benchmark groups (crypto, template, db, compression)
+    # are measured too.
+    - name: Build the benchmark targets
+      run: cargo codspeed build --features all
+
+    - name: Run the benchmarks
+      uses: CodSpeedHQ/action@v5
+      with:
+        mode: simulation
+        run: cargo codspeed run

@@ -43,6 +43,11 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 # XChaCha20-Poly1305 for `nitr.crypto.seal`/`open`.
 chacha20poly1305 = "0.10"
 cookie = "0.18"
+# Benchmark harness. `codspeed-divan-compat` is a drop-in replacement for
+# `divan`: the same API, plus the instrumentation CodSpeed needs in CI. It
+# falls back to plain divan when run outside a CodSpeed runner, so
+# `cargo bench` keeps working locally.
+divan = { package = "codspeed-divan-compat", version = "5.0" }
 flate2 = "1.1"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 getrandom = "0.2"
