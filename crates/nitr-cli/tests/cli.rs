@@ -9,15 +9,16 @@ fn nitr() -> Command {
 }
 
 /// A scratch application directory scaffolded by `nitr init`.
-fn scaffold(name: &str) -> PathBuf {
+fn scaffold(name: &str, minimal: bool) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("nitr-cli-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create scratch dir");
-    let out = nitr()
-        .arg("init")
-        .arg(&dir)
-        .output()
-        .expect("run nitr init");
+    let mut cmd = nitr();
+    cmd.arg("init").arg(&dir);
+    if minimal {
+        cmd.arg("--minimal");
+    }
+    let out = cmd.output().expect("run nitr init");
     assert!(
         out.status.success(),
         "init failed: {}",
@@ -42,7 +43,7 @@ fn version_flag_prints_the_crate_version() {
 
 #[test]
 fn check_print_config_shows_the_effective_layering() {
-    let dir = scaffold("print-config");
+    let dir = scaffold("print-config", true);
     let out = nitr()
         .current_dir(&dir)
         .env("NITR_WORKERS", "3")
@@ -67,7 +68,9 @@ fn check_print_config_shows_the_effective_layering() {
 
 #[test]
 fn build_produces_a_self_contained_artifact() {
-    let dir = scaffold("build");
+    // The full scaffold: config script, routes/, templates, migrations —
+    // the richest thing a bundle must carry.
+    let dir = scaffold("build", false);
     let artifact = dir.join("myapp");
     let out = nitr()
         .current_dir(&dir)
@@ -89,9 +92,21 @@ fn build_produces_a_self_contained_artifact() {
     assert!(bundled > base, "artifact {bundled} <= binary {base}");
 
     // The artifact validates its own embedded application from an empty
-    // working directory — no dependency on the build layout.
+    // working directory — no dependency on the build layout. Mutable
+    // state stays external: the database directory and schema are the
+    // deployment's to provide, via the artifact's own `migrate`.
     let empty = dir.join("elsewhere");
-    std::fs::create_dir_all(&empty).expect("mkdir");
+    std::fs::create_dir_all(empty.join("data")).expect("mkdir");
+    let out = Command::new(&artifact)
+        .current_dir(&empty)
+        .arg("migrate")
+        .output()
+        .expect("run the artifact's migrate");
+    assert!(
+        out.status.success(),
+        "bundled migrate failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let out = Command::new(&artifact)
         .current_dir(&empty)
         .arg("check")
@@ -124,10 +139,71 @@ fn build_produces_a_self_contained_artifact() {
 
 /// `nitr run` writes the configured pidfile, `nitr reload` signals through
 /// it, and a graceful exit removes it.
+/// The full scaffold's own test suite passes under the framework, and
+/// `--filter` narrows the run.
+#[test]
+fn scaffolded_app_tests_pass_and_filter() {
+    let dir = scaffold("test-framework", false);
+    let migrate = nitr()
+        .current_dir(&dir)
+        .arg("migrate")
+        .output()
+        .expect("run migrate");
+    assert!(
+        migrate.status.success(),
+        "migrate failed: {}",
+        String::from_utf8_lossy(&migrate.stderr)
+    );
+
+    let out = nitr()
+        .current_dir(&dir)
+        .arg("test")
+        .output()
+        .expect("run tests");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "tests failed: {stdout}");
+    assert!(
+        stdout.contains("ok   notes API > creates a note"),
+        "got: {stdout}"
+    );
+    assert!(stdout.contains("3 passed, 0 failed"), "got: {stdout}");
+
+    let out = nitr()
+        .current_dir(&dir)
+        .args(["test", "--filter", "rejects"])
+        .output()
+        .expect("run filtered");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "filtered run failed: {stdout}");
+    assert!(
+        stdout.contains("1 passed, 0 failed, 2 filtered out"),
+        "got: {stdout}"
+    );
+
+    // A failing assertion names the expectation and the file:line.
+    std::fs::write(
+        dir.join("tests/failing_test.lua"),
+        "local t = nitr.test\nt.it(\"fails loudly\", function()\n    t.expect(1 + 1).to_equal(3)\nend)\n",
+    )
+    .expect("write failing test");
+    let out = nitr()
+        .current_dir(&dir)
+        .args(["test", "--filter", "loudly"])
+        .output()
+        .expect("run failing");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success());
+    assert!(stdout.contains("FAIL fails loudly"), "got: {stdout}");
+    assert!(stdout.contains("expected 2 to equal 3"), "got: {stdout}");
+    assert!(stdout.contains("failing_test.lua:3"), "got: {stdout}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[cfg(unix)]
 #[test]
 fn pidfile_reload_and_cleanup() {
-    let dir = scaffold("pidfile");
+    let dir = scaffold("pidfile", true);
     // Port 0 so parallel test runs cannot collide; the pidfile is the
     // contract under test, not the address.
     std::fs::write(

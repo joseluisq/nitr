@@ -167,12 +167,11 @@ async fn handle_inner(
             .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
         return Ok(resp);
     };
+    // Dev-mode hot reload happens in the serve loop (a notify watcher
+    // driving the pool rebuild), not here: the request path stays free of
+    // per-request stat calls, and a save is noticed when it happens rather
+    // than by the next request.
     let dev_mode = rt.dev_mode();
-
-    if dev_mode && let Err(err) = app::reload_if_changed(&rt, protection.base_statics()) {
-        tracing::error!("failed to reload the HTTP handler: {err}");
-        return error_response(&err, dev_mode);
-    }
 
     // A state serves one request at a time, so "this request" is
     // unambiguous: the outbound budget starts fresh here, and outbound

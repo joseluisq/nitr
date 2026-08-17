@@ -229,6 +229,14 @@ impl Server {
                 Err(err) => tracing::warn!("failed to install the SIGHUP reload handler: {err}"),
             }
         }
+        // Dev mode: a notify-based watcher feeds the same reload channel a
+        // SIGHUP does, so a save rebuilds the pool immediately instead of
+        // being discovered by the next request.
+        let _watcher = self
+            .cfg
+            .dev_mode
+            .then(|| crate::watch::spawn(&self.cfg, reload_tx.clone()))
+            .flatten();
         let _reload_tx = reload_tx;
 
         // The listener's own address, not `cfg.listen`: with a pre-bound

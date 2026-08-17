@@ -24,7 +24,9 @@ Nitr is both a **binary** (`nitr`, configured via `nitr.toml`) and a **library c
 - **Easy configuration:** `nitr.toml` configuration with `NITR_*` environment overrides and CLI flags; unknown keys, contradictions, and missing paths refuse to start, and `nitr check --print-config` prints the effective result of the layering.
 - **Operable:** Rust-owned `/healthz` + `/readyz` probes (readiness flips before a drain can fail a request, optionally on a separate port), JSON log output (`[log] format = "json"`), pidfile + `nitr reload` for scripted zero-downtime reloads, and reference [systemd/Docker deployments](deploy/).
 - **One-file deploys:** `nitr build --output myapp` appends the whole application (config, Lua, templates, static files, migrations) to the binary — copy one executable; the database stays external.
-- **Dev mode (`--dev`)**: handler hot reload and error details in responses.
+- **Dev mode (`--dev`)**: instant hot reload (a `notify` watcher rebuilds on save — scripts, `routes/`, templates) and error details in responses.
+- **Editor completion for everything:** `nitr init` writes generated LuaCATS type definitions (`nitr-types.lua`) covering the whole `nitr.*` surface — completion, signatures and inline docs in any editor with the Lua Language Server. Generated from the same [single API description](docs/nitr-api.md) as the reference docs; a test fails if an undocumented builtin ships.
+- **A test framework worth using:** `nitr.test` gives `describe`/`it`/`expect` matchers, `before_each`/`after_each`, `t.request(..., { json = ... })` and `resp:json()`, `nitr test --filter <name>` — failures name the assertion, both values, and the file:line. Requests dispatch through the real router, middleware included.
 - **Extensible:** `ServerBuilder::module("name", ...)` mounts a Rust table at `nitr.name` in every Lua state, third-party extension crates need no fork.
 
 ## Cargo features

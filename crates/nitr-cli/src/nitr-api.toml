@@ -1,0 +1,588 @@
+# The single source of truth for the `nitr.*` API surface.
+#
+# Everything generated — the LuaCATS type definitions (`nitr-types.lua`)
+# and the reference page (`docs/nitr-api.md`) — comes from this file, and a
+# test walks the registered namespace to assert every entry is described
+# here: adding a builtin without documenting it fails the build.
+#
+# Schema:
+#   [[table]]  a namespace table (or userdata) mounted on `nitr`;
+#              `call` makes it callable. `feature` is the `[std]` name
+#              gating it ("" = always registered).
+#   [[fn]]     a function; a `:` in the name declares a method on the
+#              parent table or class. A trailing `?` on a param type marks
+#              it optional.
+#   [[class]]  a value type (request, response, handles) with fields;
+#              its methods are `[[fn]]` entries named `Class:method`.
+
+# ---------------------------------------------------------------- classes
+
+[[class]]
+name = "nitr.Request"
+desc = "The incoming request, passed to every handler and middleware."
+fields = [
+  { name = "method", type = "string", desc = "Request method, uppercase (`\"GET\"`)." },
+  { name = "path", type = "string", desc = "URI path (`\"/users/42\"`)." },
+  { name = "params", type = "table<string, string>", desc = "Path parameters captured by the router (`:id` → `params.id`)." },
+  { name = "query", type = "table<string, string>", desc = "Parsed query string; repeated keys keep the last value." },
+  { name = "headers", type = "table<string, string>", desc = "Request headers, lowercase names." },
+  { name = "id", type = "string", desc = "The request id (UUIDv7, echoed as `X-Request-ID`)." },
+  { name = "remote_addr", type = "string", desc = "Peer address (`\"ip:port\"`)." },
+  { name = "uri", type = "table", desc = "URI components: `scheme`, `host`, `port`, `path`, `authority`, `query`." },
+  { name = "cookies", type = "nitr.RequestCookies", desc = "Parsed request cookies." },
+]
+
+[[fn]]
+name = "nitr.Request:json"
+desc = "Reads and decodes the body as JSON. Errors on an empty or invalid body."
+returns = [{ type = "table" }]
+
+[[fn]]
+name = "nitr.Request:text"
+desc = "Reads the whole body as a string."
+returns = [{ type = "string" }]
+
+[[fn]]
+name = "nitr.Request:form"
+desc = "Reads an `application/x-www-form-urlencoded` body as a table. The parse is cached, so middleware and handler can both call it."
+returns = [{ type = "table<string, string>" }]
+
+[[fn]]
+name = "nitr.Request:multipart"
+feature = "http"
+desc = "Invokes `fn(part)` once per part of a `multipart/form-data` body, in arrival order; returns the part count. (Needs the `multipart` Cargo feature.)"
+params = [{ name = "fn", type = "fun(part: nitr.Part)" }]
+returns = [{ type = "integer", desc = "Number of parts seen." }]
+
+[[fn]]
+name = "nitr.Request:read"
+desc = "Streams the body: the next chunk as it arrives, or at least `n` bytes. `nil` marks the end."
+params = [{ name = "n", type = "integer?", desc = "Minimum bytes to gather." }]
+returns = [{ type = "string|nil" }]
+
+[[fn]]
+name = "nitr.Request:accepts"
+desc = "The best match among the given media types for the `Accept` header, or nil."
+params = [{ name = "...", type = "string", desc = "Offered media types." }]
+returns = [{ type = "string|nil" }]
+
+[[fn]]
+name = "nitr.Request:fresh"
+desc = "Whether the client's cached copy is current, per `If-None-Match`/`If-Modified-Since`."
+params = [
+  { name = "etag", type = "string?", desc = "Entity tag of the current representation." },
+  { name = "last_modified", type = "integer?", desc = "Unix seconds of the last change." },
+]
+returns = [{ type = "boolean" }]
+
+[[class]]
+name = "nitr.RequestCookies"
+desc = "Cookies from the `Cookie` header: index by name (`req.cookies.session`)."
+
+[[fn]]
+name = "nitr.RequestCookies:verify"
+desc = "The verified value of a signed cookie, or nil when missing or tampered."
+params = [
+  { name = "name", type = "string" },
+  { name = "secret", type = "string" },
+]
+returns = [{ type = "string|nil" }]
+
+[[class]]
+name = "nitr.Response"
+desc = "A response: `{ status, headers, body }` plus a cookie builder. Helpers build these; handlers may also build them by hand."
+fields = [
+  { name = "status", type = "integer", desc = "HTTP status code." },
+  { name = "headers", type = "table<string, string>", desc = "Response headers." },
+  { name = "body", type = "string|fun(...)|nil", desc = "Body string, or a streaming body function." },
+  { name = "cookies", type = "nitr.ResponseCookies", desc = "Set-Cookie builder (attached by the helpers)." },
+]
+
+[[class]]
+name = "nitr.ResponseCookies"
+desc = "Builder for `Set-Cookie` headers on a response."
+
+[[fn]]
+name = "nitr.ResponseCookies:set"
+desc = "Adds a cookie. Options: `http_only`, `secure`, `path`, `domain`, `max_age` (seconds), `same_site` (\"Strict\"/\"Lax\"/\"None\")."
+params = [
+  { name = "name", type = "string" },
+  { name = "value", type = "string" },
+  { name = "opts", type = "table?" },
+]
+
+[[fn]]
+name = "nitr.ResponseCookies:set_signed"
+desc = "Adds an HMAC-signed cookie, verifiable later with `req.cookies:verify`."
+params = [
+  { name = "name", type = "string" },
+  { name = "value", type = "string" },
+  { name = "secret", type = "string" },
+  { name = "opts", type = "table?" },
+]
+
+[[class]]
+name = "nitr.App"
+desc = "The application: routes, middleware, error handling, static mounts. Return it from the handler script."
+
+[[fn]]
+name = "nitr.App:get"
+desc = "Registers a GET route: `middleware..., handler` plus an optional trailing `{ on_error = fn }`. Paths take `:name` parameters and a trailing `*` catch-all."
+params = [
+  { name = "path", type = "string" },
+  { name = "...", type = "fun(req: nitr.Request): nitr.Response|table" },
+]
+
+[[fn]]
+name = "nitr.App:post"
+desc = "Registers a POST route (see `get`)."
+params = [
+  { name = "path", type = "string" },
+  { name = "...", type = "fun(req: nitr.Request): nitr.Response|table" },
+]
+
+[[fn]]
+name = "nitr.App:put"
+desc = "Registers a PUT route (see `get`)."
+params = [
+  { name = "path", type = "string" },
+  { name = "...", type = "fun(req: nitr.Request): nitr.Response|table" },
+]
+
+[[fn]]
+name = "nitr.App:delete"
+desc = "Registers a DELETE route (see `get`)."
+params = [
+  { name = "path", type = "string" },
+  { name = "...", type = "fun(req: nitr.Request): nitr.Response|table" },
+]
+
+[[fn]]
+name = "nitr.App:patch"
+desc = "Registers a PATCH route (see `get`)."
+params = [
+  { name = "path", type = "string" },
+  { name = "...", type = "fun(req: nitr.Request): nitr.Response|table" },
+]
+
+[[fn]]
+name = "nitr.App:head"
+desc = "Registers a HEAD route (see `get`). Without one, HEAD reuses the GET route with the body stripped."
+params = [
+  { name = "path", type = "string" },
+  { name = "...", type = "fun(req: nitr.Request): nitr.Response|table" },
+]
+
+[[fn]]
+name = "nitr.App:options"
+desc = "Registers an OPTIONS route (see `get`). Without one, OPTIONS answers 204 with `Allow`."
+params = [
+  { name = "path", type = "string" },
+  { name = "...", type = "fun(req: nitr.Request): nitr.Response|table" },
+]
+
+[[fn]]
+name = "nitr.App:use"
+desc = "Adds app-wide middleware: a factory `fn(next) -> fn(req)`. Must be called before any route."
+params = [{ name = "mw", type = "fun(next: fun): fun(req: nitr.Request): any" }]
+
+[[fn]]
+name = "nitr.App:on_error"
+desc = "Sets the app-wide error handler: `fn(err, req)` where `err` is the structured error (`kind`, `message`, `source`, `line`, `traceback`, ...)."
+params = [{ name = "handler", type = "fun(err: table, req: nitr.Request): nitr.Response|table" }]
+
+[[fn]]
+name = "nitr.App:static"
+desc = "Mounts a static directory, served in Rust. Options: `{ spa = boolean, cache_control = string }`."
+params = [
+  { name = "mount", type = "string" },
+  { name = "dir", type = "string" },
+  { name = "opts", type = "table?" },
+]
+
+[[class]]
+name = "nitr.Part"
+desc = "One part of a multipart upload, delivered to the `req:multipart` callback."
+fields = [
+  { name = "name", type = "string|nil", desc = "Form field name." },
+  { name = "filename", type = "string|nil", desc = "Client-supplied file name." },
+  { name = "content_type", type = "string|nil", desc = "Part content type." },
+]
+
+[[fn]]
+name = "nitr.Part:text"
+desc = "Reads a non-file field as a string (bounded by `[limits] max_field_bytes`)."
+returns = [{ type = "string" }]
+
+[[fn]]
+name = "nitr.Part:save"
+desc = "Streams a file part to `path` without entering the Lua heap; returns the bytes written."
+params = [{ name = "path", type = "string" }]
+returns = [{ type = "integer" }]
+
+[[fn]]
+name = "nitr.Part:discard"
+desc = "Drains and drops the part."
+
+[[class]]
+name = "nitr.FetchHandle"
+desc = "An unsent outbound request from `nitr.fetch`; send it, or hand it to `nitr.await_all`."
+
+[[fn]]
+name = "nitr.FetchHandle:send"
+desc = "Performs the request."
+returns = [{ type = "nitr.FetchResponse" }]
+
+[[class]]
+name = "nitr.FetchResponse"
+desc = "An outbound response."
+fields = [
+  { name = "status", type = "integer", desc = "HTTP status code." },
+  { name = "headers", type = "table<string, string>", desc = "Response headers." },
+  { name = "url", type = "string", desc = "Final URL after redirects." },
+]
+
+[[fn]]
+name = "nitr.FetchResponse:text"
+desc = "The body as a string (bounded by `[fetch] max_response_bytes`)."
+returns = [{ type = "string" }]
+
+[[fn]]
+name = "nitr.FetchResponse:json"
+desc = "The body decoded as JSON."
+returns = [{ type = "table" }]
+
+[[fn]]
+name = "nitr.FetchResponse:read"
+desc = "Streams the body chunk by chunk; `nil` at the end."
+returns = [{ type = "string|nil" }]
+
+[[class]]
+name = "nitr.Schema"
+desc = "A compiled validation schema from `nitr.validate.schema`."
+
+[[fn]]
+name = "nitr.Schema:check"
+desc = "Validates a value. Returns the data (declared fields only) or nil plus `{ message, fields }` mapping each failing path to its message."
+params = [{ name = "value", type = "any" }]
+returns = [
+  { type = "table|nil", desc = "Validated data." },
+  { type = "table|nil", desc = "The error, when validation failed." },
+]
+
+[[class]]
+name = "nitr.Session"
+desc = "A stateless signed-cookie session from `nitr.session`. Assign fields directly (`session.user_id = 42`)."
+
+[[fn]]
+name = "nitr.Session:save"
+desc = "Serializes the session into a signed cookie on the response. An empty session deletes the cookie."
+params = [{ name = "resp", type = "nitr.Response|table" }]
+
+[[fn]]
+name = "nitr.Session:clear"
+desc = "Removes every field; `save` then writes the deletion cookie."
+
+[[class]]
+name = "nitr.Tx"
+desc = "A database transaction handle inside `nitr.db:transaction`; same query API as `nitr.db`, plus nesting via savepoints."
+
+# ---------------------------------------------------------- response helpers
+
+[[fn]]
+name = "nitr.json"
+feature = "json"
+desc = "As a function: a JSON response (`nitr.json({ ok = true })`). Also the codec: `nitr.json:encode(v)` / `nitr.json:decode(s)`."
+params = [
+  { name = "value", type = "any" },
+  { name = "status", type = "integer?", desc = "Status code (default 200)." },
+]
+returns = [{ type = "nitr.Response" }]
+methods = [
+  { name = "encode", params = [{ name = "value", type = "any" }], returns = [{ type = "string" }], desc = "Encodes a value as JSON." },
+  { name = "decode", params = [{ name = "s", type = "string" }], returns = [{ type = "any" }], desc = "Decodes JSON; errors on invalid input." },
+]
+
+[[fn]]
+name = "nitr.text"
+feature = "http"
+desc = "A `text/plain` response."
+params = [
+  { name = "body", type = "string" },
+  { name = "status", type = "integer?" },
+]
+returns = [{ type = "nitr.Response" }]
+
+[[fn]]
+name = "nitr.html"
+feature = "http"
+desc = "A `text/html` response."
+params = [
+  { name = "body", type = "string" },
+  { name = "status", type = "integer?" },
+]
+returns = [{ type = "nitr.Response" }]
+
+[[fn]]
+name = "nitr.redirect"
+feature = "http"
+desc = "A redirect (default 302)."
+params = [
+  { name = "location", type = "string" },
+  { name = "status", type = "integer?" },
+]
+returns = [{ type = "nitr.Response" }]
+
+[[fn]]
+name = "nitr.status"
+feature = "http"
+desc = "An empty response with the given status."
+params = [{ name = "code", type = "integer" }]
+returns = [{ type = "nitr.Response" }]
+
+[[fn]]
+name = "nitr.negotiate"
+feature = "http"
+desc = "Picks the offer whose media type best matches the `Accept` header; function values are called with the request. No match answers 406."
+params = [
+  { name = "req", type = "nitr.Request" },
+  { name = "offers", type = "table<string, any>" },
+]
+returns = [{ type = "any" }]
+
+[[fn]]
+name = "nitr.sse"
+feature = "http"
+desc = "A Server-Sent Events stream: `fn(send)` calls `send(event, data)`; table data is JSON-encoded."
+params = [{ name = "fn", type = "fun(send: fun(event: string, data: any))" }]
+returns = [{ type = "nitr.Response" }]
+
+[[fn]]
+name = "nitr.error"
+feature = "http"
+desc = "An error response: string body as text, table body as JSON."
+params = [
+  { name = "code", type = "integer" },
+  { name = "body", type = "string|table|nil" },
+]
+returns = [{ type = "nitr.Response" }]
+
+[[fn]]
+name = "nitr.etag"
+feature = "http"
+desc = "A well-formed entity tag for whatever identifies the resource (a row version, an updated_at), to pair with `req:fresh`."
+params = [
+  { name = "value", type = "any" },
+  { name = "weak", type = "boolean?" },
+]
+returns = [{ type = "string" }]
+
+[[fn]]
+name = "nitr.csrf"
+feature = "http"
+desc = "As a function: the CSRF middleware factory for `app:use` (signed double-submit cookie; unsafe methods must echo the token in `X-CSRF-Token` or a `_csrf` field). Options: `secret` (required), `cookie`, `header`, `field`, `cookie_opts`."
+params = [{ name = "opts", type = "table" }]
+returns = [{ type = "fun" }]
+methods = [
+  { name = "token", dot = true, params = [{ name = "req", type = "nitr.Request" }], returns = [{ type = "string" }], desc = "The request's token, for a form or meta tag. Requires the middleware." },
+]
+
+[[fn]]
+name = "nitr.session"
+feature = "http"
+desc = "Loads (or starts) the stateless signed-cookie session. Options: `secret` (required), `name`, `max_age`, `cookie`."
+params = [
+  { name = "req", type = "nitr.Request" },
+  { name = "opts", type = "table" },
+]
+returns = [{ type = "nitr.Session" }]
+
+# ------------------------------------------------------------------ modules
+
+[[fn]]
+name = "nitr.app"
+desc = "Creates the application object the handler script must return."
+returns = [{ type = "nitr.App" }]
+
+[[fn]]
+name = "nitr.errinfo"
+desc = "Classifies a pcall-caught error into its structured form: `kind`, `message`, `source`, `line`, `traceback`, `cause`, `pretty`."
+params = [{ name = "caught", type = "any" }]
+returns = [{ type = "table" }]
+
+[[fn]]
+name = "nitr.dbg"
+feature = "dbg"
+desc = "Debug-prints a value (structure included) to the log; returns it unchanged."
+params = [{ name = "value", type = "any" }]
+returns = [{ type = "any" }]
+
+[[fn]]
+name = "nitr.fetch"
+feature = "fetch"
+desc = "An outbound HTTP request (SSRF-guarded, redirect-checked). Options: `headers`, `query`, `json`, `body`, `timeout`, `retry`. Returns an unsent handle."
+params = [
+  { name = "method", type = "string" },
+  { name = "url", type = "string" },
+  { name = "opts", type = "table?" },
+]
+returns = [{ type = "nitr.FetchHandle" }]
+
+[[fn]]
+name = "nitr.await_all"
+feature = "fetch"
+desc = "Runs fetch handles (and `db:query_async` handles) concurrently; returns their results in order."
+params = [{ name = "handles", type = "table" }]
+returns = [{ type = "table" }]
+
+[[table]]
+name = "nitr.template"
+feature = "template"
+desc = "The minijinja template engine, loading from `templates_dir`."
+methods = [
+  { name = "render", params = [{ name = "name", type = "string" }, { name = "data", type = "table?" }], returns = [{ type = "string" }], desc = "Renders a template." },
+]
+
+[[table]]
+name = "nitr.db"
+feature = "db"
+desc = "The SQLite database (`database` in nitr.toml): WAL, busy timeout, foreign keys on."
+methods = [
+  { name = "execute", params = [{ name = "sql", type = "string" }, { name = "params", type = "table?" }], returns = [{ type = "integer", desc = "Affected row count." }], desc = "Runs a statement." },
+  { name = "query", params = [{ name = "sql", type = "string" }, { name = "params", type = "table?" }], returns = [{ type = "table[]" }], desc = "All rows, each a column→value table." },
+  { name = "query_row", params = [{ name = "sql", type = "string" }, { name = "params", type = "table?" }], returns = [{ type = "table|nil" }], desc = "The first row, or nil." },
+  { name = "query_one", params = [{ name = "sql", type = "string" }, { name = "params", type = "table?" }], returns = [{ type = "any" }], desc = "The first column of the first row." },
+  { name = "transaction", params = [{ name = "fn", type = "fun(tx: nitr.Tx): any" }], returns = [{ type = "any" }], desc = "Runs `fn` atomically; rolls back on error. Nestable (savepoints). Use `tx`, not the outer `nitr.db`." },
+  { name = "query_async", params = [{ name = "sql", type = "string" }, { name = "params", type = "table?" }, { name = "kind", type = "string?" }], returns = [{ type = "table", desc = "A pending handle for `nitr.await_all`." }], desc = "An unsent query to run alongside fetches." },
+]
+
+[[table]]
+name = "nitr.log"
+feature = "log"
+desc = "Structured logging into the request span. Fields become real keys in JSON log output."
+functions = [
+  { name = "debug", params = [{ name = "msg", type = "string" }, { name = "fields", type = "table?" }], desc = "Debug-level record." },
+  { name = "info", params = [{ name = "msg", type = "string" }, { name = "fields", type = "table?" }], desc = "Info-level record." },
+  { name = "warn", params = [{ name = "msg", type = "string" }, { name = "fields", type = "table?" }], desc = "Warn-level record." },
+  { name = "error", params = [{ name = "msg", type = "string" }, { name = "fields", type = "table?" }], desc = "Error-level record." },
+]
+
+[[table]]
+name = "nitr.crypto"
+feature = "crypto"
+desc = "Crypto primitives (RustCrypto): compose them; never reimplement them in Lua."
+functions = [
+  { name = "sha256", params = [{ name = "data", type = "string" }], returns = [{ type = "string" }], desc = "SHA-256 digest, lowercase hex." },
+  { name = "hmac_sha256", params = [{ name = "key", type = "string" }, { name = "data", type = "string" }], returns = [{ type = "string" }], desc = "HMAC-SHA256, lowercase hex." },
+  { name = "random_bytes", params = [{ name = "n", type = "integer" }], returns = [{ type = "string" }], desc = "N random bytes from the OS (1..=65536)." },
+  { name = "constant_time_eq", params = [{ name = "a", type = "string" }, { name = "b", type = "string" }], returns = [{ type = "boolean" }], desc = "Timing-safe comparison — what `==` on secrets is not." },
+  { name = "password_hash", params = [{ name = "password", type = "string" }], returns = [{ type = "string" }], desc = "argon2id hash for storage." },
+  { name = "password_verify", params = [{ name = "password", type = "string" }, { name = "hash", type = "string" }], returns = [{ type = "boolean" }], desc = "Verifies a password against a stored hash." },
+  { name = "seal", params = [{ name = "key", type = "string", desc = "Exactly 32 bytes." }, { name = "plaintext", type = "string" }, { name = "aad", type = "string?" }], returns = [{ type = "string" }], desc = "Authenticated encryption (XChaCha20-Poly1305); printable token." },
+  { name = "open", params = [{ name = "key", type = "string" }, { name = "sealed", type = "string" }, { name = "aad", type = "string?" }], returns = [{ type = "string|nil" }], desc = "Opens a sealed token; nil on any tampering." },
+]
+
+[[table]]
+name = "nitr.crypto.jwt"
+feature = "crypto"
+desc = "HMAC JWTs (HS256/384/512). Verification demands an explicit algorithm allow-list; `exp`/`nbf` are checked by default."
+functions = [
+  { name = "sign", params = [{ name = "claims", type = "table" }, { name = "key", type = "string" }, { name = "opts", type = "table?", desc = "`{ alg = \"HS256\" }`" }], returns = [{ type = "string" }], desc = "Signs a token." },
+  { name = "verify", params = [{ name = "token", type = "string" }, { name = "key", type = "string" }, { name = "opts", type = "table", desc = "`{ algorithms = {...}, leeway? }` — the allow-list is required." }], returns = [{ type = "table|nil", desc = "The claims." }, { type = "string|nil", desc = "The rejection reason." }], desc = "Verifies a token." },
+]
+
+[[table]]
+name = "nitr.auth"
+feature = "crypto"
+desc = "`Authorization` header parsing."
+functions = [
+  { name = "basic", params = [{ name = "req", type = "nitr.Request|string" }], returns = [{ type = "string|nil", desc = "User." }, { type = "string|nil", desc = "Password." }], desc = "Basic credentials, or nil." },
+  { name = "bearer", params = [{ name = "req", type = "nitr.Request|string" }], returns = [{ type = "string|nil" }], desc = "The bearer token, or nil." },
+]
+
+[[table]]
+name = "nitr.cache"
+feature = "cache"
+desc = "The bounded TTL+LRU cache shared by every state. Entries are plain data; per-process, so not a session store."
+methods = [
+  { name = "get", params = [{ name = "key", type = "string" }], returns = [{ type = "any" }], desc = "The cached value, or nil." },
+  { name = "set", params = [{ name = "key", type = "string" }, { name = "value", type = "any" }, { name = "ttl", type = "integer?" }], desc = "Stores a value (ttl in seconds)." },
+  { name = "delete", params = [{ name = "key", type = "string" }], desc = "Removes a key." },
+  { name = "clear", desc = "Empties the cache." },
+  { name = "remember", params = [{ name = "key", type = "string" }, { name = "ttl", type = "integer|nil" }, { name = "fn", type = "fun(): any" }], returns = [{ type = "any" }], desc = "The cached value, or `fn()`'s result, stored and returned." },
+  { name = "stats", returns = [{ type = "table" }], desc = "Hit/miss/entry counters." },
+]
+
+[[table]]
+name = "nitr.time"
+feature = "time"
+desc = "Safe clocks and time formatting (UTC), so scripts never need the `os` library for a date."
+functions = [
+  { name = "now", returns = [{ type = "integer" }], desc = "Unix seconds." },
+  { name = "monotonic", returns = [{ type = "number" }], desc = "Monotonic seconds (sub-second precision), for measuring durations." },
+  { name = "format", params = [{ name = "ts", type = "integer" }, { name = "fmt", type = "string?", desc = "strftime; default ISO-like." }], returns = [{ type = "string" }], desc = "Formats a timestamp in UTC." },
+  { name = "parse", params = [{ name = "value", type = "string" }, { name = "fmt", type = "string" }], returns = [{ type = "integer|nil" }, { type = "string|nil", desc = "Reason when nil." }], desc = "Parses per a strftime format (UTC unless the input carries an offset)." },
+  { name = "http", params = [{ name = "ts", type = "integer" }], returns = [{ type = "string" }], desc = "IMF-fixdate (`Tue, 15 Nov 1994 08:12:31 GMT`)." },
+  { name = "parse_http", params = [{ name = "value", type = "string" }], returns = [{ type = "integer|nil" }], desc = "Parses the three HTTP date forms." },
+  { name = "iso8601", params = [{ name = "ts", type = "integer" }], returns = [{ type = "string" }], desc = "RFC 3339 in UTC (`1994-11-15T08:12:31Z`)." },
+]
+
+[[table]]
+name = "nitr.validate"
+feature = "validate"
+desc = "Declarative validation, compiled once and checked in Rust."
+functions = [
+  { name = "schema", params = [{ name = "fields", type = "table", desc = "`{ name = { type = ..., ... } }` rules; unknown rule keys fail at load." }], returns = [{ type = "nitr.Schema" }], desc = "Compiles a schema." },
+]
+
+[[table]]
+name = "nitr.base64"
+feature = "base64"
+desc = "Base64 encoding and decoding."
+functions = [
+  { name = "encode", params = [{ name = "data", type = "string" }, { name = "opts", type = "table?", desc = "`{ url = true }` for the URL-safe alphabet." }], returns = [{ type = "string" }], desc = "Encodes bytes." },
+  { name = "decode", params = [{ name = "value", type = "string" }, { name = "opts", type = "table?" }], returns = [{ type = "string|nil" }, { type = "string|nil", desc = "Reason when nil." }], desc = "Decodes; forgiving about padding, never about the alphabet." },
+]
+
+[[table]]
+name = "nitr.path"
+feature = "path"
+desc = "Lexical path manipulation (POSIX and Windows styles). Pure text: nothing touches the filesystem."
+functions = [
+  { name = "join", params = [{ name = "...", type = "string" }], returns = [{ type = "string" }], desc = "Joins segments; a later absolute segment never discards the base." },
+  { name = "basename", params = [{ name = "path", type = "string" }], returns = [{ type = "string" }], desc = "The final component." },
+  { name = "dirname", params = [{ name = "path", type = "string" }], returns = [{ type = "string" }], desc = "The directory part." },
+  { name = "extension", params = [{ name = "path", type = "string" }], returns = [{ type = "string|nil" }], desc = "The extension without the dot; nil for none (dotfiles included)." },
+  { name = "normalize", params = [{ name = "path", type = "string" }], returns = [{ type = "string" }], desc = "Resolves `.`/`..` lexically; `..` cannot climb out of the root." },
+  { name = "is_absolute", params = [{ name = "path", type = "string" }], returns = [{ type = "boolean" }], desc = "Whether the path is absolute (`/x`, `C:\\x`, UNC)." },
+]
+
+[[table]]
+name = "nitr.url"
+feature = "url"
+desc = "Percent-encoding, query strings, and a lexical URL splitter."
+functions = [
+  { name = "encode", params = [{ name = "value", type = "string" }], returns = [{ type = "string" }], desc = "Percent-encodes a component (like `encodeURIComponent`)." },
+  { name = "decode", params = [{ name = "value", type = "string" }], returns = [{ type = "string" }], desc = "Percent-decodes (`+` is left alone — that is a form convention)." },
+  { name = "query_parse", params = [{ name = "query", type = "string" }], returns = [{ type = "table<string, string>" }], desc = "Parses a query string (`+` as space; last duplicate wins)." },
+  { name = "query_build", params = [{ name = "params", type = "table" }], returns = [{ type = "string" }], desc = "Builds a query string, keys sorted." },
+  { name = "parse", params = [{ name = "value", type = "string" }], returns = [{ type = "table|nil", desc = "`{ scheme?, userinfo?, host?, port?, path, query?, fragment? }`" }, { type = "string|nil", desc = "Reason when nil." }], desc = "Splits a URL lexically (not a WHATWG parser)." },
+]
+
+[[table]]
+name = "nitr.test"
+feature = "test"
+desc = "The `nitr test` framework: available in test files only."
+functions = [
+  { name = "request", params = [{ name = "method", type = "string" }, { name = "path", type = "string" }, { name = "opts", type = "table?", desc = "`{ headers?, body?, json? }`." }], returns = [{ type = "table", desc = "`{ status, headers, body }` plus `:json()`." }], desc = "Dispatches through the real router/middleware/handler path." },
+  { name = "describe", params = [{ name = "name", type = "string" }, { name = "fn", type = "fun()" }], desc = "Groups tests; names are prefixed." },
+  { name = "it", params = [{ name = "name", type = "string" }, { name = "fn", type = "fun()" }], desc = "One test case." },
+  { name = "expect", params = [{ name = "actual", type = "any" }], returns = [{ type = "table", desc = "Matchers: `to_equal`, `to_not_equal`, `to_be_nil`, `to_be_truthy`, `to_match`, `to_contain`." }], desc = "Starts an assertion." },
+  { name = "before_each", params = [{ name = "fn", type = "fun()" }], desc = "Runs before every test in the file." },
+  { name = "after_each", params = [{ name = "fn", type = "fun()" }], desc = "Runs after every test in the file (even failing ones)." },
+]
+
+[[table]]
+name = "nitr.cfg"
+feature = "cfg"
+desc = "The configuration snapshot returned by `config.lua` (nil without one)."

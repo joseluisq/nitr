@@ -21,6 +21,7 @@ pub(crate) mod request;
 pub(crate) mod server;
 pub(crate) mod static_files;
 pub(crate) mod stream;
+pub(crate) mod watch;
 
 pub mod testing;
 

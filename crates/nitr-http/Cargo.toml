@@ -60,6 +60,7 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 matchit = { workspace = true }
 mime_guess = { workspace = true }
+notify = { workspace = true }
 mlua = { workspace = true }
 percent-encoding = { workspace = true }
 serde = { workspace = true }

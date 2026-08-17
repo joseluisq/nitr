@@ -5,8 +5,10 @@ use clap::{Parser, Subcommand};
 
 use nitr::{BuiltinsEnv, Config, Runtime, Server};
 
+mod apidef;
 mod bundle;
 mod diag;
+mod scaffold;
 
 const DEFAULT_CONFIG_FILE: &str = "nitr.toml";
 
@@ -46,7 +48,11 @@ enum Command {
         print_config: bool,
     },
     /// Run the Lua tests against an in-process server.
-    Test,
+    Test {
+        /// Run only tests whose name (or file name) contains this string.
+        #[arg(long, value_name = "SUBSTRING")]
+        filter: Option<String>,
+    },
     /// Apply pending SQL migrations from migrations/.
     Migrate {
         /// Report what has run and what is pending, applying nothing.
@@ -57,6 +63,10 @@ enum Command {
     Init {
         /// Directory to scaffold into (default: the current directory).
         dir: Option<PathBuf>,
+        /// Only the bare minimum: nitr.toml, app.lua, a static page, one
+        /// test — instead of the full documented layout.
+        #[arg(long)]
+        minimal: bool,
     },
     /// Package the application and this binary into one runnable file.
     Build {
@@ -190,9 +200,9 @@ async fn run_main() -> anyhow::Result<()> {
 
     // `init` runs before any configuration exists; everything else loads
     // the configuration first so `[log]` can shape the subscriber.
-    if let Some(Command::Init { dir }) = &cli.command {
+    if let Some(Command::Init { dir, minimal }) = &cli.command {
         init_logging(None, cli.dev);
-        return init(dir.as_deref().unwrap_or(Path::new(".")));
+        return scaffold::init(dir.as_deref().unwrap_or(Path::new(".")), *minimal);
     }
 
     let cfg = match load_config(&cli) {
@@ -225,8 +235,8 @@ async fn run_main() -> anyhow::Result<()> {
             }
             check(cfg).await?;
         }
-        Command::Test => {
-            let failures = run_tests(cfg).await?;
+        Command::Test { filter } => {
+            let failures = run_tests(cfg, filter.as_deref()).await?;
             if failures > 0 {
                 std::process::exit(1);
             }
@@ -341,7 +351,37 @@ async fn check(cfg: Config) -> anyhow::Result<()> {
 /// server: each file gets a fresh sandboxed state with the configured
 /// builtins plus a `test` global whose `test.request(method, path, opts?)`
 /// dispatches through the real router/middleware/handler path.
-async fn run_tests(cfg: Config) -> anyhow::Result<usize> {
+/// The Lua test framework (`t.describe`/`t.it`/`t.expect`/hooks), loaded
+/// into each test state before its file runs.
+const TEST_FRAMEWORK: &str = include_str!("test_framework.lua");
+
+/// One `t.it(...)` outcome, read back from the state after the file ran.
+struct TestOutcome {
+    name: String,
+    ok: bool,
+    skipped: bool,
+    err: Option<String>,
+}
+
+/// Reads `nitr.test._results` from a finished test state.
+fn collect_outcomes(lua: &mlua::Lua) -> anyhow::Result<Vec<TestOutcome>> {
+    let results: mlua::Table = nitr::nitr_table(lua)?
+        .get::<mlua::Table>("test")?
+        .get("_results")?;
+    let mut out = Vec::new();
+    for entry in results.sequence_values::<mlua::Table>() {
+        let entry = entry?;
+        out.push(TestOutcome {
+            name: entry.get("name")?,
+            ok: entry.get::<Option<bool>>("ok")?.unwrap_or(false),
+            skipped: entry.get::<Option<bool>>("skipped")?.unwrap_or(false),
+            err: entry.get("err")?,
+        });
+    }
+    Ok(out)
+}
+
+async fn run_tests(cfg: Config, filter: Option<&str>) -> anyhow::Result<usize> {
     let tests_dir = cfg
         .tests_dir
         .clone()
@@ -375,7 +415,7 @@ async fn run_tests(cfg: Config) -> anyhow::Result<usize> {
     let server = Server::builder().config(cfg).build().await?;
     let client = server.test_client();
 
-    let mut failures = 0usize;
+    let (mut passed, mut failed, mut skipped) = (0usize, 0usize, 0usize);
     for file in &files {
         // A fresh state per file: tests are isolated from each other but
         // share the server (and its database) like real requests do.
@@ -387,31 +427,89 @@ async fn run_tests(cfg: Config) -> anyhow::Result<usize> {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| file.display().to_string());
+
+        // The framework rides on `nitr.test`, with the runner's filter and
+        // the file name injected before it loads.
+        let test_table: mlua::Table = nitr::nitr_table(rt.lua())?.get("test")?;
+        test_table.set("_filter", filter.unwrap_or_default())?;
+        test_table.set("_file", name.as_str())?;
+        rt.lua()
+            .load(TEST_FRAMEWORK)
+            .set_name("@nitr-test-framework")
+            .exec()
+            .context("cannot load the test framework")?;
+
         let source = std::fs::read(file)
             .with_context(|| format!("cannot read test file {}", file.display()))?;
-        let chunk = match rt.lua().load(source).into_function() {
+        // Named after the real file, so assertion failures point at it.
+        let chunk = match rt
+            .lua()
+            .load(source)
+            .set_name(format!("@{}", file.display()))
+            .into_function()
+        {
             Ok(chunk) => chunk,
             Err(err) => {
-                failures += 1;
+                failed += 1;
                 println!("FAIL {name}\n     {err}");
                 continue;
             }
         };
-        match rt.call_function::<mlua::Value>(chunk, ()).await {
-            Ok(_) => println!("PASS {name}"),
-            Err(err) => {
-                failures += 1;
-                println!("FAIL {name}\n     {err}");
+        let file_err = rt.call_function::<mlua::Value>(chunk, ()).await.err();
+
+        let outcomes = collect_outcomes(rt.lua())?;
+        if outcomes.is_empty() {
+            // The pre-framework style: a bare script of asserts. It passes
+            // by running to completion.
+            match file_err {
+                None => {
+                    passed += 1;
+                    println!("PASS {name}");
+                }
+                Some(err) => {
+                    failed += 1;
+                    println!("FAIL {name}\n     {err}");
+                }
+            }
+            continue;
+        }
+        println!("{name}");
+        for outcome in outcomes {
+            if outcome.skipped {
+                skipped += 1;
+                continue;
+            }
+            if outcome.ok {
+                passed += 1;
+                println!("  ok   {}", outcome.name);
+            } else {
+                failed += 1;
+                println!("  FAIL {}", outcome.name);
+                if let Some(err) = outcome.err {
+                    for line in err.lines() {
+                        println!("       {line}");
+                    }
+                }
             }
         }
+        // A file that also failed outside any `it` (e.g. in `describe`
+        // setup) is its own failure, on top of whatever tests recorded.
+        if let Some(err) = file_err {
+            failed += 1;
+            println!("  FAIL {name} (outside any test)\n     {err}");
+        }
     }
-    println!(
-        "\n{} passed, {} failed ({} file(s))",
-        files.len() - failures,
-        failures,
-        files.len()
-    );
-    Ok(failures)
+    match skipped {
+        0 => println!(
+            "\n{passed} passed, {failed} failed ({} file(s))",
+            files.len()
+        ),
+        _ => println!(
+            "\n{passed} passed, {failed} failed, {skipped} filtered out ({} file(s))",
+            files.len()
+        ),
+    }
+    Ok(failed)
 }
 
 /// `RuntimeOpts` is not `Clone`; rebuild an equivalent one.
@@ -449,6 +547,19 @@ fn register_test_global(lua: &mlua::Lua, client: nitr::testing::TestClient) -> a
                         if let Some(raw) = opts.get::<Option<mlua::LuaString>>("body")? {
                             body = Some(bytes::Bytes::copy_from_slice(&raw.as_bytes()));
                         }
+                        // `json = <value>` encodes the body and sets the
+                        // content type, so tests stop hand-encoding both.
+                        let json = opts.get::<mlua::Value>("json")?;
+                        if !json.is_nil() {
+                            let encoded = serde_json::to_vec(&json).into_lua_err()?;
+                            body = Some(bytes::Bytes::from(encoded));
+                            if !headers
+                                .iter()
+                                .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                            {
+                                headers.push(("content-type".into(), "application/json".into()));
+                            }
+                        }
                     }
                     let resp = client
                         .request(&method, &path, &headers, body)
@@ -463,6 +574,19 @@ fn register_test_global(lua: &mlua::Lua, client: nitr::testing::TestClient) -> a
                     }
                     table.set("headers", header_table)?;
                     table.set("body", lua.create_string(&resp.body)?)?;
+                    // resp:json() — the decoded body, so a test reads
+                    // `resp:json().name` instead of decoding by hand.
+                    table.set(
+                        "json",
+                        lua.create_function(|lua, this: mlua::Table| {
+                            let body: mlua::LuaString = this.get("body")?;
+                            let value =
+                                serde_json::from_slice::<serde_json::Value>(&body.as_bytes())
+                                    .into_lua_err()?;
+                            use mlua::LuaSerdeExt as _;
+                            lua.to_value(&value)
+                        })?,
+                    )?;
                     Ok(table)
                 }
             },
@@ -471,77 +595,3 @@ fn register_test_global(lua: &mlua::Lua, client: nitr::testing::TestClient) -> a
     nitr::nitr_table(lua)?.set("test", test)?;
     Ok(())
 }
-
-/// Scaffolds a minimal Nitr application; refuses to overwrite anything.
-fn init(dir: &Path) -> anyhow::Result<()> {
-    let files: &[(&str, &str)] = &[
-        ("nitr.toml", INIT_NITR_TOML),
-        ("app.lua", INIT_APP_LUA),
-        ("public/index.html", INIT_INDEX_HTML),
-        ("tests/app_test.lua", INIT_TEST_LUA),
-    ];
-    for (rel, _) in files {
-        if dir.join(rel).exists() {
-            bail!("refusing to overwrite existing {}", dir.join(rel).display());
-        }
-    }
-    for (rel, content) in files {
-        let path = dir.join(rel);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&path, content)?;
-        println!("created {}", path.display());
-    }
-    println!("\nNext steps:\n  nitr check\n  nitr test\n  nitr dev");
-    Ok(())
-}
-
-const INIT_NITR_TOML: &str = r#"# Nitr application configuration.
-listen = "127.0.0.1:3000"
-handler_script = "app.lua"
-
-# Static files are served from this directory, before Lua runs.
-[static]
-dir = "public"
-mount = "/"
-"#;
-
-const INIT_APP_LUA: &str = r#"local app = nitr.app()
-
-app:use(function(next)
-    return function(req)
-        nitr.log.info("request", { path = req.path })
-        return next(req)
-    end
-end)
-
-app:get("/api/hello", function(req)
-    return nitr.json({ hello = req.query.name or "world" })
-end)
-
-app:on_error(function(err, req)
-    -- err is structured: err.kind ("lua"|"nitr"|"module"|"timeout"|"memory"|"panic"),
-    -- err.message, err.source, err.line, err.module, err.traceback, err.cause.
-    nitr.log.error("handler failed", {
-        error = err.message, kind = err.kind, source = err.source, line = err.line,
-    })
-    return nitr.error(500, { code = "INTERNAL" })
-end)
-
-return app
-"#;
-
-const INIT_INDEX_HTML: &str = r#"<!doctype html>
-<h1>Hello from Nitr</h1>
-<p>Edit <code>public/index.html</code> and <code>app.lua</code>.</p>
-"#;
-
-const INIT_TEST_LUA: &str = r#"-- Run with: nitr test
-local resp = nitr.test.request("GET", "/api/hello?name=nitr")
-assert(resp.status == 200, "expected 200, got " .. resp.status)
-assert(nitr.json:decode(resp.body).hello == "nitr", "unexpected body: " .. resp.body)
-
-local resp = nitr.test.request("GET", "/")
-assert(resp.status == 200, "static index should be served")
-"#;

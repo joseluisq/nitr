@@ -36,9 +36,6 @@ pub(crate) struct Protection {
     cors: Option<crate::cors::Cors>,
     /// The compiled `[compression]` policy.
     compression: crate::compress::Compression,
-    /// Static mounts from the `[static]` configuration, appended to the
-    /// script's own mounts on every (re)load.
-    base_statics: Vec<crate::static_files::StaticMount>,
 }
 
 impl Protection {
@@ -62,7 +59,6 @@ impl Protection {
             },
             cors: crate::cors::Cors::new(&cfg.cors),
             compression: crate::compress::Compression::new(&cfg.compression),
-            base_statics: crate::static_files::base_mounts(cfg),
         }
     }
 
@@ -79,11 +75,6 @@ impl Protection {
     /// Body-parsing bounds handed to each request.
     pub(crate) fn form_limits(&self) -> crate::request::FormLimits {
         self.form
-    }
-
-    /// The `[static]` mounts merged into every state's dispatch table.
-    pub(crate) fn base_statics(&self) -> &[crate::static_files::StaticMount] {
-        &self.base_statics
     }
 
     /// Whether error responses may carry internal detail.

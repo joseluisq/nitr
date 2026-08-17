@@ -8,7 +8,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::SystemTime;
 
 use hyper::Method;
 use matchit::Router;
@@ -219,7 +218,6 @@ pub(crate) struct AppState {
     /// server-level `[static]` configuration.
     pub(crate) statics: Arc<Vec<crate::static_files::StaticMount>>,
     script: PathBuf,
-    mtime: Option<SystemTime>,
 }
 
 impl UserData for AppState {}
@@ -243,7 +241,6 @@ pub(crate) fn load(
     script: &Path,
     base_statics: &[crate::static_files::StaticMount],
 ) -> Result<()> {
-    let mtime = modified(script);
     let value = rt.eval_script(script)?;
     let (dispatch, mut statics) = compile(value, script)?;
     statics.extend_from_slice(base_statics);
@@ -251,7 +248,6 @@ pub(crate) fn load(
         dispatch,
         statics: Arc::new(statics),
         script: script.to_path_buf(),
-        mtime,
     })?;
     rt.lua().set_named_registry_value(APP_STATE_KEY, state)?;
     Ok(())
@@ -261,28 +257,6 @@ pub(crate) fn load(
 pub(crate) fn state(lua: &Lua) -> Result<AnyUserData> {
     lua.named_registry_value::<AnyUserData>(APP_STATE_KEY)
         .map_err(|_| Error::Script("no HTTP handler has been loaded".into()))
-}
-
-/// Dev mode: re-evaluates the handler script when its mtime changed since
-/// the last load, replacing this state's dispatch table.
-pub(crate) fn reload_if_changed(
-    rt: &Runtime,
-    base_statics: &[crate::static_files::StaticMount],
-) -> Result<()> {
-    let ud = state(rt.lua())?;
-    let (script, last) = {
-        let st = ud.borrow::<AppState>()?;
-        (st.script.clone(), st.mtime)
-    };
-    if modified(&script) != last {
-        tracing::debug!("reloading handler script {}", script.display());
-        load(rt, &script, base_statics)?;
-    }
-    Ok(())
-}
-
-fn modified(path: &Path) -> Option<SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
 /// Compiles the script's return value into a [`Dispatch`]: middleware

@@ -12,7 +12,7 @@ documentation = "https://docs.rs/nitr-cli"
 readme = "../../README.md"
 categories = ["web-programming::http-server", "command-line-utilities"]
 keywords = ["dynamic-web-server", "http-server", "lua-server"]
-include = ["src/**/*.rs", "Cargo.toml", "LICENSE-APACHE", "LICENSE-MIT"]
+include = ["src/**/*.rs", "src/**/*.lua", "Cargo.toml", "LICENSE-APACHE", "LICENSE-MIT"]
 publish = true
 
 [[bin]]
@@ -29,7 +29,9 @@ rustdoc-args = ["--cfg", "docsrs"]
 # whichever features are wanted) produces a smaller server.
 [features]
 default = ["all"]
-all = ["nitr/all"]
+# The CLI's own feature names must come on too: `nitr migrate` is gated on
+# *this* crate's `db` feature, not the library's.
+all = ["compression", "crypto", "db", "fetch", "multipart", "template"]
 
 compression = ["nitr/compression"]
 crypto = ["nitr/crypto"]
@@ -45,6 +47,9 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 bytes = { workspace = true }
 mlua = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
 tar = { workspace = true }
 tokio = { workspace = true }
 tracing-subscriber = { workspace = true }

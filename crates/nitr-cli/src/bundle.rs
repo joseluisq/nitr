@@ -99,6 +99,14 @@ pub fn load() -> anyhow::Result<Option<Config>> {
 
     let mut cfg = Config::from_file(&root.join(CONFIG_NAME))?;
     cfg.rebase(&root);
+    // Default migrations discovery looks for `migrations/` in the working
+    // directory; in a bundle they were extracted next to the config.
+    if let Some(db) = &mut cfg.database
+        && db.migrations_dir.is_none()
+        && root.join("migrations").is_dir()
+    {
+        db.migrations_dir = Some(root.join("migrations"));
+    }
     if cfg.dev_mode {
         // stderr, not tracing: this runs while the configuration is being
         // loaded, before the subscriber can exist (its format comes from
