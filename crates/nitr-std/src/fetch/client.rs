@@ -588,6 +588,41 @@ mod tests {
         assert!(backoff(30, true) <= RETRY_MAX_DELAY);
     }
 
+    /// The security boundary is the resolver wired *into* the client, not
+    /// `check_url`: even with the URL check bypassed entirely, the built
+    /// client must refuse to connect to a policy-forbidden address. This
+    /// fails if the `dns_resolver(GuardedResolver)` wiring in
+    /// [`client_for`] is ever dropped — the invariant phase 18 pins down.
+    #[tokio::test]
+    async fn built_client_refuses_forbidden_addresses_without_check_url() {
+        // A live listener on loopback, so a connection would succeed if
+        // the resolver let one through.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+
+        let client = client_for(&FetchOptions::default()).expect("client");
+        let err = client
+            .get(format!("http://localhost:{port}/"))
+            .send()
+            .await
+            .expect_err("the guarded resolver must refuse loopback");
+
+        // The policy refusal surfaces somewhere in reqwest's error chain.
+        let mut chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(err) = source {
+            chain.push_str(": ");
+            chain.push_str(&err.to_string());
+            source = err.source();
+        }
+        assert!(
+            chain.contains("private or local"),
+            "unexpected error: {chain}"
+        );
+    }
+
     #[test]
     fn the_outbound_budget_counts_and_refuses() {
         let budget = OutboundBudget::default();

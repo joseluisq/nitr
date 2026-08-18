@@ -852,6 +852,17 @@ impl Config {
                 )));
             }
         }
+        // Existence is not readability: a mis-owned static root would
+        // otherwise answer every request 404 with nothing explaining why.
+        // Probing with read_dir surfaces PermissionDenied at startup.
+        if let Some(dir) = &self.static_files.dir
+            && let Err(err) = std::fs::read_dir(dir)
+        {
+            return Err(Error::Config(format!(
+                "[static] dir {} exists but cannot be read: {err}",
+                dir.display()
+            )));
+        }
         // The database file itself may not exist yet (SQLite creates it),
         // but its parent directory must — SQLite will not create that.
         if let Some(db) = &self.database

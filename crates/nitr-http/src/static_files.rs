@@ -150,12 +150,10 @@ async fn resolve(dir: &Path, rel: &str) -> Option<PathBuf> {
         }
     }
 
-    let meta = tokio::fs::metadata(&path).await.ok()?;
+    let meta = fs_ok(tokio::fs::metadata(&path).await, &path)?;
     if meta.is_dir() {
         path.push("index.html");
-        tokio::fs::metadata(&path)
-            .await
-            .ok()?
+        fs_ok(tokio::fs::metadata(&path).await, &path)?
             .is_file()
             .then_some(())?;
     } else if !meta.is_file() {
@@ -164,9 +162,24 @@ async fn resolve(dir: &Path, rel: &str) -> Option<PathBuf> {
 
     // Symlink policy: the canonical target must stay inside the canonical
     // root, so links cannot escape the mount.
-    let canonical = tokio::fs::canonicalize(&path).await.ok()?;
-    let root = tokio::fs::canonicalize(dir).await.ok()?;
+    let canonical = fs_ok(tokio::fs::canonicalize(&path).await, &path)?;
+    let root = fs_ok(tokio::fs::canonicalize(dir).await, dir)?;
     canonical.starts_with(&root).then_some(canonical)
+}
+
+/// Filesystem access on the serving path. An absent file is normal
+/// traffic; anything else (permissions, a broken mount) is a server-side
+/// problem the operator needs to see, so it is logged here — while the
+/// client gets the same non-leaking 404 either way.
+fn fs_ok<T>(result: std::io::Result<T>, path: &Path) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            tracing::warn!("static file access failed for {}: {err}", path.display());
+            None
+        }
+    }
 }
 
 /// Serves one resolved file: precompressed sidecar selection, conditional
@@ -371,6 +384,18 @@ fn not_found() -> Result<HttpResponse> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Absent files stay a quiet `None` (normal traffic); every other
+    /// filesystem error also answers `None` — same non-leaking 404 — but
+    /// is the case [`fs_ok`] logs for the operator.
+    #[test]
+    fn fs_errors_all_resolve_to_none() {
+        use std::io::{Error as IoError, ErrorKind};
+        let p = Path::new("x");
+        assert_eq!(fs_ok(Ok(7), p), Some(7));
+        assert!(fs_ok::<()>(Err(IoError::from(ErrorKind::NotFound)), p).is_none());
+        assert!(fs_ok::<()>(Err(IoError::from(ErrorKind::PermissionDenied)), p).is_none());
+    }
 
     #[test]
     fn mounts_normalize_and_match() {

@@ -453,9 +453,7 @@ pub fn verify(name: &str, signed: &str, secret: &str) -> Option<String> {
 }
 
 fn new_mac(name: &str, payload: &str, secret: &str) -> HmacSha256 {
-    // Never panics: HMAC-SHA256 accepts keys of any length.
-    let mut mac =
-        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    let mut mac: HmacSha256 = crate::utils::new_hmac(secret.as_bytes());
     mac.update(name.as_bytes());
     mac.update(b"=");
     mac.update(payload.as_bytes());

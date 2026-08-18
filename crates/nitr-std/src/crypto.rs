@@ -53,9 +53,7 @@ pub(crate) fn create_crypto_table(lua: &Lua) -> mlua::Result<Table> {
     crypto.set(
         "hmac_sha256",
         lua.create_function(|_, (key, data): (LuaString, LuaString)| {
-            // Never panics: HMAC-SHA256 accepts keys of any length.
-            let mut mac = Hmac::<Sha256>::new_from_slice(&key.as_bytes())
-                .expect("HMAC accepts any key length");
+            let mut mac: Hmac<Sha256> = crate::utils::new_hmac(&key.as_bytes());
             mac.update(&data.as_bytes());
             Ok(hex(&mac.finalize().into_bytes()))
         })?,
@@ -204,20 +202,19 @@ fn aead_cipher(key: &LuaString) -> mlua::Result<XChaCha20Poly1305> {
 const JWT_ALGORITHMS: &[&str] = &["HS256", "HS384", "HS512"];
 
 fn jwt_mac(alg: &str, key: &[u8], data: &[u8]) -> Vec<u8> {
-    // Never panics: HMAC accepts keys of any length.
     match alg {
         "HS256" => {
-            let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
+            let mut mac: Hmac<Sha256> = crate::utils::new_hmac(key);
             mac.update(data);
             mac.finalize().into_bytes().to_vec()
         }
         "HS384" => {
-            let mut mac = Hmac::<Sha384>::new_from_slice(key).expect("HMAC accepts any key length");
+            let mut mac: Hmac<Sha384> = crate::utils::new_hmac(key);
             mac.update(data);
             mac.finalize().into_bytes().to_vec()
         }
         "HS512" => {
-            let mut mac = Hmac::<Sha512>::new_from_slice(key).expect("HMAC accepts any key length");
+            let mut mac: Hmac<Sha512> = crate::utils::new_hmac(key);
             mac.update(data);
             mac.finalize().into_bytes().to_vec()
         }
