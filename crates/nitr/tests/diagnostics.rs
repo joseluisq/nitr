@@ -72,14 +72,17 @@ return app
 "#;
 
 fn write_temp_script(name: &str, content: &str) -> PathBuf {
-    // `fs::write` truncates before writing, so a path two tests share is a
-    // race; the counter keeps every call on its own file.
+    // Each script gets its own private DIRECTORY, not just its own file:
+    // a dev-mode server watches the handler's parent directory, and if
+    // that were the shared system temp dir, the watcher would recursively
+    // register the runner's whole temp tree and react to every other
+    // test's file churn — which is exactly the CI hang this fixes. The
+    // counter still keeps two tests in this process apart.
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
-        "nitr-diagnostics-{}-{id}-{name}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("nitr-diagnostics-{}-{id}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp script dir");
+    let path = dir.join(name);
     std::fs::write(&path, content).expect("write temp script");
     path
 }
@@ -173,7 +176,10 @@ impl Harness {
             .await
             .expect("server task")
             .expect("clean shutdown");
-        std::fs::remove_file(&self.handler).ok();
+        // Scripts live in a private per-test directory; remove it whole.
+        if let Some(dir) = self.handler.parent() {
+            std::fs::remove_dir_all(dir).ok();
+        }
     }
 }
 
@@ -398,7 +404,9 @@ return app
     // Both sites carry the line numbers of the two app:get calls.
     assert!(message.contains(":3"), "{message}");
     assert!(message.contains(":4"), "{message}");
-    std::fs::remove_file(&handler).ok();
+    if let Some(dir) = handler.parent() {
+        std::fs::remove_dir_all(dir).ok();
+    }
 }
 
 /// A syntax error points at the line, with the source rendered around it.
@@ -419,5 +427,7 @@ async fn syntax_errors_point_at_the_line() {
     assert!(message.contains("syntax.lua"), "{message}");
     // The gutter renders the offending source line.
     assert!(message.contains("| return app"), "{message}");
-    std::fs::remove_file(&handler).ok();
+    if let Some(dir) = handler.parent() {
+        std::fs::remove_dir_all(dir).ok();
+    }
 }

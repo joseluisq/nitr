@@ -18,10 +18,13 @@ use crate::config::Config;
 /// How long a burst of events must be quiet before one reload fires.
 const DEBOUNCE: Duration = Duration::from_millis(150);
 
-/// Keeps the watcher (and its debouncer thread) alive for as long as the
-/// server serves.
+/// How often the watcher thread checks whether the server stopped.
+const STOP_POLL: Duration = Duration::from_millis(500);
+
+/// Keeps the watcher thread alive for as long as the server serves;
+/// dropping it disconnects the stop channel, which ends the thread.
 pub(crate) struct WatchGuard {
-    _watcher: notify::RecommendedWatcher,
+    _stop: std::sync::mpsc::Sender<()>,
 }
 
 /// Whether an event is worth a rebuild: content changes only — reads and
@@ -60,58 +63,74 @@ fn watch_roots(cfg: &Config) -> Vec<PathBuf> {
 }
 
 /// Starts watching; changed files send on `reload` after the debounce.
-/// Returns `None` (with a warning) when the watcher cannot start — dev
-/// mode still works, it just reloads on SIGHUP only.
+/// Returns `None` when there is nothing to watch.
+///
+/// Everything — watcher creation, the recursive registration walk, and
+/// the debounce loop — runs on its own thread: registering watches over a
+/// large tree can be slow, and `serve()` must never wait on it (a CI
+/// hang taught this the hard way). Dropping the returned guard stops the
+/// thread and with it the watcher.
 pub(crate) fn spawn(cfg: &Config, reload: tokio::sync::mpsc::Sender<()>) -> Option<WatchGuard> {
     let roots = watch_roots(cfg);
     if roots.is_empty() {
         return None;
     }
 
-    let (tx, rx) = std::sync::mpsc::channel::<()>();
-    let mut watcher =
-        match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-            if let Ok(event) = res
-                && relevant(&event)
-            {
-                let _ = tx.send(());
-            }
-        }) {
-            Ok(watcher) => watcher,
-            Err(err) => {
-                tracing::warn!(
-                    "dev-mode file watcher unavailable ({err}); reload via SIGHUP instead"
-                );
-                return None;
-            }
-        };
-
-    for root in &roots {
-        if let Err(err) = watcher.watch(root, notify::RecursiveMode::Recursive) {
-            tracing::warn!("cannot watch {} for changes: {err}", root.display());
-        }
-    }
-    tracing::debug!(
-        "watching {} for changes",
-        roots
-            .iter()
-            .map(|r| r.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-
-    // The debouncer: wait for a burst to go quiet, then request one
-    // reload. A plain thread, because notify delivers on its own thread
-    // and the wait is a blocking recv.
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {
-        while rx.recv().is_ok() {
-            while rx.recv_timeout(DEBOUNCE).is_ok() {}
-            // A full channel means a reload is already queued.
-            let _ = reload.try_send(());
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let mut watcher =
+            match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+                if let Ok(event) = res
+                    && relevant(&event)
+                {
+                    let _ = tx.send(());
+                }
+            }) {
+                Ok(watcher) => watcher,
+                Err(err) => {
+                    tracing::warn!(
+                        "dev-mode file watcher unavailable ({err}); reload via SIGHUP instead"
+                    );
+                    return;
+                }
+            };
+
+        for root in &roots {
+            if let Err(err) = watcher.watch(root, notify::RecursiveMode::Recursive) {
+                tracing::warn!("cannot watch {} for changes: {err}", root.display());
+            }
+        }
+        tracing::debug!(
+            "watching {} for changes",
+            roots
+                .iter()
+                .map(|r| r.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
+        // The debounce loop: wait for a burst to go quiet, then request
+        // one reload. Interleaved with the stop signal so the thread (and
+        // the watcher it owns) dies promptly when the server stops.
+        loop {
+            match rx.recv_timeout(STOP_POLL) {
+                Ok(()) => {
+                    while rx.recv_timeout(DEBOUNCE).is_ok() {}
+                    // A full channel means a reload is already queued.
+                    let _ = reload.try_send(());
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+            match stop_rx.try_recv() {
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                _ => return,
+            }
         }
     });
 
-    Some(WatchGuard { _watcher: watcher })
+    Some(WatchGuard { _stop: stop_tx })
 }
 
 #[cfg(test)]
