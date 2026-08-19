@@ -18,8 +18,8 @@ const DEFAULT_EXEC_TIMEOUT_MS: u64 = 30_000;
 /// in Rust.
 ///
 /// Two deliberately separate questions: liveness ("is the process alive?")
-/// never touches a Lua state — a probe that queued behind a saturated pool
-/// would cause the restart it exists to prevent — and readiness ("should
+/// never touches a Lua state; a probe that queued behind a saturated pool
+/// would cause the restart it exists to prevent; and readiness ("should
 /// it receive traffic?") flips to `503` the moment a graceful drain
 /// starts, so a rolling deploy shifts traffic before requests can fail.
 /// An application cannot influence either answer.

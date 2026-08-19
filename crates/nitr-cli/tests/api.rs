@@ -12,8 +12,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-#[path = "../src/apidef.rs"]
-mod apidef;
+use nitr_cli::apidef;
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

@@ -37,8 +37,8 @@ pub struct Config {
     /// SQLite database for the `db` builtin (`[database]` section): the
     /// file path plus the connection pragmas.
     pub database: Option<DatabaseConfig>,
-    /// Number of pooled Lua states. Reserved: takes effect with the runtime
-    /// pool (roadmap phase 3).
+    /// Number of pooled Lua states (the maximum concurrently executing)
+    /// handlers.
     pub workers: usize,
     /// Maximum concurrent streaming responses (each holds a pooled state
     /// for its whole lifetime). Defaults to `workers - 1` (at least 1) so

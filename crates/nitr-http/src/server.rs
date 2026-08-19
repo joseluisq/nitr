@@ -285,6 +285,9 @@ impl Server {
                     // Wait for a free connection slot before accepting; the
                     // whole future is dropped (releasing nothing) on
                     // shutdown. The semaphore is never closed.
+                    // Invariant: acquire fails only on a closed
+                    // semaphore, and nothing ever closes this one.
+                    #[allow(clippy::expect_used)]
                     let permit = conn_slots
                         .clone()
                         .acquire_owned()
@@ -658,6 +661,9 @@ async fn build_runtimes(
     let snapshot = match &cfg.config_script {
         Some(conf_src) => {
             // Pass the database connection to the config script when available.
+            // Invariant: `nitr_name` is `None` only for combined or
+            // multi-field flags; DATABASE is neither.
+            #[allow(clippy::expect_used)]
             let db_name = Builtins::DATABASE
                 .nitr_name()
                 .expect("DATABASE is a single builtin flag");

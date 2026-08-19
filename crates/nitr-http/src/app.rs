@@ -303,6 +303,8 @@ fn compile(value: Value, script: &Path) -> Result<Compiled> {
             None => {
                 index.insert(pattern.clone(), patterns.len());
                 patterns.push((pattern, HashMap::new()));
+                // Invariant: the element was pushed on the previous line.
+                #[allow(clippy::expect_used)]
                 &mut patterns.last_mut().expect("just pushed").1
             }
         };
@@ -338,6 +340,9 @@ fn compile(value: Value, script: &Path) -> Result<Compiled> {
 /// Composes `global middleware → route middleware → handler` into a single
 /// function by calling each middleware factory with its `next` link.
 fn compose(global: &[Function], route: &RouteDef) -> Result<Function> {
+    // Invariant: route registration refuses an empty function list, so a
+    // compiled route always carries at least its handler.
+    #[allow(clippy::expect_used)]
     let (handler, mws) = route
         .fns
         .split_last()

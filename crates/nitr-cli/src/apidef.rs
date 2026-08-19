@@ -104,7 +104,6 @@ pub fn parse() -> anyhow::Result<Api> {
 
 impl Api {
     /// Every dotted path the description covers, for the completeness test.
-    #[allow(dead_code)]
     pub fn known_paths(&self) -> std::collections::BTreeSet<String> {
         let mut out = std::collections::BTreeSet::new();
         for f in &self.fns {
@@ -287,9 +286,6 @@ fn clone_ret(r: &Ret) -> Ret {
 }
 
 /// One signature line for the reference page.
-// Reference-page generation runs from the drift test (which includes this
-// module via `#[path]`), not from the binary itself.
-#[allow(dead_code)]
 fn signature(name: &str, params: &[Param], returns: &[Ret]) -> String {
     let params = params
         .iter()
@@ -308,7 +304,6 @@ fn signature(name: &str, params: &[Param], returns: &[Ret]) -> String {
 }
 
 /// Generates the Markdown reference page (`docs/nitr-api.md`).
-#[allow(dead_code)]
 pub fn emit_docs(api: &Api) -> String {
     let mut out = String::from(
         "# The `nitr.*` API\n\n\

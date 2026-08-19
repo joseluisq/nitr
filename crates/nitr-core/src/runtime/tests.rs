@@ -1,0 +1,209 @@
+use super::*;
+
+fn write_temp_script(name: &str, content: &str) -> PathBuf {
+    // `fs::write` truncates before writing, so a path two tests share is
+    // a race; the counter keeps every call on its own file.
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path =
+        std::env::temp_dir().join(format!("nitr-rt-test-{}-{id}-{name}", std::process::id()));
+    std::fs::write(&path, content).expect("write temp script");
+    path
+}
+
+fn test_runtime(exec_timeout: Option<Duration>) -> Runtime {
+    Runtime::new_with(RuntimeOpts {
+        libs: StdLib::MATH | StdLib::TABLE | StdLib::STRING,
+        memory_limit: 8 * 1024 * 1024,
+        dev_mode: false,
+        exec_timeout,
+        package_dir: None,
+    })
+    .expect("runtime")
+}
+
+fn eval_function(rt: &Runtime, src: &str) -> Function {
+    rt.lua().load(src).eval().expect("eval handler function")
+}
+
+#[test]
+fn expression_form_typos_report_the_real_line() {
+    // An expression-form script (`function(...) ... end`, no `return`)
+    // with a typo mid-body. mlua's own `eval` would report its block
+    // fallback — "<name> expected" at the `function(` line — masking
+    // the actual position; the dual-parse must surface line 4.
+    let rt = Runtime::new().expect("runtime");
+    let path = write_temp_script(
+        "expr-typo.lua",
+        "-- comment\nfunction(db)\n    local ok = 1\n    lodcal users = 2\n    return {}\nend",
+    );
+    let err = rt.eval_script(&path).expect_err("typo must fail the load");
+    let message = err.to_string();
+    assert!(message.contains("expr-typo.lua:4"), "{message}");
+    assert!(message.contains("near 'users'"), "{message}");
+    // The caret spans the token the parser stopped at (`users`, five
+    // wide); exact column alignment is covered by the snippet unit test.
+    assert!(message.contains("^^^^^"), "{message}");
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn both_script_forms_still_evaluate() {
+    let rt = Runtime::new().expect("runtime");
+    // Expression form.
+    let path = write_temp_script("expr-ok.lua", "function(x)\n    return x\nend");
+    assert!(matches!(
+        rt.eval_script(&path).expect("expression form"),
+        Value::Function(_)
+    ));
+    std::fs::remove_file(&path).ok();
+    // Statement-block form (handler scripts).
+    let path = write_temp_script("block-ok.lua", "local t = { ok = true }\nreturn t");
+    assert!(matches!(
+        rt.eval_script(&path).expect("block form"),
+        Value::Table(_)
+    ));
+    std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test]
+async fn function_calls_round_trip() {
+    let mut rt = test_runtime(Some(Duration::from_secs(5)));
+    let f = eval_function(
+        &rt,
+        "return function(req) return { status = 200, body = req } end",
+    );
+
+    // The cached coroutine must keep working across calls.
+    for _ in 0..3 {
+        let resp = rt
+            .call_function::<Table>(f.clone(), "ping")
+            .await
+            .expect("call function");
+        assert_eq!(resp.get::<String>("body").expect("body"), "ping");
+    }
+}
+
+#[tokio::test]
+async fn cpu_bound_loops_hit_the_instruction_hook() {
+    let mut rt = test_runtime(Some(Duration::from_millis(100)));
+    let looping = eval_function(&rt, "return function() while true do end end");
+
+    let err = rt
+        .call_function::<Table>(looping, Value::Nil)
+        .await
+        .expect_err("must time out");
+    assert!(err.to_string().contains("time budget"), "got: {err}");
+
+    // The state must survive and serve the next call after a reset.
+    let ok = eval_function(&rt, "return function() return { body = 'alive' } end");
+    let resp = rt
+        .call_function::<Table>(ok, Value::Nil)
+        .await
+        .expect("recovered");
+    assert_eq!(resp.get::<String>("body").expect("body"), "alive");
+}
+
+#[test]
+fn modules_mount_under_nitr_ext_and_reject_collisions() {
+    let rt = test_runtime(None);
+    rt.register_module("greet", |lua| {
+        let t = lua.create_table()?;
+        t.set(
+            "hello",
+            lua.create_function(|_, name: String| Ok(format!("hi {name}")))?,
+        )?;
+        Ok(t)
+    })
+    .expect("register module");
+
+    let out: String = rt
+        .lua()
+        .load("return nitr.ext.greet.hello('nitr')")
+        .eval()
+        .expect("call module");
+    assert_eq!(out, "hi nitr");
+
+    // A second mount under the same name must fail loudly.
+    let err = rt
+        .register_module("greet", |lua| lua.create_table())
+        .expect_err("collision");
+    assert!(err.to_string().contains("already exists"), "got: {err}");
+}
+
+#[tokio::test]
+async fn config_accepts_plain_script() {
+    // Handler-style shape: top-level statements, args via `...`,
+    // trailing `return { ... }` — no `function(...)` wrapper.
+    let cfg_script = write_temp_script(
+        "cfg_plain.lua",
+        "local greeting = ...\n\
+             local upper = greeting:upper()\n\
+             return { greeting = greeting, upper = upper }",
+    );
+    let mut rt = test_runtime(None);
+    rt.register_cfg_fn(&cfg_script, "hi")
+        .await
+        .expect("run plain config script");
+    std::fs::remove_file(&cfg_script).ok();
+
+    let cfg = rt.cfg().expect("cfg table");
+    assert_eq!(cfg.get::<String>("greeting").expect("greeting"), "hi");
+    assert_eq!(cfg.get::<String>("upper").expect("upper"), "HI");
+}
+
+#[tokio::test]
+async fn config_rejects_non_table_result() {
+    let cfg_script = write_temp_script("cfg_bad.lua", "return 42");
+    let mut rt = test_runtime(None);
+    let err = rt
+        .register_cfg_fn(&cfg_script, Value::Nil)
+        .await
+        .expect_err("number is not a valid configuration");
+    std::fs::remove_file(&cfg_script).ok();
+    assert!(
+        err.to_string().contains("must return a table"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn config_rejects_the_dropped_wrapper_form() {
+    // The old `function(db) ... end` shape must fail with a message
+    // that points migrations at the plain-script form.
+    let cfg_script = write_temp_script(
+        "cfg_wrapped.lua",
+        "function(db)\n    return { ok = true }\nend",
+    );
+    let mut rt = test_runtime(None);
+    let err = rt
+        .register_cfg_fn(&cfg_script, Value::Nil)
+        .await
+        .expect_err("wrapper form is no longer supported");
+    std::fs::remove_file(&cfg_script).ok();
+    let message = err.to_string();
+    assert!(message.contains("no longer supported"), "got: {message}");
+    assert!(message.contains("local db = ..."), "got: {message}");
+}
+
+#[tokio::test]
+async fn config_snapshot_round_trips() {
+    let cfg_script = write_temp_script("cfg.lua", "return { greeting = 'hi', nested = { n = 7 } }");
+    let mut source = test_runtime(None);
+    source
+        .register_cfg_fn(&cfg_script, Value::Nil)
+        .await
+        .expect("run config script");
+    std::fs::remove_file(&cfg_script).ok();
+
+    let snapshot = source
+        .cfg_snapshot()
+        .expect("snapshot")
+        .expect("config present");
+    let mut target = test_runtime(None);
+    target.set_cfg_snapshot(&snapshot).expect("inject snapshot");
+    let cfg = target.cfg().expect("cfg table");
+    assert_eq!(cfg.get::<String>("greeting").expect("greeting"), "hi");
+    let nested: Table = cfg.get("nested").expect("nested");
+    assert_eq!(nested.get::<i64>("n").expect("n"), 7);
+}

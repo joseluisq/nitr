@@ -15,6 +15,9 @@ keywords = ["dynamic-web-server", "http-server", "lua-server"]
 include = ["src/**/*.rs", "src/**/*.lua", "Cargo.toml", "LICENSE-APACHE", "LICENSE-MIT"]
 publish = true
 
+
+[lints]
+workspace = true
 [[bin]]
 name = "nitr"
 path = "src/main.rs"

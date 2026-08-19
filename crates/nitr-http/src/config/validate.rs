@@ -11,7 +11,7 @@ impl Config {
     /// Rejects configurations that parse but cannot be honored.
     ///
     /// Called once at startup so a contradiction is a loud failure rather
-    /// than a subtle runtime surprise — a browser silently ignoring a
+    /// than a subtle runtime surprise, a browser silently ignoring a
     /// header combination is much harder to debug than a refused boot.
     pub(crate) fn validate(&self) -> Result {
         let any_origin = self
@@ -121,7 +121,7 @@ impl Config {
             )));
         }
         // The database file itself may not exist yet (SQLite creates it),
-        // but its parent directory must — SQLite will not create that.
+        // but its parent directory must, SQLite will not create that.
         if let Some(db) = &self.database
             && let Some(parent) = db.path.parent()
             && !parent.as_os_str().is_empty()
@@ -140,7 +140,7 @@ impl Config {
     ///
     /// Used when running from a `nitr build` bundle: the scripts, templates
     /// and static files live in the extraction directory, while the
-    /// database path is deliberately left alone — it is mutable state and
+    /// database path is deliberately left alone, it is mutable state and
     /// stays external to the artifact, resolving against the working
     /// directory as usual.
     pub fn rebase(&mut self, root: &Path) {
@@ -168,7 +168,7 @@ impl Config {
     }
 
     /// The effective configuration after file, environment, and flag
-    /// layering, rendered as TOML — the answer to "which value actually
+    /// layering, rendered as TOML, the answer to "which value actually
     /// won?".
     pub fn effective_toml(&self) -> Result<String> {
         // Route through JSON first to drop the `None`s: TOML has no null,

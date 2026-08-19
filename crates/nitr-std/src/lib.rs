@@ -5,11 +5,11 @@
 //! globals, so scripts always read `nitr.*` and nothing is intermixed with
 //! the Lua standard library.
 
-#![deny(missing_docs)]
-#![forbid(unsafe_code)]
-#![deny(warnings)]
-#![deny(rust_2018_idioms)]
-#![deny(dead_code)]
+// Lint policy comes from `[workspace.lints]` in the root Cargo.toml.
+// `unwrap_used`/`expect_used` are denied here (not in the workspace table,
+// which would also hit test and bench targets); unit tests are exempt, and
+// the few documented-invariant `expect()`s carry targeted allows.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 use std::path::PathBuf;

@@ -76,7 +76,7 @@ fn is_memory_error(err: &mlua::Error) -> bool {
 pub type Result<T = (), E = Error> = std::result::Result<T, E>;
 
 // ---------------------------------------------------------------------------
-// Structured diagnostics (phase 13)
+// Structured diagnostics
 // ---------------------------------------------------------------------------
 
 /// How many Lua traceback frames survive into diagnostics. Beyond this the

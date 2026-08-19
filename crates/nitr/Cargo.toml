@@ -26,6 +26,9 @@ include = ["src/**/*.rs", "Cargo.toml", "LICENSE-APACHE", "LICENSE-MIT"]
 # builtins, which need no dependency the server does not already have.
 # Configuring a builtin that was not compiled in is a startup error naming
 # the feature to enable.
+
+[lints]
+workspace = true
 [features]
 default = []
 all = [

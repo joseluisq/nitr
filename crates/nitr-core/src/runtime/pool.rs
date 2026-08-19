@@ -79,6 +79,10 @@ impl RuntimePool {
 
     /// Checks a runtime out of the pool, waiting until one is available.
     pub async fn get(&self) -> RuntimeGuard {
+        // Invariant, not a fallible path: the pool owns both channel ends
+        // for its whole lifetime, so recv can only fail after the pool —
+        // and every guard borrowing from it — is gone.
+        #[allow(clippy::expect_used)]
         let rt = self
             .rx
             .recv()
@@ -141,12 +145,16 @@ impl std::fmt::Debug for RuntimeGuard {
 impl Deref for RuntimeGuard {
     type Target = Runtime;
     fn deref(&self) -> &Self::Target {
+        // Invariant: `rt` is only taken in `Drop`, after the last deref.
+        #[allow(clippy::expect_used)]
         self.rt.as_ref().expect("runtime present until drop")
     }
 }
 
 impl DerefMut for RuntimeGuard {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        // Invariant: `rt` is only taken in `Drop`, after the last deref.
+        #[allow(clippy::expect_used)]
         self.rt.as_mut().expect("runtime present until drop")
     }
 }

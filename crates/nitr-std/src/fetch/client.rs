@@ -403,8 +403,9 @@ fn fill_headers(headers: &mut HeaderMap, table: &Table) -> mlua::Result<()> {
 /// The W3C `traceparent` for the current request, when propagation is on.
 ///
 /// Pass-through, not a tracing SDK: the trace id is derived from the
-/// request id phase 5 already generates, so a request crossing several
-/// Nitr services can be stitched together without any pipeline.
+/// request id the server generates for every request, so a request
+/// crossing several Nitr services can be stitched together without any
+/// pipeline.
 fn traceparent(lua: &Lua) -> Option<HeaderValue> {
     use sha2::Digest as _;
 
@@ -592,7 +593,7 @@ mod tests {
     /// `check_url`: even with the URL check bypassed entirely, the built
     /// client must refuse to connect to a policy-forbidden address. This
     /// fails if the `dns_resolver(GuardedResolver)` wiring in
-    /// [`client_for`] is ever dropped — the invariant phase 18 pins down.
+    /// [`client_for`] is ever dropped.
     #[tokio::test]
     async fn built_client_refuses_forbidden_addresses_without_check_url() {
         // A live listener on loopback, so a connection would succeed if

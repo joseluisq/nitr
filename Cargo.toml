@@ -10,6 +10,29 @@ members = [
     "crates/nitr-cli",
 ]
 
+# One lint policy for every workspace crate (each opts in with
+# `lints.workspace = true`), so the discipline is mechanical instead of
+# five hand-copied crate headers that drift. `clippy::unwrap_used`/
+# `expect_used` are deliberately NOT here: the Cargo table applies to
+# every target, and tests and benches use `expect` legitimately — the
+# library crates deny them via `#![cfg_attr(not(test), deny(...))]` at
+# their roots instead.
+[workspace.lints.rust]
+# Any warning is a hard error — including in tests and benches.
+warnings = { level = "deny", priority = -1 }
+rust-2018-idioms = { level = "deny", priority = -1 }
+unsafe_code = "forbid"
+missing_docs = "deny"
+dead_code = "deny"
+
+[workspace.lints.clippy]
+# Pure-signal picks: each of these is a leftover debugging or stub marker
+# that should never survive review.
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+mem_forget = "deny"
+
 [workspace.package]
 version = "0.0.0-beta.1"
 edition = "2024"

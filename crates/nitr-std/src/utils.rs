@@ -8,6 +8,9 @@ use mlua::{Function, Lua, Value};
 /// (signed cookies, `nitr.crypto.hmac_sha256`, JWT) constructs through
 /// here so key handling has one auditable site.
 pub(crate) fn new_hmac<M: hmac::digest::KeyInit>(key: &[u8]) -> M {
+    // Invariant: `new_from_slice` fails only for fixed-key-length
+    // algorithms, which HMAC is not.
+    #[allow(clippy::expect_used)]
     <M as hmac::digest::KeyInit>::new_from_slice(key).expect("HMAC accepts any key length")
 }
 
