@@ -125,4 +125,29 @@ mod tests {
         assert_eq!(decoded, None);
         assert_eq!(err.as_deref(), Some("invalid base64"));
     }
+
+    proptest::proptest! {
+        /// Property: decode(encode(bytes)) is the identity for arbitrary
+        /// bytes, in both alphabets.
+        #[test]
+        fn prop_bytes_round_trip_in_both_alphabets(
+            data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64),
+            url in proptest::prelude::any::<bool>(),
+        ) {
+            let lua = Lua::new();
+            let b64 = table(&lua);
+            let encode: mlua::Function = b64.get("encode").expect("fn");
+            let decode: mlua::Function = b64.get("decode").expect("fn");
+            let input = lua.create_string(&data).expect("bytes");
+            let opts: Table = lua.create_table().expect("opts");
+            opts.set("url", url).expect("set");
+            let encoded: String = encode.call((&input, &opts)).expect("encode");
+            let (decoded, err): (Option<mlua::LuaString>, Option<String>) =
+                decode.call((encoded, &opts)).expect("decode");
+            proptest::prop_assert_eq!(err, None);
+            let decoded = decoded.expect("decoded");
+            let bytes = decoded.as_bytes();
+            proptest::prop_assert_eq!(bytes.as_ref(), &data[..]);
+        }
+    }
 }

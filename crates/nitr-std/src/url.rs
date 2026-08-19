@@ -318,4 +318,49 @@ mod tests {
         assert!(parsed.is_nil());
         assert_eq!(err.as_deref(), Some("empty URL"));
     }
+
+    proptest::proptest! {
+        /// Property: decode(encode(s)) is the identity, and a query built
+        /// from a table parses back to the same table.
+        #[test]
+        fn prop_percent_and_query_round_trip(
+            s in "[ -~]{0,40}",
+            entries in proptest::collection::btree_map("[a-z][a-z0-9]{0,7}", "[ -~]{0,12}", 0..5),
+        ) {
+            let lua = Lua::new();
+            let url = create_url_table(&lua).expect("table");
+            let encode: mlua::Function = url.get("encode").expect("fn");
+            let decode: mlua::Function = url.get("decode").expect("fn");
+            let build: mlua::Function = url.get("query_build").expect("fn");
+            let parse: mlua::Function = url.get("query_parse").expect("fn");
+
+            let encoded: String = encode.call(s.as_str()).expect("encode");
+            let decoded: String = decode.call(encoded).expect("decode");
+            proptest::prop_assert_eq!(&decoded, &s);
+
+            // BTreeMap keys are unique by construction: duplicates are
+            // defined to collapse on parse, so they are out of scope here.
+            let map = lua.create_table().expect("map");
+            for (k, v) in &entries {
+                map.set(k.as_str(), v.as_str()).expect("set");
+            }
+            let query: String = build.call(&map).expect("build");
+            let parsed: Table = parse.call(query.as_str()).expect("parse");
+            for (k, v) in &entries {
+                let got = parsed.get::<Option<String>>(k.as_str()).expect("get");
+                proptest::prop_assert_eq!(
+                    got.as_deref(),
+                    Some(v.as_str()),
+                    "key {:?} in query {:?}", k, query
+                );
+            }
+            for pair in parsed.pairs::<String, String>() {
+                let (k, _) = pair.expect("pair");
+                proptest::prop_assert!(
+                    entries.contains_key(&k),
+                    "parse invented key {:?}", k
+                );
+            }
+        }
+    }
 }

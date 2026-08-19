@@ -2,7 +2,9 @@
 
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
+
 use std::time::Duration;
+use tracing::Instrument as _;
 
 use crate::error::Result;
 use crate::runtime::Runtime;
@@ -98,20 +100,35 @@ impl RuntimePool {
     /// overloaded pool. A zero duration disables the bound and waits like
     /// [`get()`](Self::get).
     pub async fn get_timeout(&self, wait: Duration) -> Option<RuntimeGuard> {
-        if wait.is_zero() {
-            return Some(self.get().await);
+        // The `pool_checkout` span: how long this request waited for a
+        // state and whether it got one. DEBUG so the per-request
+        // decomposition is opt-in via the level filter.
+        let span = tracing::debug_span!(
+            "pool_checkout",
+            wait_ms = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        );
+        let started = std::time::Instant::now();
+        let got = async {
+            if wait.is_zero() {
+                Some(self.get().await)
+            } else if let Ok(rt) = self.rx.try_recv() {
+                // The fast path (a state is already idle) skips the timer.
+                Some(self.guard(rt))
+            } else {
+                match tokio::time::timeout(wait, self.rx.recv()).await {
+                    Ok(Ok(rt)) => Some(self.guard(rt)),
+                    // The channel cannot close while the pool is alive; a
+                    // timeout is the only real outcome here.
+                    Ok(Err(_)) | Err(_) => None,
+                }
+            }
         }
-        // The fast path (a state is already idle) skips the timer entirely.
-        if let Ok(rt) = self.rx.try_recv() {
-            return Some(self.guard(rt));
-        }
-        match tokio::time::timeout(wait, self.rx.recv()).await {
-            Ok(Ok(rt)) => Some(self.guard(rt)),
-            // The channel cannot close while the pool is alive; a timeout is
-            // the only real outcome here.
-            Ok(Err(_)) => None,
-            Err(_) => None,
-        }
+        .instrument(span.clone())
+        .await;
+        span.record("wait_ms", started.elapsed().as_millis() as u64);
+        span.record("outcome", if got.is_some() { "hit" } else { "shed" });
+        got
     }
 
     fn guard(&self, rt: Runtime) -> RuntimeGuard {
@@ -192,7 +209,7 @@ impl Drop for RuntimeGuard {
         tokio::task::spawn_blocking(move || match rebuild() {
             Ok(fresh) => {
                 let _ = tx.try_send(fresh);
-                tracing::info!("recycled a damaged Lua state");
+                tracing::info!(outcome = "rebuilt", "recycled a damaged Lua state");
             }
             // Capacity is lost until the next reload. Loud, because a pool
             // that silently shrinks looks like a mysterious slowdown.

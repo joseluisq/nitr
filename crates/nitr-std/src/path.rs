@@ -315,4 +315,55 @@ mod tests {
         assert_eq!(normalize(r"C:/mixed\style/x"), r"C:\mixed\style\x");
         assert_eq!(normalize(r"\\server\share\..\other"), r"\\server\other");
     }
+
+    proptest::proptest! {
+        /// Property (mirrors the fuzz target on every `cargo test` run): a
+        /// normalized absolute path never keeps a `..` component, and
+        /// normalize is idempotent.
+        #[test]
+        fn prop_normalize_never_leaves_dotdot_and_is_idempotent(
+            pieces in proptest::collection::vec(
+                proptest::prelude::prop_oneof![
+                    proptest::prelude::Just("a"),
+                    proptest::prelude::Just("bb"),
+                    proptest::prelude::Just(".."),
+                    proptest::prelude::Just("."),
+                    proptest::prelude::Just(""),
+                    proptest::prelude::Just("/"),
+                    proptest::prelude::Just("\\"),
+                    proptest::prelude::Just("C:"),
+                    proptest::prelude::Just("C:\\"),
+                    proptest::prelude::Just("x/y"),
+                    proptest::prelude::Just("..."),
+                    proptest::prelude::Just("..a"),
+                    proptest::prelude::Just(" "),
+                ],
+                0..8,
+            ),
+            separators in proptest::collection::vec(proptest::prelude::any::<bool>(), 0..8),
+        ) {
+            let mut input = String::new();
+            for (i, piece) in pieces.iter().enumerate() {
+                input.push_str(piece);
+                if separators.get(i).copied().unwrap_or(false) {
+                    input.push('/');
+                }
+            }
+            let normalized = normalize(&input);
+            if is_absolute(&normalized) {
+                proptest::prop_assert!(
+                    !normalized
+                        .replace('\\', "/")
+                        .split('/')
+                        .any(|seg| seg == ".."),
+                    "{:?} -> {:?}", input, normalized
+                );
+            }
+            proptest::prop_assert_eq!(
+                normalize(&normalized),
+                normalized,
+                "normalize is not idempotent for {:?}", input
+            );
+        }
+    }
 }

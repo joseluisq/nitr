@@ -525,4 +525,31 @@ mod tests {
         assert_eq!(best_match("text/html;q=0", offers), None);
         assert_eq!(best_match("image/png", offers), None);
     }
+
+    proptest::proptest! {
+        /// Property: sign/verify round-trips arbitrary printable inputs,
+        /// and flipping any single character of the signed value breaks
+        /// it — as do the wrong secret and a swapped cookie name.
+        #[test]
+        fn prop_signed_cookies_round_trip_and_any_tamper_fails(
+            name in "[ -~]{1,16}",
+            value in "[ -~]{0,48}",
+            secret in "[ -~]{1,32}",
+            pos in proptest::prelude::any::<proptest::sample::Index>(),
+        ) {
+            let signed = sign(&name, &value, &secret);
+            let verified = verify(&name, &signed, &secret);
+            proptest::prop_assert_eq!(verified.as_deref(), Some(value.as_str()));
+
+            // One changed character anywhere — payload or MAC — must fail.
+            let pos = pos.index(signed.len());
+            let mut tampered: Vec<char> = signed.chars().collect();
+            tampered[pos] = if tampered[pos] == 'A' { 'B' } else { 'A' };
+            let tampered: String = tampered.into_iter().collect();
+            proptest::prop_assert_eq!(verify(&name, &tampered, &secret), None);
+
+            proptest::prop_assert_eq!(verify(&name, &signed, "other-secret"), None);
+            proptest::prop_assert_eq!(verify("other-name", &signed, &secret), None);
+        }
+    }
 }

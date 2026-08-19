@@ -134,7 +134,14 @@ fn init_logging(cfg: Option<&Config>, dev: bool) {
     };
     let filter =
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| fallback());
-    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    // Span close events are what make the span timings visible: the
+    // `request` span's close line is an access-log entry (id, method,
+    // path, status), and at debug level the inner spans (`pool_checkout`,
+    // `lua_handler`, `db_query`, `fetch`) decompose where the time went.
+    // See docs/logging.md for the schema.
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE);
     match cfg.map(|c| c.log.format) {
         Some(nitr::LogFormat::Json) => builder.json().init(),
         _ => builder.init(),

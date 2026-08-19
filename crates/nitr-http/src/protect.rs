@@ -215,3 +215,89 @@ impl RateLimiter {
         req.peer_addr.ip()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::BodyExt as _;
+
+    fn limiter(max: u32, window_ms: u64, trust_forwarded_for: bool) -> RateLimiter {
+        RateLimiter {
+            max,
+            window: Duration::from_millis(window_ms),
+            trust_forwarded_for,
+            buckets: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn request(peer: &str, forwarded_for: Option<&str>) -> LuaRequest {
+        let mut builder = hyper::Request::builder().uri("/");
+        if let Some(xff) = forwarded_for {
+            builder = builder.header("x-forwarded-for", xff);
+        }
+        let req = builder
+            .body(
+                http_body_util::Empty::<hyper::body::Bytes>::new()
+                    .map_err(|err| match err {})
+                    .boxed(),
+            )
+            .expect("request");
+        LuaRequest {
+            peer_addr: format!("{peer}:1234").parse().expect("addr"),
+            req,
+            params: Vec::new(),
+            id: "test".into(),
+            limits: Default::default(),
+            cached_form: None,
+        }
+    }
+
+    #[test]
+    fn the_budget_applies_per_client_ip() {
+        let limiter = limiter(2, 60_000, false);
+        let a = request("10.0.0.1", None);
+        let b = request("10.0.0.2", None);
+        assert!(limiter.check(&a).is_ok());
+        assert!(limiter.check(&a).is_ok());
+        let retry = limiter.check(&a).expect_err("third request is over");
+        assert!(retry >= 1, "Retry-After must be at least a second");
+        // Another client's budget is untouched.
+        assert!(limiter.check(&b).is_ok());
+    }
+
+    #[test]
+    fn the_window_resets_the_budget() {
+        let limiter = limiter(1, 30, false);
+        let req = request("10.0.0.1", None);
+        assert!(limiter.check(&req).is_ok());
+        assert!(limiter.check(&req).is_err());
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(limiter.check(&req).is_ok(), "a new window starts fresh");
+    }
+
+    #[test]
+    fn forwarded_for_is_honored_only_when_trusted() {
+        // Untrusted: the header is attacker-controlled, so the peer
+        // address keys the budget and the spoofed IPs share one bucket.
+        let rl = limiter(1, 60_000, false);
+        assert!(rl.check(&request("10.0.0.9", Some("1.1.1.1"))).is_ok());
+        assert!(
+            rl.check(&request("10.0.0.9", Some("2.2.2.2"))).is_err(),
+            "spoofing the header must not buy a fresh budget"
+        );
+
+        // Trusted (behind a proxy): the first entry keys the budget.
+        let rl = limiter(1, 60_000, true);
+        assert!(
+            rl.check(&request("10.0.0.9", Some("1.1.1.1, 9.9.9.9")))
+                .is_ok()
+        );
+        assert!(rl.check(&request("10.0.0.9", Some("1.1.1.1"))).is_err());
+        assert!(
+            rl.check(&request("10.0.0.9", Some("2.2.2.2"))).is_ok(),
+            "a different client gets its own budget"
+        );
+        // A garbage header falls back to the peer address.
+        assert!(rl.check(&request("10.0.0.9", Some("not-an-ip"))).is_ok());
+    }
+}

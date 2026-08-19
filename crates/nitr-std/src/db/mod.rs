@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use mlua::{AnyUserData, Function, Lua, Table, UserData, UserDataMethods, Value};
 use rusqlite::Connection;
+use tracing::Instrument as _;
 
 use crate::db::types::{Conn, SqlValue, params_from_table, row_to_lua};
 use nitr_core::Result;
@@ -41,12 +42,24 @@ pub(crate) struct LuaTransaction {
 /// Runs a blocking database operation on the blocking thread pool so it
 /// stalls a blocking-pool thread instead of an async worker. Only plain
 /// `Send` data crosses the boundary — never a Lua handle.
-async fn run_blocking<T, F>(conn: Conn, sql: String, params: Vec<SqlValue>, f: F) -> mlua::Result<T>
+async fn run_blocking<T, F>(
+    conn: Conn,
+    kind: &'static str,
+    sql: String,
+    params: Vec<SqlValue>,
+    f: F,
+) -> mlua::Result<T>
 where
     T: Send + 'static,
     F: FnOnce(&Connection, &str, &[SqlValue]) -> Result<T, rusqlite::Error> + Send + 'static,
 {
-    tokio::task::spawn_blocking(move || {
+    // The `db_query` span: which statement kind ran and for how long.
+    // Deliberately no SQL text and no bind values — statements can embed
+    // secrets, and logs outlive them. DEBUG so the per-request
+    // decomposition is opt-in via the level filter.
+    let span = tracing::debug_span!("db_query", kind, elapsed_ms = tracing::field::Empty);
+    let started = std::time::Instant::now();
+    let result = tokio::task::spawn_blocking(move || {
         let conn = conn.lock().map_err(|_| {
             mlua::Error::RuntimeError("failed to lock the database connection".into())
         })?;
@@ -54,13 +67,16 @@ where
             mlua::Error::RuntimeError(format!("SQL statement `{sql}` failed: {err}"))
         })
     })
+    .instrument(span.clone())
     .await
-    .map_err(mlua::Error::external)?
+    .map_err(mlua::Error::external)?;
+    span.record("elapsed_ms", started.elapsed().as_millis() as u64);
+    result
 }
 
 /// Executes a control statement (`BEGIN`, `COMMIT`, `SAVEPOINT ...`).
 async fn exec_batch(conn: Conn, sql: String) -> mlua::Result<()> {
-    run_blocking(conn, sql, Vec::new(), |conn, sql, _| {
+    run_blocking(conn, "tx", sql, Vec::new(), |conn, sql, _| {
         conn.execute_batch(sql)
     })
     .await
@@ -83,7 +99,7 @@ where
         async move {
             let (sql, params) = args;
             let params = params_from_table(params.as_ref())?;
-            let affected = run_blocking(conn?, sql, params, execute::call).await?;
+            let affected = run_blocking(conn?, "execute", sql, params, execute::call).await?;
             Ok(affected)
         }
     });
@@ -95,7 +111,7 @@ where
             async move {
                 let (sql, params) = args;
                 let params = params_from_table(params.as_ref())?;
-                let row = run_blocking(conn?, sql, params, query_row::call).await?;
+                let row = run_blocking(conn?, "query_row", sql, params, query_row::call).await?;
                 row_to_lua(&lua, row)
             }
         },
@@ -108,7 +124,7 @@ where
             async move {
                 let (sql, params) = args;
                 let params = params_from_table(params.as_ref())?;
-                let row = run_blocking(conn?, sql, params, query_one::call).await?;
+                let row = run_blocking(conn?, "query_one", sql, params, query_one::call).await?;
                 row_to_lua(&lua, row)
             }
         },
@@ -119,7 +135,7 @@ where
         async move {
             let (sql, params) = args;
             let params = params_from_table(params.as_ref())?;
-            let rows = run_blocking(conn?, sql, params, query::call).await?;
+            let rows = run_blocking(conn?, "query", sql, params, query::call).await?;
             let table = lua.create_table()?;
             for (i, row) in rows.into_iter().enumerate() {
                 table.raw_set(i + 1, row_to_lua(&lua, row)?)?;
@@ -173,19 +189,19 @@ impl PendingQuery {
         } = self;
         match kind {
             QueryKind::Execute => {
-                let affected = run_blocking(conn, sql, params, execute::call).await?;
+                let affected = run_blocking(conn, "execute", sql, params, execute::call).await?;
                 Ok(Value::Integer(affected as i64))
             }
             QueryKind::QueryRow => {
-                let row = run_blocking(conn, sql, params, query_row::call).await?;
+                let row = run_blocking(conn, "query_row", sql, params, query_row::call).await?;
                 row_to_lua(lua, row).map(Value::Table)
             }
             QueryKind::QueryOne => {
-                let row = run_blocking(conn, sql, params, query_one::call).await?;
+                let row = run_blocking(conn, "query_one", sql, params, query_one::call).await?;
                 row_to_lua(lua, row).map(Value::Table)
             }
             QueryKind::Query => {
-                let rows = run_blocking(conn, sql, params, query::call).await?;
+                let rows = run_blocking(conn, "query", sql, params, query::call).await?;
                 let table = lua.create_table()?;
                 for (i, row) in rows.into_iter().enumerate() {
                     table.raw_set(i + 1, row_to_lua(lua, row)?)?;
@@ -374,4 +390,24 @@ pub(crate) fn create_database_fn(
         in_transaction: Arc::new(AtomicBool::new(false)),
     })?;
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_kinds_parse_strictly_with_a_query_default() {
+        assert_eq!(QueryKind::parse(None).expect("default"), QueryKind::Query);
+        for (name, kind) in [
+            ("query", QueryKind::Query),
+            ("query_row", QueryKind::QueryRow),
+            ("query_one", QueryKind::QueryOne),
+            ("execute", QueryKind::Execute),
+        ] {
+            assert_eq!(QueryKind::parse(Some(name)).expect(name), kind);
+        }
+        let err = QueryKind::parse(Some("insert")).expect_err("unknown kind");
+        assert!(err.to_string().contains("insert"), "{err}");
+    }
 }

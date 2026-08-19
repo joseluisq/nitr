@@ -123,3 +123,49 @@ pub(crate) fn create_errinfo_fn(lua: &Lua) -> mlua::Result<Function> {
         error_lua_value(lua, &info)
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_values_stringify_and_concatenate_as_the_concise_form() {
+        let lua = Lua::new();
+        let info = nitr_core::ErrorInfo::from_message("app.lua:7: boom");
+        let err = error_lua_value(&lua, &info).expect("value");
+        lua.globals().set("err", err).expect("set");
+
+        let (text, concat, message, line): (String, String, String, u32) = lua
+            .load(r#"return tostring(err), "got: " .. err, err.message, err.line"#)
+            .eval()
+            .expect("eval");
+        assert!(text.contains("boom"), "tostring: {text}");
+        assert!(text.contains("app.lua:7"), "tostring: {text}");
+        assert_eq!(concat, format!("got: {text}"));
+        assert_eq!(message, "boom");
+        assert_eq!(line, 7);
+    }
+
+    #[test]
+    fn errinfo_classifies_and_is_idempotent() {
+        let lua = Lua::new();
+        lua.globals()
+            .set("errinfo", create_errinfo_fn(&lua).expect("fn"))
+            .expect("set");
+        let (message, kind, twice_same): (String, String, bool) = lua
+            .load(
+                // `error(msg, 0)`: no position prefix, so the message is
+                // exactly what the script raised.
+                r#"local ok, caught = pcall(function() error("nope", 0) end)
+                   assert(not ok)
+                   local info = errinfo(caught)
+                   local again = errinfo(info)
+                   return info.message, info.kind, rawequal(info, again)"#,
+            )
+            .eval()
+            .expect("eval");
+        assert_eq!(message, "nope");
+        assert_eq!(kind, "lua");
+        assert!(twice_same, "a structured value passes through unchanged");
+    }
+}

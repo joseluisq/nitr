@@ -485,11 +485,18 @@ mod tests {
 
         // Wrong key, wrong aad, tampered ciphertext, garbage: all nil.
         let other_key = "ffffffffffffffffffffffffffffffff";
+        // The tamper must actually change a byte: the nonce is random, so a
+        // fixed replacement character is a 1-in-64 no-op when the first
+        // base64 char already is that character (a real flake seen in CI).
+        let tampered = match sealed.strip_prefix('A') {
+            Some(rest) => format!("B{rest}"),
+            None => format!("A{}", &sealed[1..]),
+        };
         for (k, sealed, aad) in [
             (other_key, sealed.clone(), Some("ctx")),
             (key, sealed.clone(), Some("other")),
             (key, sealed.clone(), None),
-            (key, format!("A{}", &sealed[1..]), Some("ctx")),
+            (key, tampered, Some("ctx")),
             (key, "garbage".to_string(), Some("ctx")),
         ] {
             let opened: Option<String> = open.call((k, sealed, aad)).expect("open");
@@ -715,5 +722,51 @@ mod tests {
         assert!(eq.call::<bool>(("same", "same")).expect("eq"));
         assert!(!eq.call::<bool>(("same", "diff")).expect("eq"));
         assert!(!eq.call::<bool>(("same", "longer-value")).expect("eq"));
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(48))]
+        /// Property: seal/open round-trips arbitrary binary plaintexts and
+        /// aads, and a single changed character at any position — or the
+        /// wrong key — never opens.
+        #[test]
+        fn prop_seal_open_round_trips_and_rejects_tampering(
+            plaintext in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64),
+            aad in proptest::option::of("[ -~]{1,16}"),
+            pos in proptest::prelude::any::<proptest::sample::Index>(),
+        ) {
+            let lua = Lua::new();
+            let crypto = create_crypto_table(&lua).expect("crypto table");
+            let seal: mlua::Function = crypto.get("seal").expect("fn");
+            let open: mlua::Function = crypto.get("open").expect("fn");
+            let key = "0123456789abcdef0123456789abcdef";
+            let other_key = "ffffffffffffffff0000000000000000";
+            let input = lua.create_string(&plaintext).expect("bytes");
+
+            let sealed: String = seal.call((key, &input, aad.as_deref())).expect("seal");
+            let opened: Option<mlua::LuaString> = open
+                .call((key, sealed.as_str(), aad.as_deref()))
+                .expect("open");
+            let opened = opened.expect("opened");
+            let opened_bytes = opened.as_bytes();
+            proptest::prop_assert_eq!(opened_bytes.as_ref(), &plaintext[..]);
+
+            proptest::prop_assert_eq!(
+                open.call::<Option<String>>((other_key, sealed.as_str(), aad.as_deref()))
+                    .expect("open"),
+                None
+            );
+
+            // Flip one character at any position to a different one.
+            let pos = pos.index(sealed.len());
+            let mut tampered: Vec<char> = sealed.chars().collect();
+            tampered[pos] = if tampered[pos] == 'A' { 'B' } else { 'A' };
+            let tampered: String = tampered.into_iter().collect();
+            proptest::prop_assert_eq!(
+                open.call::<Option<String>>((key, tampered, aad.as_deref()))
+                    .expect("open"),
+                None
+            );
+        }
     }
 }

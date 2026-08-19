@@ -17,6 +17,7 @@ use mlua::{
 };
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, LOCATION};
 use reqwest::{Client as HttpClient, Method as HttpMethod, StatusCode, Url, redirect};
+use tracing::Instrument as _;
 
 use crate::config::FetchOptions;
 use crate::fetch::policy::{ConnectPolicy, GuardedResolver, check_url};
@@ -233,7 +234,28 @@ async fn execute(
         if let Some(timeout) = timeout {
             builder = builder.timeout(timeout);
         }
-        let resp = builder.send().await.into_lua_err()?;
+        // The `fetch` span, one per network exchange (so per redirect hop
+        // and per retry attempt). Host only, never the full URL — query
+        // strings carry secrets; the connected IP is the address the
+        // SSRF-vetted resolution actually produced, which is the
+        // security-relevant fact for an audit trail. DEBUG so the
+        // per-request decomposition is opt-in via the level filter.
+        let span = tracing::debug_span!(
+            "fetch",
+            host = %url.host_str().unwrap_or_default(),
+            method = %method,
+            status = tracing::field::Empty,
+            ip = tracing::field::Empty,
+            elapsed_ms = tracing::field::Empty,
+        );
+        let started = std::time::Instant::now();
+        let sent = builder.send().instrument(span.clone()).await;
+        span.record("elapsed_ms", started.elapsed().as_millis() as u64);
+        let resp = sent.into_lua_err()?;
+        span.record("status", resp.status().as_u16());
+        if let Some(addr) = resp.remote_addr() {
+            span.record("ip", tracing::field::display(addr.ip()));
+        }
 
         if !resp.status().is_redirection() {
             return Ok(LuaResponse::new(resp, opts.max_response_bytes));

@@ -73,12 +73,15 @@ impl Service<Request<Incoming>> for Svc {
         let protection = self.protection.clone();
         let id = protection.request_id(&req);
         // The per-request span: every tracing event below it (including
-        // Lua `log.*` calls) carries the request id, method, and path.
+        // Lua `log.*` calls) carries the request id, method, and path;
+        // `status` is recorded when the response is built, so the span's
+        // close line doubles as an access log.
         let span = tracing::info_span!(
             "request",
             id = %id,
             method = %req.method(),
             path = %req.uri().path(),
+            status = tracing::field::Empty,
         );
         let req = LuaRequest {
             peer_addr: self.peer_addr,

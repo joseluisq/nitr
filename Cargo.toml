@@ -91,6 +91,7 @@ multer = "3.1"
 dotenvy = "0.15"
 notify = { version = "8", default-features = false, features = ["macos_kqueue"] }
 percent-encoding = "2.3"
+proptest = "1"
 mlua = { version = "0.12", features = ["async", "macros", "lua54", "serialize", "vendored", "anyhow", "send"] }
 # TLS comes from rustls (ring provider), not the `default-tls` backend.
 # `default-tls` means `native-tls`, which is OpenSSL on every unix except

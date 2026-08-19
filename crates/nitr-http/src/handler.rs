@@ -9,6 +9,7 @@ use futures_util::FutureExt as _;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+use tracing::Instrument as _;
 
 use crate::app::{self, AppState};
 use crate::protect::Protection;
@@ -68,6 +69,9 @@ pub(crate) async fn handle(
             error_response(&err, dev_mode)?
         }
     };
+    // Completes the `request` span: its close line now reads as an access
+    // log entry (id, method, path, status, timing).
+    tracing::Span::current().record("status", resp.status().as_u16());
     if let Ok(value) = header::HeaderValue::from_str(&id) {
         resp.headers_mut().insert("x-request-id", value);
     }
@@ -217,7 +221,17 @@ async fn handle_inner(
             // The request becomes a Lua value up front so the error handler
             // can receive the same object the handler saw.
             let req_ud = rt.lua().create_userdata(req)?;
-            let err = match rt.call_function::<LuaTable>(chain, &req_ud).await {
+            // The `lua_handler` span: how long the script itself ran, with
+            // any `nitr.log` lines it emits nested inside. DEBUG so the
+            // decomposition is opt-in via the level filter.
+            let span = tracing::debug_span!("lua_handler", elapsed_ms = tracing::field::Empty);
+            let started = std::time::Instant::now();
+            let called = rt
+                .call_function::<LuaTable>(chain, &req_ud)
+                .instrument(span.clone())
+                .await;
+            span.record("elapsed_ms", started.elapsed().as_millis() as u64);
+            let err = match called {
                 // `finish` releases the body itself: a streaming body may
                 // still be reading from the request.
                 Ok(lua_resp) => return finish(rt, lua_resp, &streams, dev_mode, &req_ud),

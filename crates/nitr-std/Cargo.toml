@@ -76,3 +76,6 @@ minijinja = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 rusqlite = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

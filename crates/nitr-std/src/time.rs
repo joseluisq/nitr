@@ -259,4 +259,25 @@ mod tests {
         let b: f64 = call(&lua, &time, "monotonic", ());
         assert!(b >= a);
     }
+
+    proptest::proptest! {
+        /// Property: `parse(iso8601(ts))` and the strftime round trip are
+        /// the identity for any timestamp between 1970 and 2100.
+        #[test]
+        fn prop_timestamps_round_trip(ts in 0i64..4_102_444_800) {
+            let lua = Lua::new();
+            let time = create_time_table(&lua).expect("table");
+            let iso: String = call(&lua, &time, "iso8601", ts);
+            let (parsed, err): (Option<i64>, Option<String>) =
+                call(&lua, &time, "parse", (iso, "%Y-%m-%dT%H:%M:%SZ"));
+            proptest::prop_assert_eq!(err, None);
+            proptest::prop_assert_eq!(parsed, Some(ts));
+
+            let formatted: String =
+                call(&lua, &time, "format", (ts, "%Y-%m-%d %H:%M:%S"));
+            let (parsed, _): (Option<i64>, Option<String>) =
+                call(&lua, &time, "parse", (formatted, "%Y-%m-%d %H:%M:%S"));
+            proptest::prop_assert_eq!(parsed, Some(ts));
+        }
+    }
 }
