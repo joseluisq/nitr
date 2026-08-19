@@ -81,10 +81,20 @@ enum Command {
 fn load_config(cli: &Cli) -> anyhow::Result<Config> {
     // A bundled executable carries its own application; the config file
     // and every path in it come from the extracted archive.
+    // Where a relative `env_file` (and the implicit `.env`) resolves: next
+    // to the config file. A bundle's config lives in a temp extraction
+    // dir, but its env file is external state like the database, so it
+    // resolves against the working directory instead.
+    let mut env_base = PathBuf::from(".");
     let mut cfg = match bundle::load()? {
         Some(cfg) => cfg,
         None => match &cli.config {
-            Some(path) => Config::from_file(path)?,
+            Some(path) => {
+                if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    env_base = parent.to_path_buf();
+                }
+                Config::from_file(path)?
+            }
             None => {
                 let default = Path::new(DEFAULT_CONFIG_FILE);
                 if default.is_file() {
@@ -95,6 +105,9 @@ fn load_config(cli: &Cli) -> anyhow::Result<Config> {
             }
         },
     };
+    // The env file loads first so `apply_env` sees its values — while the
+    // real process environment still wins (the file never overwrites it).
+    cfg.load_env_file(&env_base)?;
     cfg.apply_env()?;
     if cli.dev || matches!(cli.command, Some(Command::Dev)) {
         cfg.dev_mode = true;
@@ -279,7 +292,7 @@ fn migrate(cfg: &Config, status_only: bool) -> anyhow::Result<()> {
     let db = cfg
         .database
         .as_ref()
-        .context("no database is configured; set `database` in nitr.toml")?;
+        .context("no database is configured; add a `[database]` section to nitr.toml")?;
     let dir = db.migrations().context(
         "no migrations directory found (looked for `migrations/`; set \
          [database] migrations_dir to point elsewhere)",
@@ -382,10 +395,7 @@ fn collect_outcomes(lua: &mlua::Lua) -> anyhow::Result<Vec<TestOutcome>> {
 }
 
 async fn run_tests(cfg: Config, filter: Option<&str>) -> anyhow::Result<usize> {
-    let tests_dir = cfg
-        .tests_dir
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("tests"));
+    let tests_dir = cfg.testing.dir.clone();
     let mut files: Vec<PathBuf> = std::fs::read_dir(&tests_dir)
         .with_context(|| format!("cannot read the tests directory {}", tests_dir.display()))?
         .filter_map(|entry| entry.ok().map(|e| e.path()))
@@ -406,6 +416,7 @@ async fn run_tests(cfg: Config, filter: Option<&str>) -> anyhow::Result<usize> {
             .map(|db| db.pragmas())
             .unwrap_or_default(),
         fetch: cfg.fetch.options(),
+        env: cfg.env_options(),
         // Tests get their own cache: a test file must not see entries a
         // previous one left behind.
         cache: Some(nitr::stdlib::Cache::new(cfg.cache_options())),

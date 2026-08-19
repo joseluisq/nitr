@@ -624,6 +624,32 @@ function nitr.url.query_build(params) end
 ---@return string|nil _ Reason when nil.
 function nitr.url.parse(value) end
 
+---Read-only environment variable access. Opt-in; reads are filtered by `[env] allow`, and `NITR_*` internals are never visible. Getters only: no setter, no enumeration. (std feature: `env`)
+nitr.env = {}
+
+---Reads one variable.
+---@param name string
+---@param default? string
+---@return string|nil _ The value, or the default (nil without one) when unset or not readable.
+function nitr.env.get(name, default) end
+
+---Whether the variable is set and readable; a policy-hidden name reports false.
+---@param name string
+---@return boolean
+function nitr.env.has(name) end
+
+---Reads and parses a number; unset or unparseable answers the default.
+---@param name string
+---@param default? number
+---@return number|nil
+function nitr.env.number(name, default) end
+
+---Reads a flag: 1/true/yes/on and 0/false/no/off (any case); anything else answers the default.
+---@param name string
+---@param default? boolean
+---@return boolean|nil
+function nitr.env.bool(name, default) end
+
 ---The `nitr test` framework: available in test files only. (available in `nitr test` files)
 nitr.test = {}
 

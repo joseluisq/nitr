@@ -65,6 +65,7 @@ mime_guess = "2.0"
 minijinja = { version = "2.24.0", features = ["loader"] }
 multer = "3.1"
 # Dev-mode file watcher: a save triggers the rebuild, not the next request.
+dotenvy = "0.15"
 notify = { version = "8", default-features = false, features = ["macos_kqueue"] }
 percent-encoding = "2.3"
 mlua = { version = "0.12", features = ["async", "macros", "lua54", "serialize", "vendored", "anyhow", "send"] }

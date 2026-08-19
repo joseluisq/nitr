@@ -570,6 +570,17 @@ functions = [
 ]
 
 [[table]]
+name = "nitr.env"
+feature = "env"
+desc = "Read-only environment variable access. Opt-in; reads are filtered by `[env] allow`, and `NITR_*` internals are never visible. Getters only: no setter, no enumeration."
+functions = [
+  { name = "get", params = [{ name = "name", type = "string" }, { name = "default", type = "string?" }], returns = [{ type = "string|nil", desc = "The value, or the default (nil without one) when unset or not readable." }], desc = "Reads one variable." },
+  { name = "has", params = [{ name = "name", type = "string" }], returns = [{ type = "boolean" }], desc = "Whether the variable is set and readable; a policy-hidden name reports false." },
+  { name = "number", params = [{ name = "name", type = "string" }, { name = "default", type = "number?" }], returns = [{ type = "number|nil" }], desc = "Reads and parses a number; unset or unparseable answers the default." },
+  { name = "bool", params = [{ name = "name", type = "string" }, { name = "default", type = "boolean?" }], returns = [{ type = "boolean|nil" }], desc = "Reads a flag: 1/true/yes/on and 0/false/no/off (any case); anything else answers the default." },
+]
+
+[[table]]
 name = "nitr.test"
 feature = "test"
 desc = "The `nitr test` framework: available in test files only."

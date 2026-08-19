@@ -3,8 +3,12 @@
 listen = "127.0.0.1:3000"
 handler_script = "crates/nitr/examples/app-package/app.lua"
 config_script = "crates/nitr/examples/app-package/config.lua"
-database = "/tmp/nitr-app-package.db"
-tests_dir = "crates/nitr/examples/app-package/tests"
+
+[database]
+path = "/tmp/nitr-app-package.db"
+
+[testing]
+dir = "crates/nitr/examples/app-package/tests"
 
 # Opt into the `db` standard library feature on top of the minimal
 # defaults (json, http, log, time, validate, base64, path, url).

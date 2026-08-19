@@ -65,6 +65,18 @@ impl Default for FetchOptions {
     }
 }
 
+/// Read policy for the `nitr.env` builtin.
+///
+/// The builtin itself is opt-in (`[std] features`); this narrows what an
+/// enabled one may see. `NITR_*` variables are hidden from scripts
+/// unconditionally — they configure the server, not the application.
+#[derive(Debug, Clone, Default)]
+pub struct EnvOptions {
+    /// Names scripts may read: exact names, or prefixes written with a
+    /// trailing `_` (`"APP_"`). `None` allows every non-`NITR_*` variable.
+    pub allow: Option<Vec<String>>,
+}
+
 /// The pragma set applied to a connection when it is opened.
 #[derive(Debug, Clone)]
 pub struct SqlitePragmas {

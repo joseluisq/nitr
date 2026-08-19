@@ -91,6 +91,70 @@ fn check_print_config_shows_the_effective_layering() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[test]
+fn env_files_feed_overrides_and_the_process_environment_wins() {
+    require_runnable_binary!();
+    let dir = scaffold("env-file", true);
+    // `.env` next to nitr.toml loads implicitly; NITR_* values it carries
+    // become overrides exactly as if they came from the environment.
+    std::fs::write(dir.join(".env"), "NITR_WORKERS=7\nNITR_TESTING_DIR=spec\n")
+        .expect("write .env");
+    let out = nitr()
+        .current_dir(&dir)
+        .args(["check", "--print-config"])
+        .output()
+        .expect("run check");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("workers = 7"), "got: {stdout}");
+    assert!(stdout.contains("dir = \"spec\""), "got: {stdout}");
+
+    // The real process environment beats the file.
+    let out = nitr()
+        .current_dir(&dir)
+        .env("NITR_WORKERS", "2")
+        .args(["check", "--print-config"])
+        .output()
+        .expect("run check");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("workers = 2"), "got: {stdout}");
+
+    // An explicitly configured env file must exist.
+    let toml = dir.join("nitr.toml");
+    let mut cfg = std::fs::read_to_string(&toml).expect("read nitr.toml");
+    cfg.push_str("\n[env]\nfile = \"missing.env\"\n");
+    std::fs::write(&toml, cfg).expect("write nitr.toml");
+    let out = nitr()
+        .current_dir(&dir)
+        .args(["check"])
+        .output()
+        .expect("run check");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("missing.env"), "got: {stderr}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn renamed_env_variables_fail_with_the_new_name() {
+    require_runnable_binary!();
+    let dir = scaffold("env-rename", true);
+    let out = nitr()
+        .current_dir(&dir)
+        .env("NITR_DATABASE", "app.db")
+        .args(["check"])
+        .output()
+        .expect("run check");
+    assert!(!out.status.success(), "the stale name must refuse to start");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("NITR_DATABASE_PATH"), "got: {stderr}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 // The full scaffold uses the database and templates; a build without
 // those features cannot run it.
 #[cfg(all(feature = "db", feature = "template"))]

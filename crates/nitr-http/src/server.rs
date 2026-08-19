@@ -703,6 +703,7 @@ fn new_runtime(
             .map(|db| db.pragmas())
             .unwrap_or_default(),
         fetch: cfg.fetch.options(),
+        env: cfg.env_options(),
         cache: cache.cloned(),
     };
     nitr_std::register_builtins(rt.lua(), builtins, &env)?;

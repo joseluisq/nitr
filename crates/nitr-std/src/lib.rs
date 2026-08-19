@@ -24,6 +24,7 @@ pub(crate) mod crypto;
 pub(crate) mod csrf;
 #[cfg(feature = "db")]
 pub(crate) mod db;
+pub(crate) mod env;
 #[cfg(feature = "fetch")]
 pub(crate) mod fetch;
 pub(crate) mod http;
@@ -41,7 +42,7 @@ pub(crate) mod validate;
 pub use cache::{Cache, CacheOptions};
 // The configuration types are always available: `nitr.toml` has one shape
 // regardless of which builtins this build compiled in.
-pub use config::{FetchOptions, SqlitePragmas};
+pub use config::{EnvOptions, FetchOptions, SqlitePragmas};
 pub use http::{RequestCookies, ResponseCookies, best_match};
 pub use utils::error_lua_value;
 
@@ -113,6 +114,10 @@ bitflags::bitflags! {
         /// `nitr.url`: percent-encoding, query strings, and a lexical
         /// URL splitter.
         const URL = 1 << 13;
+        /// `nitr.env`: read-only environment variable access
+        /// (`get`/`has`/`number`/`bool`), filtered by `[env] allow` and
+        /// never exposing `NITR_*` internals.
+        const ENV = 1 << 14;
     }
 }
 
@@ -154,6 +159,7 @@ impl Builtins {
             Builtins::BASE64 => Some("base64"),
             Builtins::PATH => Some("path"),
             Builtins::URL => Some("url"),
+            Builtins::ENV => Some("env"),
             _ => None,
         }
     }
@@ -176,6 +182,7 @@ impl Builtins {
             "base64" => Some(Builtins::BASE64),
             "path" => Some(Builtins::PATH),
             "url" => Some(Builtins::URL),
+            "env" => Some(Builtins::ENV),
             _ => None,
         }
     }
@@ -197,6 +204,8 @@ pub struct BuiltinsEnv {
     pub cache: Option<Cache>,
     /// Outbound-request policy for the `fetch` builtin.
     pub fetch: FetchOptions,
+    /// Read policy for the `nitr.env` builtin.
+    pub env: EnvOptions,
 }
 
 /// Registers the selected builtins as fields of the global `nitr`
@@ -265,6 +274,7 @@ pub fn register_builtins(lua: &mlua::Lua, builtins: Builtins, env: &BuiltinsEnv)
             Builtins::BASE64 => nitr.set("base64", base64::create_base64_table(lua)?)?,
             Builtins::PATH => nitr.set("path", path::create_path_table(lua)?)?,
             Builtins::URL => nitr.set("url", url::create_url_table(lua)?)?,
+            Builtins::ENV => nitr.set("env", env::create_env_table(lua, &env.env)?)?,
             // Registers both `nitr.crypto` and `nitr.auth`.
             #[cfg(feature = "crypto")]
             Builtins::CRYPTO => {
@@ -319,6 +329,7 @@ mod tests {
             ("base64", Builtins::BASE64),
             ("path", Builtins::PATH),
             ("url", Builtins::URL),
+            ("env", Builtins::ENV),
         ] {
             assert_eq!(Builtins::from_config_name(name), Some(flag));
         }

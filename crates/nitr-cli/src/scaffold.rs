@@ -70,7 +70,8 @@ templates_dir = "templates"
 
 # SQLite: WAL, busy timeout and foreign keys are on by default. The data/
 # directory holds mutable state and stays out of version control.
-database = "data/app.db"
+[database]
+path = "data/app.db"
 
 [std]
 features = ["json", "http", "log", "time", "validate", "base64", "path", "url", "db", "template"]

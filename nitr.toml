@@ -20,9 +20,9 @@ config_script = "scripts/config.lua"
 # it the `nitr.template` builtin is unavailable.
 templates_dir = "scripts/templates"
 
-# SQLite database file for the `nitr.db` builtin. Optional: without it the
-# `nitr.db` builtin is unavailable.
-database = "scripts/file.db"
+# Development mode: hot-reload the handler script on change.
+# Default: false (also enabled by the --dev flag).
+dev_mode = true
 
 # Number of pooled Lua states (max concurrently executing handlers).
 # Default: number of CPU cores.
@@ -37,6 +37,10 @@ database = "scripts/file.db"
 # instead of generating one. Enable only behind a proxy that sets or
 # sanitizes the header.
 #trust_request_id = false
+
+# File the server writes its pid to at startup (removed at exit); what
+# `nitr reload` uses to find the process.
+#pidfile = "/run/nitr/nitr.pid"
 
 # Request-size and connection limits, enforced before a request reaches Lua.
 #[limits]
@@ -57,16 +61,17 @@ database = "scripts/file.db"
                              # `max_body_bytes` too — it bounds the whole
                              # request, uploads included.
 
-# SQLite. Either a bare path (`database = "app.db"`, taking the defaults
-# below) or this table when the pragmas need tuning.
+# SQLite database for the `nitr.db` builtin. Optional: without this
+# section the `nitr.db` builtin is unavailable. `path` is the only
+# required key; the pragma defaults below are already applied.
 #
 # WAL matters most: with one connection per pooled state, SQLite's default
 # rollback journal serializes every writer and fails fast on contention.
 # It also changes the on-disk file set to `app.db`, `app.db-wal` and
 # `app.db-shm`, so copying only `app.db` while the server runs no longer
 # captures a consistent snapshot -- use `VACUUM INTO` or stop the server.
-#[database]
-#path = "app.db"
+[database]
+path = "scripts/file.db"
 #journal_mode = "wal"      # or "delete"; "keep" leaves the existing mode
 #busy_timeout = 5000       # ms to wait on a lock instead of failing
 #synchronous = "normal"    # the right pairing with WAL
@@ -154,8 +159,19 @@ database = "scripts/file.db"
 #spa = false                 # serve index.html for unknown paths
 #cache_control = "public, max-age=3600"
 
-# Directory `nitr test` discovers *.lua test files in (default: "tests").
-#tests_dir = "tests"
+# The `nitr test` runner.
+#[testing]
+#dir = "tests"             # where *.lua test files are discovered
+
+# Environment handling: a dotenv-style file loaded at startup, and what
+# the opt-in `nitr.env` builtin may read. The file's values never override
+# the real process environment, and `NITR_*` internals are always hidden
+# from scripts.
+#[env]
+#file = ".env"             # default: `.env` next to nitr.toml, if present
+#allow = ["APP_", "API_TOKEN"]  # exact names, or prefixes ending in `_`;
+                                # unset lets an enabled `env` builtin read
+                                # any non-NITR_* variable
 
 # Health and readiness endpoints, answered entirely in Rust (a handler
 # cannot influence them). Enabled by default on the main listener.
@@ -174,14 +190,6 @@ database = "scripts/file.db"
 #format = "text"
 #level = "info"            # default: info (debug in dev mode)
 
-# File the server writes its pid to at startup (removed at exit); what
-# `nitr reload` uses to find the process.
-#pidfile = "/run/nitr/nitr.pid"
-
-# Development mode: hot-reload the handler script on change.
-# Default: false (also enabled by the --dev flag).
-dev_mode = true
-
 # Standard library (`nitr.*`) modules exposed to scripts.
 #
 # A feature must also be compiled into the binary. The released `nitr`
@@ -193,9 +201,9 @@ dev_mode = true
 # only a minimal set is enabled: "json", "http", "log", "time",
 # "validate", "base64", "path", "url". Valid names: "dbg", "fetch",
 # "template", "json", "db", "http", "log", "crypto", "cache", "time",
-# "validate", "base64", "path", "url".
+# "validate", "base64", "path", "url", "env".
 # Listing a feature is strict: a listed feature missing its configuration
-# (e.g. "db" without `database`) fails at startup.
+# (e.g. "db" without a `[database]` section) fails at startup.
 [std]
 features = [
     "dbg", "fetch", "template", "json", "db", "http", "log", "crypto",

@@ -190,9 +190,11 @@ listen = "127.0.0.1:3000"
 handler_script = "scripts/handler.lua"
 config_script = "scripts/config.lua"    # optional
 templates_dir = "scripts/templates"     # enables `nitr.template`
-database = "scripts/file.db"            # enables `nitr.db`
 workers = 4                             # Lua states; default: CPU cores
 dev_mode = false                        # hot reload + error details
+
+[database]
+path = "scripts/file.db"                # enables `nitr.db`
 
 [std]
 # `nitr.*` standard library features; default: ["json", "http", "log",

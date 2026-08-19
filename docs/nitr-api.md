@@ -186,6 +186,15 @@ Percent-encoding, query strings, and a lexical URL splitter.
 - `nitr.url.query_build(params) -> string` — Builds a query string, keys sorted.
 - `nitr.url.parse(value) -> table|nil, string|nil` — Splits a URL lexically (not a WHATWG parser).
 
+### `nitr.env` (std feature: `env`)
+
+Read-only environment variable access. Opt-in; reads are filtered by `[env] allow`, and `NITR_*` internals are never visible. Getters only: no setter, no enumeration.
+
+- `nitr.env.get(name, default) -> string|nil` — Reads one variable.
+- `nitr.env.has(name) -> boolean` — Whether the variable is set and readable; a policy-hidden name reports false.
+- `nitr.env.number(name, default) -> number|nil` — Reads and parses a number; unset or unparseable answers the default.
+- `nitr.env.bool(name, default) -> boolean|nil` — Reads a flag: 1/true/yes/on and 0/false/no/off (any case); anything else answers the default.
+
 ### `nitr.test` (available in `nitr test` files)
 
 The `nitr test` framework: available in test files only.
