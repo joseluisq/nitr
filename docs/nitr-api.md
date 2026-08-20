@@ -173,7 +173,7 @@ Lexical path manipulation (POSIX and Windows styles). Pure text: nothing touches
 - `nitr.path.basename(path) -> string` — The final component.
 - `nitr.path.dirname(path) -> string` — The directory part.
 - `nitr.path.extension(path) -> string|nil` — The extension without the dot; nil for none (dotfiles included).
-- `nitr.path.normalize(path) -> string` — Resolves `.`/`..` lexically; `..` cannot climb out of the root.
+- `nitr.path.normalize(path) -> string` — Resolves `.`/`..` lexically; `..` cannot climb out of the root. Text-only: before real file access on Windows also reject segments with trailing dots/spaces or colons, which Win32 rewrites.
 - `nitr.path.is_absolute(path) -> boolean` — Whether the path is absolute (`/x`, `C:\x`, UNC).
 
 ### `nitr.url` (std feature: `url`)

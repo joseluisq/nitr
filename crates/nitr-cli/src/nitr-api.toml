@@ -553,7 +553,7 @@ functions = [
   { name = "basename", params = [{ name = "path", type = "string" }], returns = [{ type = "string" }], desc = "The final component." },
   { name = "dirname", params = [{ name = "path", type = "string" }], returns = [{ type = "string" }], desc = "The directory part." },
   { name = "extension", params = [{ name = "path", type = "string" }], returns = [{ type = "string|nil" }], desc = "The extension without the dot; nil for none (dotfiles included)." },
-  { name = "normalize", params = [{ name = "path", type = "string" }], returns = [{ type = "string" }], desc = "Resolves `.`/`..` lexically; `..` cannot climb out of the root." },
+  { name = "normalize", params = [{ name = "path", type = "string" }], returns = [{ type = "string" }], desc = "Resolves `.`/`..` lexically; `..` cannot climb out of the root. Text-only: before real file access on Windows also reject segments with trailing dots/spaces or colons, which Win32 rewrites." },
   { name = "is_absolute", params = [{ name = "path", type = "string" }], returns = [{ type = "boolean" }], desc = "Whether the path is absolute (`/x`, `C:\\x`, UNC)." },
 ]
 

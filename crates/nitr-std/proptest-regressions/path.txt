@@ -1,0 +1,12 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+# "./C:.." normalized to "C:..", which re-parses as drive-relative.
+cc 3d50ee97e1f7a757f471b8853fa6e8d39c233ace4bc8429a6a2d951edf689676
+# Windows CI: "///ax/y" split its rest through std::path, whose RootDir
+# stringifies as "\" there and "/" on Unix — the same input normalized
+# differently per host OS, and not idempotently on Windows.
+cc d827a87a1373c62aa26dd3156cb9485e7ac20d7bb747afdf503fbf7c7de8dda0

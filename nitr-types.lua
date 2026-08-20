@@ -585,7 +585,7 @@ function nitr.path.dirname(path) end
 ---@return string|nil
 function nitr.path.extension(path) end
 
----Resolves `.`/`..` lexically; `..` cannot climb out of the root.
+---Resolves `.`/`..` lexically; `..` cannot climb out of the root. Text-only: before real file access on Windows also reject segments with trailing dots/spaces or colons, which Win32 rewrites.
 ---@param path string
 ---@return string
 function nitr.path.normalize(path) end
