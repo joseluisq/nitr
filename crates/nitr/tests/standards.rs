@@ -2,11 +2,12 @@
 //! assume exist — ranges, compression, CORS, form and multipart bodies,
 //! conditional dynamic responses — plus the correctness audit.
 
-use std::net::SocketAddr;
+mod harness;
+
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
+use harness::TestServer;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 const APP_SCRIPT: &str = r#"
@@ -87,148 +88,41 @@ end)
 return app
 "#;
 
-/// A scratch directory private to one caller.
-///
-/// Every test here runs as a thread of the same process, so a directory
-/// keyed only on the pid would be shared by all of them. `fs::write`
-/// truncates before it writes, so one test rewriting `app.lua` while
-/// another's server is reading it hands that server an empty file — a
-/// race that surfaces as "must return a nitr.app(), got nil". The counter
-/// keeps every test on its own copy.
-fn scratch_dir() -> PathBuf {
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("nitr-standards-{}-{id}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    dir
+/// The standard app on two workers with an upload directory wired through
+/// the configuration script, the way any deployment setting reaches Lua.
+fn builder() -> harness::Builder {
+    let b = TestServer::builder("standards")
+        .handler(APP_SCRIPT)
+        .builtins(nitr::Builtins::JSON | nitr::Builtins::HTTP)
+        .config(|cfg| cfg.workers = 2);
+    let uploads = b.dir().join("uploads");
+    std::fs::create_dir_all(&uploads).expect("uploads dir");
+    b.config_script(format!(
+        "return {{ upload_dir = {:?} }}",
+        uploads.to_string_lossy()
+    ))
 }
 
-/// Binds port 0 (the OS picks a free port) and keeps the listener alive.
-/// The server adopts it via `.listener(...)`, so the port can never be
-/// taken by another test between choosing it and serving on it.
-fn reserve_addr() -> (std::net::TcpListener, SocketAddr) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind port 0");
-    let addr = listener.local_addr().expect("local addr");
-    (listener, addr)
-}
-
-async fn wait_until_listening(addr: SocketAddr) {
-    for _ in 0..200 {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("the server never started listening on {addr}");
-}
-
-fn base_config() -> nitr::Config {
-    // `Harness::start` reserves the real address; this placeholder is
-    // never bound.
-    let mut cfg = nitr::Config {
-        listen: "127.0.0.1:0".parse().expect("addr"),
-        workers: 2,
-        ..Default::default()
-    };
-    cfg.shutdown.grace = 5;
-    cfg.shutdown.stream_grace = 0;
-    cfg
-}
-
-/// A running server plus the handles needed to stop it.
-struct Harness {
-    addr: SocketAddr,
-    client: reqwest::Client,
-    /// This server's own scratch directory, so a test can assert on what
-    /// the handler wrote (uploads) without reaching into another's.
-    dir: PathBuf,
-    stop: tokio::sync::oneshot::Sender<()>,
-    served: tokio::task::JoinHandle<nitr::Result>,
-}
-
-impl Harness {
-    async fn start(mut cfg: nitr::Config) -> Self {
-        let dir = scratch_dir();
-        let handler = dir.join("app.lua");
-        std::fs::write(&handler, APP_SCRIPT).expect("write handler");
-        // The upload directory reaches Lua the same way any deployment
-        // setting would: through the configuration script.
-        let config_script = dir.join("config.lua");
-        std::fs::write(
-            &config_script,
-            format!(
-                "return {{ upload_dir = {:?} }}",
-                dir.join("uploads").to_string_lossy()
-            ),
-        )
-        .expect("write config script");
-        std::fs::create_dir_all(dir.join("uploads")).expect("uploads dir");
-
-        let (tcp_listener, addr) = reserve_addr();
-        cfg.listen = addr;
-        let server = nitr::Server::builder()
-            .config(cfg)
-            .listener(tcp_listener)
-            .handler_script(&handler)
-            .config_script(&config_script)
-            .builtins(nitr::Builtins::JSON | nitr::Builtins::HTTP)
-            .build()
-            .await
-            .expect("build server");
-
-        let (stop, stop_rx) = tokio::sync::oneshot::channel::<()>();
-        let served = tokio::spawn(server.serve_with_shutdown(async {
-            let _ = stop_rx.await;
-        }));
-        wait_until_listening(addr).await;
-        Self {
-            addr,
-            // No automatic decompression: these tests assert on the bytes
-            // and headers actually sent.
-            client: reqwest::Client::builder()
-                .no_gzip()
-                .no_brotli()
-                .build()
-                .expect("client"),
-            dir,
-            stop,
-            served,
-        }
-    }
-
-    fn url(&self, path: &str) -> String {
-        format!("http://{}{path}", self.addr)
-    }
-
-    async fn stop(self) {
-        let _ = self.stop.send(());
-        self.served
-            .await
-            .expect("server task")
-            .expect("clean shutdown");
-    }
-}
-
-/// Writes a static tree with a precompressed sidecar and returns its path.
-fn static_dir() -> PathBuf {
-    let dir = scratch_dir().join("public");
-    std::fs::create_dir_all(&dir).expect("public dir");
-    std::fs::write(
-        dir.join("data.txt"),
+/// Writes a static tree with a precompressed sidecar into the builder's
+/// directory and returns its path.
+fn static_dir(b: &harness::Builder) -> PathBuf {
+    b.dir().write(
+        "public/data.txt",
         (0..1000u32)
             .map(|n| (b'a' + (n % 26) as u8) as char)
             .collect::<String>(),
-    )
-    .expect("write data.txt");
+    );
 
     // `app.js` plus a gzip sidecar whose contents differ visibly, so a test
     // can tell which one was served.
-    std::fs::write(dir.join("app.js"), b"console.log('identity');\n").expect("write app.js");
+    b.dir()
+        .write("public/app.js", b"console.log('identity');\n");
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     std::io::Write::write_all(&mut encoder, b"console.log('from the sidecar');\n")
         .expect("compress");
-    std::fs::write(dir.join("app.js.gz"), encoder.finish().expect("finish")).expect("write gz");
-    dir
+    b.dir()
+        .write("public/app.js.gz", encoder.finish().expect("finish"));
+    b.dir().join("public")
 }
 
 // ---------------------------------------------------------------------------
@@ -237,28 +131,27 @@ fn static_dir() -> PathBuf {
 /// as `206` with the matching `Content-Range`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn range_requests_serve_partial_content() {
-    let dir = static_dir();
-    let mut cfg = base_config();
-    cfg.static_files.dir = Some(dir.clone());
-    cfg.static_files.mount = Some("/assets".into());
-    let h = Harness::start(cfg).await;
+    let b = builder();
+    let dir = static_dir(&b);
+    let mut srv = b
+        .config(move |cfg| {
+            cfg.static_files.dir = Some(dir);
+            cfg.static_files.mount = Some("/assets".into());
+        })
+        .spawn()
+        .await;
 
     // Whole file: ranges are advertised.
-    let resp = h
-        .client
-        .get(h.url("/assets/data.txt"))
-        .send()
-        .await
-        .expect("full");
+    let resp = srv.get("/assets/data.txt").await;
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.headers()["accept-ranges"], "bytes");
     let full = resp.text().await.expect("body");
     assert_eq!(full.len(), 1000);
 
     // An explicit span.
-    let resp = h
-        .client
-        .get(h.url("/assets/data.txt"))
+    let resp = srv
+        .client()
+        .get(srv.url("/assets/data.txt"))
         .header("range", "bytes=10-19")
         .send()
         .await
@@ -269,9 +162,9 @@ async fn range_requests_serve_partial_content() {
     assert_eq!(resp.text().await.expect("body"), &full[10..20]);
 
     // A suffix range.
-    let resp = h
-        .client
-        .get(h.url("/assets/data.txt"))
+    let resp = srv
+        .client()
+        .get(srv.url("/assets/data.txt"))
         .header("range", "bytes=-5")
         .send()
         .await
@@ -280,9 +173,9 @@ async fn range_requests_serve_partial_content() {
     assert_eq!(resp.text().await.expect("body"), &full[995..]);
 
     // Past the end: 416 with the true length, so the client can retry.
-    let resp = h
-        .client
-        .get(h.url("/assets/data.txt"))
+    let resp = srv
+        .client()
+        .get(srv.url("/assets/data.txt"))
         .header("range", "bytes=5000-6000")
         .send()
         .await
@@ -292,9 +185,9 @@ async fn range_requests_serve_partial_content() {
 
     // A stale If-Range must yield the whole file rather than a fragment
     // the client would splice into a different version.
-    let resp = h
-        .client
-        .get(h.url("/assets/data.txt"))
+    let resp = srv
+        .client()
+        .get(srv.url("/assets/data.txt"))
         .header("range", "bytes=0-9")
         .header("if-range", "\"stale\"")
         .send()
@@ -303,21 +196,23 @@ async fn range_requests_serve_partial_content() {
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.text().await.expect("body").len(), 1000);
 
-    h.stop().await;
+    srv.stop().await;
 }
 
 /// A `.gz` sidecar is served as-is: compressed once at build time, no
 /// runtime CPU, and used even though `[compression]` is off.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn precompressed_sidecars_are_served_when_accepted() {
-    let dir = static_dir();
-    let mut cfg = base_config();
-    cfg.static_files.dir = Some(dir);
-    let h = Harness::start(cfg).await;
+    let b = builder();
+    let dir = static_dir(&b);
+    let mut srv = b
+        .config(move |cfg| cfg.static_files.dir = Some(dir))
+        .spawn()
+        .await;
 
-    let resp = h
-        .client
-        .get(h.url("/app.js"))
+    let resp = srv
+        .client()
+        .get(srv.url("/app.js"))
         .header("accept-encoding", "gzip")
         .send()
         .await
@@ -340,9 +235,9 @@ async fn precompressed_sidecars_are_served_when_accepted() {
     assert_eq!(decoded, "console.log('from the sidecar');\n");
 
     // A client that does not accept gzip gets the identity file.
-    let resp = h
-        .client
-        .get(h.url("/app.js"))
+    let resp = srv
+        .client()
+        .get(srv.url("/app.js"))
         .header("accept-encoding", "identity")
         .send()
         .await
@@ -353,15 +248,15 @@ async fn precompressed_sidecars_are_served_when_accepted() {
         "console.log('identity');\n"
     );
 
-    h.stop().await;
+    srv.stop().await;
 }
 
 /// On-the-fly compression is off unless asked for, and correct when it is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dynamic_responses_compress_only_when_enabled() {
-    let off = Harness::start(base_config()).await;
+    let mut off = builder().spawn().await;
     let resp = off
-        .client
+        .client()
         .get(off.url("/big"))
         .header("accept-encoding", "gzip, br")
         .send()
@@ -374,12 +269,13 @@ async fn dynamic_responses_compress_only_when_enabled() {
     let identity_len = resp.bytes().await.expect("bytes").len();
     off.stop().await;
 
-    let mut cfg = base_config();
-    cfg.compression.enabled = true;
-    let on = Harness::start(cfg).await;
+    let mut on = builder()
+        .config(|cfg| cfg.compression.enabled = true)
+        .spawn()
+        .await;
 
     let resp = on
-        .client
+        .client()
         .get(on.url("/big"))
         .header("accept-encoding", "gzip")
         .send()
@@ -401,7 +297,7 @@ async fn dynamic_responses_compress_only_when_enabled() {
 
     // Server preference decides when the client accepts both.
     let resp = on
-        .client
+        .client()
         .get(on.url("/big"))
         .header("accept-encoding", "gzip, br")
         .send()
@@ -412,7 +308,7 @@ async fn dynamic_responses_compress_only_when_enabled() {
     // A short response is left alone: the encoder would cost more than it
     // saves.
     let resp = on
-        .client
+        .client()
         .get(on.url("/hello"))
         .header("accept-encoding", "gzip")
         .send()
@@ -426,16 +322,19 @@ async fn dynamic_responses_compress_only_when_enabled() {
 /// Preflights are answered in Rust, and the policy is enforced per origin.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cors_preflights_never_reach_lua() {
-    let mut cfg = base_config();
-    cfg.cors.origins = Some(vec!["https://app.example".into()]);
-    cfg.cors.headers = Some(vec!["content-type".into()]);
-    cfg.cors.max_age = Some(600);
-    let h = Harness::start(cfg).await;
+    let mut srv = builder()
+        .config(|cfg| {
+            cfg.cors.origins = Some(vec!["https://app.example".into()]);
+            cfg.cors.headers = Some(vec!["content-type".into()]);
+            cfg.cors.max_age = Some(600);
+        })
+        .spawn()
+        .await;
 
     // A preflight for a path that has no route at all still gets answered.
-    let resp = h
-        .client
-        .request(reqwest::Method::OPTIONS, h.url("/no-such-route"))
+    let resp = srv
+        .client()
+        .request(reqwest::Method::OPTIONS, srv.url("/no-such-route"))
         .header("origin", "https://app.example")
         .header("access-control-request-method", "POST")
         .header("access-control-request-headers", "content-type")
@@ -450,9 +349,9 @@ async fn cors_preflights_never_reach_lua() {
     assert_eq!(resp.headers()["access-control-max-age"], "600");
 
     // An origin outside the policy is answered, but not approved.
-    let resp = h
-        .client
-        .request(reqwest::Method::OPTIONS, h.url("/hello"))
+    let resp = srv
+        .client()
+        .request(reqwest::Method::OPTIONS, srv.url("/hello"))
         .header("origin", "https://evil.example")
         .header("access-control-request-method", "GET")
         .send()
@@ -462,9 +361,9 @@ async fn cors_preflights_never_reach_lua() {
     assert!(!resp.headers().contains_key("access-control-allow-origin"));
 
     // An ordinary cross-origin response carries the allow header.
-    let resp = h
-        .client
-        .get(h.url("/hello"))
+    let resp = srv
+        .client()
+        .get(srv.url("/hello"))
         .header("origin", "https://app.example")
         .send()
         .await
@@ -475,7 +374,7 @@ async fn cors_preflights_never_reach_lua() {
     );
     assert_eq!(resp.text().await.expect("body"), "hello");
 
-    h.stop().await;
+    srv.stop().await;
 }
 
 /// `origins = ["*"]` with credentials is a combination browsers reject, so
@@ -483,16 +382,12 @@ async fn cors_preflights_never_reach_lua() {
 /// never works.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_contradictory_cors_policy_fails_at_startup() {
-    let mut cfg = base_config();
-    cfg.cors.origins = Some(vec!["*".into()]);
-    cfg.cors.credentials = true;
-    let handler = scratch_dir().join("app.lua");
-    std::fs::write(&handler, APP_SCRIPT).expect("write handler");
-
-    let err = nitr::Server::builder()
-        .config(cfg)
-        .handler_script(&handler)
-        .build()
+    let err = builder()
+        .config(|cfg| {
+            cfg.cors.origins = Some(vec!["*".into()]);
+            cfg.cors.credentials = true;
+        })
+        .try_build()
         .await
         .expect_err("must refuse to start");
     assert!(
@@ -505,16 +400,17 @@ async fn a_contradictory_cors_policy_fails_at_startup() {
 /// Lua heap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn form_and_multipart_bodies_are_parsed_in_rust() {
-    let mut cfg = base_config();
     // Uploads are bounded by the overall body limit too, so it has to be
     // raised alongside the per-file one.
-    cfg.limits.max_body_bytes = 4 * 1024 * 1024;
-    let h = Harness::start(cfg).await;
+    let mut srv = builder()
+        .config(|cfg| cfg.limits.max_body_bytes = 4 * 1024 * 1024)
+        .spawn()
+        .await;
 
     // urlencoded: percent-decoding and `+`-as-space handled in Rust.
-    let resp = h
-        .client
-        .post(h.url("/echo-form"))
+    let resp = srv
+        .client()
+        .post(srv.url("/echo-form"))
         .header("content-type", "application/x-www-form-urlencoded")
         .body("email=a%40b.com&note=hello+there%21")
         .send()
@@ -547,9 +443,9 @@ async fn form_and_multipart_bodies_are_parsed_in_rust() {
     body.extend_from_slice(&file_bytes);
     body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
 
-    let resp = h
-        .client
-        .post(h.url("/upload"))
+    let resp = srv
+        .client()
+        .post(srv.url("/upload"))
         .header(
             "content-type",
             format!("multipart/form-data; boundary={boundary}"),
@@ -566,23 +462,24 @@ async fn form_and_multipart_bodies_are_parsed_in_rust() {
     assert_eq!(out["files"][0]["size"], payload);
 
     // The bytes really landed on disk, byte for byte.
-    let saved = std::fs::read(h.dir.join("uploads").join("report.bin")).expect("saved file");
+    let saved = std::fs::read(srv.dir().join("uploads").join("report.bin")).expect("saved file");
     assert_eq!(saved, file_bytes);
 
-    h.stop().await;
+    srv.stop().await;
 }
 
 /// `req:read(n)` consumes a body in bounded pieces.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn incremental_reads_bound_what_lua_holds() {
-    let mut cfg = base_config();
-    cfg.limits.max_body_bytes = 1024 * 1024;
-    let h = Harness::start(cfg).await;
+    let mut srv = builder()
+        .config(|cfg| cfg.limits.max_body_bytes = 1024 * 1024)
+        .spawn()
+        .await;
 
     let payload = vec![b'x'; 40_000];
-    let resp = h
-        .client
-        .post(h.url("/count"))
+    let resp = srv
+        .client()
+        .post(srv.url("/count"))
         .body(payload.clone())
         .send()
         .await
@@ -596,23 +493,23 @@ async fn incremental_reads_bound_what_lua_holds() {
         body["chunks"]
     );
 
-    h.stop().await;
+    srv.stop().await;
 }
 
 /// A dynamic resource can answer `304`, the same as a static file.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dynamic_responses_support_conditional_requests() {
-    let h = Harness::start(base_config()).await;
+    let mut srv = builder().spawn().await;
 
-    let resp = h.client.get(h.url("/article")).send().await.expect("first");
+    let resp = srv.get("/article").await;
     assert_eq!(resp.status(), 200);
     let etag = resp.headers()["etag"].to_str().expect("etag").to_string();
     assert!(etag.starts_with('"') && etag.ends_with('"'), "got {etag}");
     assert_eq!(resp.text().await.expect("body"), "the article body");
 
-    let resp = h
-        .client
-        .get(h.url("/article"))
+    let resp = srv
+        .client()
+        .get(srv.url("/article"))
         .header("if-none-match", &etag)
         .send()
         .await
@@ -621,45 +518,54 @@ async fn dynamic_responses_support_conditional_requests() {
     assert!(resp.bytes().await.expect("bytes").is_empty());
 
     // A different validator is a miss.
-    let resp = h
-        .client
-        .get(h.url("/article"))
+    let resp = srv
+        .client()
+        .get(srv.url("/article"))
         .header("if-none-match", "\"something-else\"")
         .send()
         .await
         .expect("stale");
     assert_eq!(resp.status(), 200);
 
-    h.stop().await;
+    srv.stop().await;
 }
 
 /// The correctness audit: the details that are easy to get subtly wrong.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn http_correctness_audit() {
-    let dir = static_dir();
-    let mut cfg = base_config();
-    cfg.static_files.dir = Some(dir);
-    cfg.static_files.mount = Some("/assets".into());
-    cfg.limits.max_body_bytes = 512;
-    let h = Harness::start(cfg).await;
+    let b = builder();
+    let dir = static_dir(&b);
+    let mut srv = b
+        .config(move |cfg| {
+            cfg.static_files.dir = Some(dir);
+            cfg.static_files.mount = Some("/assets".into());
+            cfg.limits.max_body_bytes = 512;
+        })
+        .spawn()
+        .await;
 
     // HEAD works on a route that only registered GET, and reports the
     // length the GET would have sent.
-    let get = h.client.get(h.url("/hello")).send().await.expect("GET");
+    let get = srv.get("/hello").await;
     let expected_len = get.headers()["content-length"]
         .to_str()
         .expect("length")
         .to_string();
-    let head = h.client.head(h.url("/hello")).send().await.expect("HEAD");
+    let head = srv
+        .client()
+        .head(srv.url("/hello"))
+        .send()
+        .await
+        .expect("HEAD");
     assert_eq!(head.status(), 200);
     assert_eq!(head.headers()["content-length"], expected_len);
     assert_eq!(head.headers()["content-type"], "text/plain; charset=utf-8");
     assert!(head.bytes().await.expect("bytes").is_empty());
 
     // OPTIONS on a known path answers with Allow instead of 405.
-    let resp = h
-        .client
-        .request(reqwest::Method::OPTIONS, h.url("/hello"))
+    let resp = srv
+        .client()
+        .request(reqwest::Method::OPTIONS, srv.url("/hello"))
         .send()
         .await
         .expect("OPTIONS");
@@ -668,27 +574,17 @@ async fn http_correctness_audit() {
 
     // A 204 carrying a body is refused rather than desynchronizing the
     // connection.
-    let resp = h
-        .client
-        .get(h.url("/bad-204"))
-        .send()
-        .await
-        .expect("bad 204");
+    let resp = srv.get("/bad-204").await;
     assert_eq!(resp.status(), 500);
 
     // A CRLF in a header value cannot split the response.
-    let resp = h
-        .client
-        .get(h.url("/bad-header"))
-        .send()
-        .await
-        .expect("bad header");
+    let resp = srv.get("/bad-header").await;
     assert_eq!(resp.status(), 500);
     assert!(!resp.headers().contains_key("injected"));
 
     // Expect: 100-continue on a body the limits would reject must be
     // refused *before* the client uploads it.
-    let mut sock = tokio::net::TcpStream::connect(h.addr)
+    let mut sock = tokio::net::TcpStream::connect(srv.addr())
         .await
         .expect("connect");
     sock.write_all(
@@ -710,5 +606,5 @@ async fn http_correctness_audit() {
     );
     drop(sock);
 
-    h.stop().await;
+    srv.stop().await;
 }

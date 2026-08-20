@@ -1,5 +1,7 @@
 //! End-to-end tests for the phase-3 HTTP ergonomics: response helpers,
 //! `nitr.error`, plain and signed cookies, and content negotiation.
+//! (Named `http_helpers` because `harness/` is the shared test harness;
+//! this file is a *test of* the response-helper API, not shared helpers.)
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

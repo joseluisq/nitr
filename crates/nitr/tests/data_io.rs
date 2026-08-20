@@ -2,103 +2,34 @@
 //! migrations, the shared cache, and a `fetch` that can retry, be bounded,
 //! and be correlated.
 
+mod harness;
+
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-fn scratch(name: &str) -> PathBuf {
-    // The counter keeps every call on its own directory: `fs::write`
-    // truncates before writing, so a path two tests share is a race.
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("nitr-data-io-{}-{id}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    dir.join(name)
+use harness::{TestDir, TestServer, wait_until_listening};
+
+/// Every server in this file wants real concurrency: the SQLite tests
+/// exist to prove pooled states writing at once do not collide.
+fn builder(script: &str) -> harness::Builder {
+    TestServer::builder("data-io")
+        .handler(script)
+        .config(|cfg| cfg.workers = 4)
 }
 
-/// Binds port 0 (the OS picks a free port) and keeps the listener alive.
-/// The server adopts it via `.listener(...)`, so the port can never be
-/// taken by another test between choosing it and serving on it.
-fn reserve_addr() -> (std::net::TcpListener, SocketAddr) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind port 0");
-    let addr = listener.local_addr().expect("local addr");
-    (listener, addr)
-}
+const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS counters (id INTEGER PRIMARY KEY, value TEXT);
+     CREATE TABLE IF NOT EXISTS parents (id INTEGER PRIMARY KEY);
+     CREATE TABLE IF NOT EXISTS children (
+         id INTEGER PRIMARY KEY,
+         parent_id INTEGER REFERENCES parents(id)
+     );";
 
-async fn wait_until_listening(addr: SocketAddr) {
-    for _ in 0..200 {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("nothing came up on {addr}");
-}
-
-/// A Nitr server running the given handler script.
-struct Harness {
-    addr: SocketAddr,
-    client: reqwest::Client,
-    stop: tokio::sync::oneshot::Sender<()>,
-    served: tokio::task::JoinHandle<nitr::Result>,
-}
-
-impl Harness {
-    async fn start(mut cfg: nitr::Config, script_name: &str, script: &str) -> Self {
-        let handler = scratch(script_name);
-        std::fs::write(&handler, script).expect("write handler");
-        cfg.handler_script = handler;
-        let (listener, addr) = reserve_addr();
-        cfg.listen = addr;
-        cfg.workers = 4;
-        cfg.shutdown.grace = 5;
-        cfg.shutdown.stream_grace = 0;
-
-        let server = nitr::Server::builder()
-            .config(cfg)
-            .listener(listener)
-            .build()
-            .await
-            .expect("build server");
-        let (stop, stop_rx) = tokio::sync::oneshot::channel::<()>();
-        let served = tokio::spawn(server.serve_with_shutdown(async {
-            let _ = stop_rx.await;
-        }));
-        wait_until_listening(addr).await;
-        Self {
-            addr,
-            client: reqwest::Client::new(),
-            stop,
-            served,
-        }
-    }
-
-    fn url(&self, path: &str) -> String {
-        format!("http://{}{path}", self.addr)
-    }
-
-    async fn json(&self, path: &str) -> serde_json::Value {
-        let resp = self
-            .client
-            .get(self.url(path))
-            .send()
-            .await
-            .unwrap_or_else(|err| panic!("GET {path}: {err}"));
-        let status = resp.status();
-        let text = resp.text().await.expect("body");
-        assert!(status.is_success(), "GET {path} -> {status}: {text}");
-        serde_json::from_str(&text).unwrap_or_else(|err| panic!("GET {path} json: {err}: {text}"))
-    }
-
-    async fn stop(self) {
-        let _ = self.stop.send(());
-        self.served
-            .await
-            .expect("server task")
-            .expect("clean shutdown");
-    }
+fn db_builder(script: &str) -> harness::Builder {
+    builder(script)
+        .std_features(&["json", "http", "db"])
+        .database("app.db")
+        .seed_sql(SCHEMA)
 }
 
 /// A stub upstream for the `fetch` tests.
@@ -221,46 +152,18 @@ end)
 return app
 "#;
 
-fn db_config(name: &str) -> (nitr::Config, PathBuf) {
-    let path = scratch(name);
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-    }
-    let mut cfg = nitr::Config {
-        database: Some(nitr::DatabaseConfig::new(&path)),
-        ..Default::default()
-    };
-    cfg.std.features = Some(vec!["json".into(), "http".into(), "db".into()]);
-    (cfg, path)
-}
-
-fn seed(path: &PathBuf) {
-    let conn = rusqlite::Connection::open(path).expect("open");
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS counters (id INTEGER PRIMARY KEY, value TEXT);
-         CREATE TABLE IF NOT EXISTS parents (id INTEGER PRIMARY KEY);
-         CREATE TABLE IF NOT EXISTS children (
-             id INTEGER PRIMARY KEY,
-             parent_id INTEGER REFERENCES parents(id)
-         );",
-    )
-    .expect("seed schema");
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sqlite_runs_with_the_pragmas_a_server_needs() {
-    let (cfg, path) = db_config("pragmas.db");
-    seed(&path);
-    let h = Harness::start(cfg, "db_app_pragmas.lua", DB_SCRIPT).await;
+    let mut srv = db_builder(DB_SCRIPT).spawn().await;
 
-    let body = h.json("/pragmas").await;
+    let body = srv.json("/pragmas").await;
     assert_eq!(body["journal_mode"], "wal");
     assert_eq!(body["foreign_keys"], 1);
     assert_eq!(body["busy_timeout"], 5000);
 
     // Foreign keys are actually enforced, which SQLite does not do by
     // default however the schema is written.
-    let body = h.json("/foreign-key").await;
+    let body = srv.json("/foreign-key").await;
     assert_eq!(body["ok"], false, "the constraint must be enforced");
     assert!(
         body["err"].as_str().expect("err").contains("FOREIGN KEY"),
@@ -268,21 +171,19 @@ async fn sqlite_runs_with_the_pragmas_a_server_needs() {
         body["err"]
     );
 
-    h.stop().await;
+    srv.stop().await;
 }
 
 /// The failure mode this phase exists to remove: several pooled states
 /// writing at once. On the old defaults one of them gets `SQLITE_BUSY`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_writers_do_not_collide() {
-    let (cfg, path) = db_config("concurrent.db");
-    seed(&path);
-    let h = Harness::start(cfg, "db_app_concurrent.lua", DB_SCRIPT).await;
+    let mut srv = db_builder(DB_SCRIPT).spawn().await;
 
     let mut requests = Vec::new();
     for _ in 0..40 {
-        let client = h.client.clone();
-        let url = h.url("/write");
+        let client = srv.client().clone();
+        let url = srv.url("/write");
         requests.push(tokio::spawn(async move {
             client.get(url).send().await?.status().as_u16().pipe_ok()
         }));
@@ -292,10 +193,10 @@ async fn concurrent_writers_do_not_collide() {
         assert_eq!(status, 200, "a concurrent write failed");
     }
 
-    let body = h.json("/write").await;
+    let body = srv.json("/write").await;
     assert_eq!(body["n"], 41, "every write must have landed");
 
-    h.stop().await;
+    srv.stop().await;
 }
 
 /// Small helper so the concurrency test above reads cleanly.
@@ -308,59 +209,51 @@ impl PipeOk for u16 {}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_outer_handle_refuses_to_run_inside_a_transaction() {
-    let (cfg, path) = db_config("footgun.db");
-    seed(&path);
-    let h = Harness::start(cfg, "db_app_footgun.lua", DB_SCRIPT).await;
+    let mut srv = db_builder(DB_SCRIPT).spawn().await;
 
-    let body = h.json("/footgun").await;
+    let body = srv.json("/footgun").await;
     assert_eq!(body["ok"], false, "the escape must be an error now");
     let err = body["err"].as_str().expect("err");
     assert!(err.contains("transaction is open"), "{err}");
 
+    srv.stop().await;
+
     // The transaction rolled back, so neither row is there — including the
-    // one the body wrote before the mistake.
-    let conn = rusqlite::Connection::open(&path).expect("open");
+    // one the body wrote before the mistake. (The harness keeps the test
+    // directory alive through `stop`, so the database is still on disk.)
+    let conn = rusqlite::Connection::open(srv.db_path()).expect("open");
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM counters", [], |row| row.get(0))
         .expect("count");
     assert_eq!(count, 0);
-
-    h.stop().await;
 }
 
 // ---------------------------------------------------------------------------
 
 #[test]
 fn migrations_apply_and_the_ledger_is_readable() {
-    let dir = scratch("migrations");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("migrations dir");
-    std::fs::write(
-        dir.join("001_create_notes.sql"),
+    let dir = TestDir::new("data-io-migrations");
+    dir.write(
+        "migrations/001_create_notes.sql",
         "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL);",
-    )
-    .expect("write 001");
-    std::fs::write(
-        dir.join("002_add_index.sql"),
+    );
+    dir.write(
+        "migrations/002_add_index.sql",
         "CREATE INDEX notes_body ON notes (body);",
-    )
-    .expect("write 002");
+    );
+    let migrations = dir.join("migrations");
 
-    let path = scratch("migrated.db");
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-    }
     let pragmas = nitr::stdlib::SqlitePragmas::default();
-    let conn = nitr::stdlib::db_open(&path, &pragmas).expect("open");
+    let conn = nitr::stdlib::db_open(&dir.join("migrated.db"), &pragmas).expect("open");
 
     assert_eq!(
-        nitr::stdlib::migrate::pending(&conn, &dir).expect("pending"),
+        nitr::stdlib::migrate::pending(&conn, &migrations).expect("pending"),
         vec!["001_create_notes.sql", "002_add_index.sql"]
     );
-    let applied = nitr::stdlib::migrate::run(&conn, &dir).expect("run");
+    let applied = nitr::stdlib::migrate::run(&conn, &migrations).expect("run");
     assert_eq!(applied.len(), 2);
     assert!(
-        nitr::stdlib::migrate::pending(&conn, &dir)
+        nitr::stdlib::migrate::pending(&conn, &migrations)
             .expect("pending")
             .is_empty()
     );
@@ -373,41 +266,31 @@ fn migrations_apply_and_the_ledger_is_readable() {
 /// itself, so a pending migration stops the server instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pending_migration_refuses_the_boot() {
-    let dir = scratch("pending-migrations");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("migrations dir");
-    std::fs::write(
-        dir.join("001_create_things.sql"),
+    let b = builder(DB_SCRIPT)
+        .std_features(&["json", "http", "db"])
+        .database("pending.db");
+    let migrations = b.dir().write(
+        "migrations/001_create_things.sql",
         "CREATE TABLE things (id INTEGER PRIMARY KEY);",
-    )
-    .expect("write 001");
+    );
+    let migrations = migrations.parent().expect("dir").to_path_buf();
+    let mig = migrations.clone();
+    let mut b = b.config(move |cfg| {
+        cfg.database.as_mut().expect("database").migrations_dir = Some(mig);
+    });
 
-    let (mut cfg, _path) = db_config("pending.db");
-    cfg.database.as_mut().expect("database").migrations_dir = Some(dir.clone());
-    let handler = scratch("db_app_pending.lua");
-    std::fs::write(&handler, DB_SCRIPT).expect("write handler");
-    cfg.handler_script = handler;
-    // `build()` never binds, so any address will do for a build-only test.
-    cfg.listen = "127.0.0.1:0".parse().expect("addr");
-
-    let err = nitr::Server::builder()
-        .config(cfg.clone())
-        .build()
-        .await
-        .expect_err("must refuse to start");
+    let err = b.try_build().await.expect_err("must refuse to start");
     let message = err.to_string();
     assert!(message.contains("001_create_things.sql"), "{message}");
     assert!(message.contains("nitr migrate"), "{message}");
 
     // Once applied, the same configuration starts.
-    let db = cfg.database.clone().expect("database");
-    let conn = nitr::stdlib::db_open(&db.path, &db.pragmas()).expect("open");
-    nitr::stdlib::migrate::run(&conn, &dir).expect("migrate");
+    let pragmas = nitr::stdlib::SqlitePragmas::default();
+    let conn = nitr::stdlib::db_open(b.db_path(), &pragmas).expect("open");
+    nitr::stdlib::migrate::run(&conn, &migrations).expect("migrate");
     drop(conn);
 
-    nitr::Server::builder()
-        .config(cfg)
-        .build()
+    b.try_build()
         .await
         .expect("starts once the schema is current");
 }
@@ -453,15 +336,16 @@ return app
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_cache_is_shared_across_states_and_bounded() {
-    let mut cfg = nitr::Config::default();
-    cfg.std.features = Some(vec!["json".into(), "http".into(), "cache".into()]);
-    let h = Harness::start(cfg, "cache_app.lua", CACHE_SCRIPT).await;
+    let mut srv = builder(CACHE_SCRIPT)
+        .std_features(&["json", "http", "cache"])
+        .spawn()
+        .await;
 
     // Written by whichever state served this, read back by (very likely) a
     // different one: the whole point is that they share the storage.
-    h.json("/set?who=alice").await;
+    srv.json("/set?who=alice").await;
     for _ in 0..8 {
-        let body = h.json("/get").await;
+        let body = srv.json("/get").await;
         assert_eq!(body["value"]["who"], "alice");
     }
 
@@ -469,11 +353,11 @@ async fn the_cache_is_shared_across_states_and_bounded() {
     // state, because the value is in the shared cache after the first call.
     let mut total_computed = 0;
     for _ in 0..12 {
-        let body = h.json("/remember").await;
+        let body = srv.json("/remember").await;
         assert_eq!(body["value"]["eur"], 0.92);
         total_computed += body["computed_here"].as_u64().expect("computed");
     }
-    let stats = h.json("/stats").await;
+    let stats = srv.json("/stats").await;
     assert!(
         stats["hits"].as_u64().expect("hits") > 0,
         "the second and later reads must be hits: {stats}"
@@ -485,7 +369,7 @@ async fn the_cache_is_shared_across_states_and_bounded() {
 
     // A function cannot be cached: entries are plain data, which is what
     // keeps one state from reaching into another's heap.
-    let body = h.json("/uncacheable").await;
+    let body = srv.json("/uncacheable").await;
     assert_eq!(body["ok"], false);
     assert!(
         body["err"].as_str().expect("err").contains("plain data"),
@@ -493,7 +377,7 @@ async fn the_cache_is_shared_across_states_and_bounded() {
         body["err"]
     );
 
-    h.stop().await;
+    srv.stop().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -546,27 +430,16 @@ end)
 return app
 "#;
 
-async fn fetch_harness(upstream: SocketAddr, tune: impl FnOnce(&mut nitr::Config)) -> Harness {
-    // Tests run in parallel, so every script path is keyed by the upstream
-    // port: a shared name would have one test reading another's config.
-    let port = upstream.port();
-    let config_script = scratch(&format!("fetch_config_{port}.lua"));
-    std::fs::write(
-        &config_script,
-        format!("return {{ upstream = \"http://{upstream}/\" }}"),
-    )
-    .expect("write config script");
-
-    let mut cfg = nitr::Config {
-        config_script: Some(config_script),
-        ..Default::default()
-    };
-    cfg.std.features = Some(vec!["json".into(), "http".into(), "fetch".into()]);
-    // The stub upstream is on loopback, which the SSRF policy forbids by
-    // default — exactly as it should.
-    cfg.fetch.allow_private_networks = true;
-    tune(&mut cfg);
-    Harness::start(cfg, &format!("fetch_app_{port}.lua"), FETCH_SCRIPT).await
+async fn fetch_server(upstream: SocketAddr, tune: impl FnOnce(&mut nitr::Config)) -> TestServer {
+    builder(FETCH_SCRIPT)
+        .std_features(&["json", "http", "fetch"])
+        .config_script(format!("return {{ upstream = \"http://{upstream}/\" }}"))
+        // The stub upstream is on loopback, which the SSRF policy forbids
+        // by default — exactly as it should.
+        .config(|cfg| cfg.fetch.allow_private_networks = true)
+        .config(tune)
+        .spawn()
+        .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -575,9 +448,9 @@ async fn idempotent_requests_retry_and_others_do_not() {
     let addr = upstream.start().await;
     upstream.fail_first.store(2, Ordering::SeqCst);
 
-    let h = fetch_harness(addr, |_| {}).await;
+    let mut srv = fetch_server(addr, |_| {}).await;
 
-    let body = h.json("/retry").await;
+    let body = srv.json("/retry").await;
     assert_eq!(body["status"], 200, "the third attempt must succeed");
     assert_eq!(body["body"]["ok"], true);
     assert_eq!(upstream.seen(), 3, "two failures plus the success");
@@ -586,14 +459,14 @@ async fn idempotent_requests_retry_and_others_do_not() {
     // attempts: repeating it is how a customer gets charged twice.
     upstream.fail_first.store(3, Ordering::SeqCst);
     let before = upstream.seen();
-    h.json("/retry-post").await;
+    srv.json("/retry-post").await;
     assert_eq!(
         upstream.seen() - before,
         1,
         "a POST must never be repeated automatically"
     );
 
-    h.stop().await;
+    srv.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -601,9 +474,9 @@ async fn one_inbound_request_has_a_bounded_outbound_cost() {
     let upstream = Upstream::default();
     let addr = upstream.start().await;
 
-    let h = fetch_harness(addr, |cfg| cfg.fetch.max_per_request = 3).await;
+    let mut srv = fetch_server(addr, |cfg| cfg.fetch.max_per_request = 3).await;
 
-    let body = h.json("/budget").await;
+    let body = srv.json("/budget").await;
     assert_eq!(body["made"], 3, "the fourth call must be refused");
     assert!(
         body["err"]
@@ -615,10 +488,10 @@ async fn one_inbound_request_has_a_bounded_outbound_cost() {
     );
 
     // The next inbound request starts with a fresh budget.
-    let body = h.json("/budget").await;
+    let body = srv.json("/budget").await;
     assert_eq!(body["made"], 3);
 
-    h.stop().await;
+    srv.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -626,9 +499,9 @@ async fn trace_context_is_forwarded_when_enabled() {
     let upstream = Upstream::default();
     let addr = upstream.start().await;
 
-    let h = fetch_harness(addr, |cfg| cfg.fetch.propagate_trace_context = true).await;
-    h.json("/traced").await;
-    h.stop().await;
+    let mut srv = fetch_server(addr, |cfg| cfg.fetch.propagate_trace_context = true).await;
+    srv.json("/traced").await;
+    srv.stop().await;
 
     let seen = upstream.traceparents.lock().expect("lock").clone();
     let traceparent = seen
@@ -650,15 +523,15 @@ async fn the_ssrf_policy_still_refuses_loopback_by_default() {
     let addr = upstream.start().await;
 
     // Note the override is *off* here, unlike the other fetch tests.
-    let h = fetch_harness(addr, |cfg| cfg.fetch.allow_private_networks = false).await;
-    let body = h.json("/private").await;
+    let mut srv = fetch_server(addr, |cfg| cfg.fetch.allow_private_networks = false).await;
+    let body = srv.json("/private").await;
     assert_eq!(body["ok"], false);
     assert!(
         body["err"].as_str().expect("err").contains("private"),
         "{}",
         body["err"]
     );
-    h.stop().await;
+    srv.stop().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -691,36 +564,22 @@ async fn a_query_and_a_fetch_can_run_together() {
     let upstream = Upstream::default();
     let addr = upstream.start().await;
 
-    let (mut cfg, path) = db_config("await.db");
-    seed(&path);
-    {
-        let conn = rusqlite::Connection::open(&path).expect("open");
-        conn.execute("INSERT INTO counters (value) VALUES ('one')", [])
-            .expect("seed row");
-    }
-    let config_script = scratch("await_config.lua");
-    std::fs::write(
-        &config_script,
-        format!("return {{ upstream = \"http://{addr}/\" }}"),
-    )
-    .expect("write config script");
-    cfg.config_script = Some(config_script);
-    cfg.std.features = Some(vec![
-        "json".into(),
-        "http".into(),
-        "db".into(),
-        "fetch".into(),
-    ]);
-    cfg.fetch.allow_private_networks = true;
+    let mut srv = builder(AWAIT_SCRIPT)
+        .std_features(&["json", "http", "db", "fetch"])
+        .database("await.db")
+        .seed_sql(SCHEMA)
+        .seed_sql("INSERT INTO counters (value) VALUES ('one');")
+        .config_script(format!("return {{ upstream = \"http://{addr}/\" }}"))
+        .config(|cfg| cfg.fetch.allow_private_networks = true)
+        .spawn()
+        .await;
 
-    let h = Harness::start(cfg, "await_app.lua", AWAIT_SCRIPT).await;
-
-    let body = h.json("/combined").await;
+    let body = srv.json("/combined").await;
     assert_eq!(body["rows"][0]["value"], "one");
     assert_eq!(body["upstream"]["ok"], true);
 
     // A handle is one-shot: awaiting it twice is a mistake worth naming.
-    let body = h.json("/reuse").await;
+    let body = srv.json("/reuse").await;
     assert_eq!(body["ok"], false);
     assert!(
         body["err"].as_str().expect("err").contains("already"),
@@ -728,5 +587,5 @@ async fn a_query_and_a_fetch_can_run_together() {
         body["err"]
     );
 
-    h.stop().await;
+    srv.stop().await;
 }
