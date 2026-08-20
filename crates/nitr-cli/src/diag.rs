@@ -156,8 +156,13 @@ fn paint_lua(code: &str) -> String {
             i = end;
             continue;
         }
-        out.push(code[i..].chars().next().expect("char"));
-        i += code[i..].chars().next().expect("char").len_utf8();
+        // Invariant: every branch above advances `i` by whole-character
+        // widths, so `i` always sits on a char boundary inside a non-empty
+        // remainder (`i < bytes.len()` guards the loop).
+        #[allow(clippy::expect_used)]
+        let ch = code[i..].chars().next().expect("i is on a char boundary");
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
 }

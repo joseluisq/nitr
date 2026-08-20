@@ -126,7 +126,11 @@ impl Cache {
             // to be evicted later: it is dead weight against both bounds.
             Some(_) => {
                 if let Some(entry) = inner.entries.remove(key) {
-                    inner.bytes -= entry.value.len() as u64;
+                    // Saturating (here and at every debit): if the hand-kept
+                    // counter ever drifts, a wrap near `u64::MAX` would make
+                    // eviction expel everything forever; flooring at zero
+                    // merely over-admits until entries cycle out.
+                    inner.bytes = inner.bytes.saturating_sub(entry.value.len() as u64);
                 }
                 inner.misses += 1;
                 Ok(None)
@@ -152,7 +156,7 @@ impl Cache {
         let mut inner = self.lock()?;
 
         if let Some(previous) = inner.entries.remove(&key) {
-            inner.bytes -= previous.value.len() as u64;
+            inner.bytes = inner.bytes.saturating_sub(previous.value.len() as u64);
         }
         inner.bytes += size;
         inner.entries.insert(
@@ -174,7 +178,7 @@ impl Cache {
         inner.entries.retain(|_, entry| {
             let live = entry.is_live(now);
             if !live {
-                inner.bytes -= entry.value.len() as u64;
+                inner.bytes = inner.bytes.saturating_sub(entry.value.len() as u64);
             }
             live
         });
@@ -189,7 +193,7 @@ impl Cache {
                 break;
             };
             if let Some(entry) = inner.entries.remove(&victim) {
-                inner.bytes -= entry.value.len() as u64;
+                inner.bytes = inner.bytes.saturating_sub(entry.value.len() as u64);
                 inner.evictions += 1;
             }
         }
@@ -235,7 +239,7 @@ impl UserData for Cache {
             let mut inner = cache.lock()?;
             match inner.entries.remove(&key) {
                 Some(entry) => {
-                    inner.bytes -= entry.value.len() as u64;
+                    inner.bytes = inner.bytes.saturating_sub(entry.value.len() as u64);
                     Ok(true)
                 }
                 None => Ok(false),

@@ -201,24 +201,31 @@ fn aead_cipher(key: &LuaString) -> mlua::Result<XChaCha20Poly1305> {
 /// story before RS256 helps anyone, and `alg: none` is the classic CVE.
 const JWT_ALGORITHMS: &[&str] = &["HS256", "HS384", "HS512"];
 
-fn jwt_mac(alg: &str, key: &[u8], data: &[u8]) -> Vec<u8> {
+/// Both callers validate `alg` against [`JWT_ALGORITHMS`] first, but the
+/// value originates in the attacker-supplied JWT header, so an unknown
+/// algorithm is an error here too — defense in depth, not a load-bearing
+/// invariant two hops away.
+fn jwt_mac(alg: &str, key: &[u8], data: &[u8]) -> mlua::Result<Vec<u8>> {
     match alg {
         "HS256" => {
             let mut mac: Hmac<Sha256> = crate::utils::new_hmac(key);
             mac.update(data);
-            mac.finalize().into_bytes().to_vec()
+            Ok(mac.finalize().into_bytes().to_vec())
         }
         "HS384" => {
             let mut mac: Hmac<Sha384> = crate::utils::new_hmac(key);
             mac.update(data);
-            mac.finalize().into_bytes().to_vec()
+            Ok(mac.finalize().into_bytes().to_vec())
         }
         "HS512" => {
             let mut mac: Hmac<Sha512> = crate::utils::new_hmac(key);
             mac.update(data);
-            mac.finalize().into_bytes().to_vec()
+            Ok(mac.finalize().into_bytes().to_vec())
         }
-        other => unreachable!("algorithm `{other}` was validated before use"),
+        other => Err(mlua::Error::RuntimeError(format!(
+            "unsupported JWT algorithm `{other}` (supported: {})",
+            JWT_ALGORITHMS.join(", ")
+        ))),
     }
 }
 
@@ -263,7 +270,7 @@ fn create_jwt_table(lua: &Lua) -> mlua::Result<Table> {
                     })
                     .map(|json| B64URL.encode(json))?;
                 let signing_input = format!("{header}.{payload}");
-                let sig = B64URL.encode(jwt_mac(&alg, &key.as_bytes(), signing_input.as_bytes()));
+                let sig = B64URL.encode(jwt_mac(&alg, &key.as_bytes(), signing_input.as_bytes())?);
                 lua.create_string(format!("{signing_input}.{sig}"))
             },
         )?,
@@ -326,7 +333,7 @@ fn create_jwt_table(lua: &Lua) -> mlua::Result<Table> {
             }
 
             let signing_input = format!("{header}.{payload}");
-            let expected = jwt_mac(alg, &key.as_bytes(), signing_input.as_bytes());
+            let expected = jwt_mac(alg, &key.as_bytes(), signing_input.as_bytes())?;
             let ok = B64URL
                 .decode(sig)
                 .is_ok_and(|sig| sig.len() == expected.len() && bool::from(sig.ct_eq(&expected)));

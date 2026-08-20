@@ -206,7 +206,7 @@ impl Drop for RuntimeGuard {
         // until the replacement lands.
         drop(rt);
         let tx = self.tx.clone();
-        tokio::task::spawn_blocking(move || match rebuild() {
+        let handle = tokio::task::spawn_blocking(move || match rebuild() {
             Ok(fresh) => {
                 let _ = tx.try_send(fresh);
                 tracing::info!(outcome = "rebuilt", "recycled a damaged Lua state");
@@ -214,6 +214,14 @@ impl Drop for RuntimeGuard {
             // Capacity is lost until the next reload. Loud, because a pool
             // that silently shrinks looks like a mysterious slowdown.
             Err(err) => tracing::error!("failed to recycle a damaged Lua state: {err}"),
+        });
+        // A rebuild that *panics* never reaches either arm above; only the
+        // `JoinHandle` sees it. Observe it so that failure path is exactly
+        // as loud as an `Err` — the slot is just as lost.
+        tokio::spawn(async move {
+            if let Err(err) = handle.await {
+                tracing::error!("the Lua state rebuild task panicked: {err}");
+            }
         });
     }
 }

@@ -133,6 +133,16 @@ debug = false
 debug-assertions = false
 lto = "fat"
 opt-level = 3
-panic = "abort"
+# `panic` stays at the default `unwind` — never set it to "abort" here.
+# The request panic boundary (`catch_unwind` in nitr-http's handler) and
+# the mid-unwind pool recycling in nitr-core only exist under unwinding;
+# with abort, a panic anywhere in request-reachable Rust kills the whole
+# process and every in-flight connection. Abort's smaller binary is not
+# worth an inert flagship safety layer; CI asserts the containment under
+# this exact profile.
+# Overflow wrapping in release while tests panic is two semantics for one
+# arithmetic bug; check everywhere — a drifted counter now panics loudly
+# (and is contained by the boundary above) instead of corrupting silently.
+overflow-checks = true
 rpath = false
 strip = true

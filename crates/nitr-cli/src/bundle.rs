@@ -45,6 +45,9 @@ fn read_appended(exe: &Path) -> anyhow::Result<Option<Vec<u8>>> {
     if &trailer[8..] != MAGIC {
         return Ok(None);
     }
+    // Invariant: `trailer` is a fixed `TRAILER`-byte array, so its first
+    // eight bytes always convert.
+    #[allow(clippy::expect_used)]
     let tar_len = u64::from_le_bytes(trailer[..8].try_into().expect("8 bytes"));
     if tar_len == 0 || tar_len > len - TRAILER {
         bail!("the appended application archive is corrupt (bad length)");

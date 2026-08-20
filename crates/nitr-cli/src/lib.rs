@@ -5,6 +5,8 @@
 //! test `#[path]`-included the source file, compiling it twice and forcing
 //! `#[allow(dead_code)]` on whichever half each target did not use.
 
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 // Internal single source for the generated `nitr.*` API artifacts; not a
 // public API of the `nitr-cli` crate (no stability promise applies).
 #[doc(hidden)]

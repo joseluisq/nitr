@@ -1,6 +1,8 @@
 //! The `nitr` binary: serve, develop, check, test, migrate, build, and
 //! scaffold Nitr applications.
 
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};

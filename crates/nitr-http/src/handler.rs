@@ -43,6 +43,16 @@ enum Target {
 /// The whole call is wrapped in a panic boundary: a panic in Rust code
 /// (Nitr's or an extension module's) becomes a 500 and recycles the Lua
 /// state instead of killing the connection.
+///
+/// This boundary is the last line of Nitr's error-handling hierarchy, not
+/// an exception mechanism. Every *recoverable* failure — a Lua error, a
+/// timeout, a memory limit, I/O, invalid input — travels as a `Result`
+/// from the failing call to `ErrorInfo` to a response, and must never be
+/// rerouted through here. `catch_unwind` exists solely to contain genuine
+/// bugs (a panic is always a bug, ours or a module's), and this is the one
+/// such boundary: do not add more. The containment is only real because
+/// `[profile.release]` keeps the default `panic = "unwind"` — see the
+/// profile comment in the workspace `Cargo.toml`.
 pub(crate) async fn handle(
     pool: &RuntimePool,
     req: LuaRequest,
