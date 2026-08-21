@@ -32,8 +32,6 @@ pub struct Config {
     /// Lua script executed once at startup; its returned table is passed to
     /// the handler on every request.
     pub config_script: Option<PathBuf>,
-    /// Directory for the `template` builtin.
-    pub templates_dir: Option<PathBuf>,
     /// SQLite database for the `db` builtin (`[database]` section): the
     /// file path plus the connection pragmas.
     pub database: Option<DatabaseConfig>,
@@ -50,7 +48,7 @@ pub struct Config {
     /// feature list is omitted, only the minimal set is enabled; an
     /// explicit list is strict and fails at startup when a listed feature
     /// is missing its configuration (e.g. `template` without
-    /// `templates_dir`).
+    /// `[templating] dir`).
     pub std: StdConfig,
     /// Trust an inbound `X-Request-ID` header (well-formed, <= 64 ASCII
     /// chars) instead of generating a fresh id. Enable only behind a proxy
@@ -73,6 +71,8 @@ pub struct Config {
     /// Static file serving (`[static]` section).
     #[serde(rename = "static")]
     pub static_files: StaticConfig,
+    /// Template rendering (`[templating]` section).
+    pub templating: TemplatingConfig,
     /// Test runner settings (`[testing]` section).
     pub testing: TestingConfig,
     /// Environment access for the `nitr.env` builtin (`[env]` section).
@@ -95,7 +95,6 @@ impl Default for Config {
             listen: SocketAddr::from(([127, 0, 0, 1], 3000)),
             handler_script: PathBuf::from("scripts/handler.lua"),
             config_script: None,
-            templates_dir: None,
             database: None,
             workers: std::thread::available_parallelism().map_or(1, |n| n.get()),
             max_streams: None,
@@ -110,6 +109,7 @@ impl Default for Config {
             cors: CorsConfig::default(),
             cache: CacheConfig::default(),
             static_files: StaticConfig::default(),
+            templating: TemplatingConfig::default(),
             testing: TestingConfig::default(),
             env: EnvConfig::default(),
             lua: LuaConfig::default(),
@@ -129,9 +129,9 @@ impl Config {
                 path.display()
             ))
         })?;
-        // Deserialization alone would report the removed pre-phase-19
-        // spellings as mere unknown/invalid fields; recognize them first so
-        // the error says what to write instead.
+        // Deserialization alone would report the removed spellings as mere
+        // unknown/invalid fields; recognize them first so the error says
+        // what to write instead.
         if let Ok(doc) = toml::from_str::<toml::Value>(&data) {
             check_moved_keys(&doc)?;
         }
@@ -175,9 +175,9 @@ impl Config {
         for name in names {
             let builtin = Builtins::from_config_name(name)
                 .ok_or_else(|| Error::Config(format!("unknown std feature `{name}`")))?;
-            if builtin == Builtins::TEMPLATE && self.templates_dir.is_none() {
+            if builtin == Builtins::TEMPLATE && self.templating.dir.is_none() {
                 return Err(Error::Config(
-                    "std feature `template` is enabled but `templates_dir` is not set".into(),
+                    "std feature `template` is enabled but `[templating] dir` is not set".into(),
                 ));
             }
             if builtin == Builtins::DATABASE && self.database.is_none() {
@@ -213,9 +213,9 @@ impl Config {
     }
 }
 
-/// Rejects the pre-phase-19 spellings of moved settings with an error that
-/// says what to write instead — `deny_unknown_fields` alone would report
-/// them as a bare unknown key or type mismatch.
+/// Rejects superseded spellings of moved settings with an error that says
+/// what to write instead — `deny_unknown_fields` alone would report them
+/// as a bare unknown key or type mismatch.
 fn check_moved_keys(doc: &toml::Value) -> Result {
     let Some(table) = doc.as_table() else {
         return Ok(());
@@ -230,6 +230,13 @@ fn check_moved_keys(doc: &toml::Value) -> Result {
     if table.contains_key("tests_dir") {
         return Err(Error::Config(
             "`tests_dir` moved: replace it with a `[testing]` section \
+             containing `dir = \"...\"`"
+                .into(),
+        ));
+    }
+    if table.contains_key("templates_dir") {
+        return Err(Error::Config(
+            "`templates_dir` moved: replace it with a `[templating]` section \
              containing `dir = \"...\"`"
                 .into(),
         ));
@@ -305,14 +312,14 @@ mod tests {
         assert!(err.to_string().contains("handler_script"), "got: {err}");
 
         let mut cfg = valid_base();
-        cfg.templates_dir = Some(PathBuf::from("/nonexistent/templates"));
+        cfg.templating.dir = Some(PathBuf::from("/nonexistent/templates"));
         let err = cfg.validate().expect_err("missing templates");
-        assert!(err.to_string().contains("templates_dir"), "got: {err}");
+        assert!(err.to_string().contains("[templating] dir"), "got: {err}");
 
         // A file where a directory belongs is as wrong as nothing at all.
         let mut cfg = valid_base();
-        cfg.templates_dir = Some(cfg.handler_script.clone());
-        let err = cfg.validate().expect_err("file as templates_dir");
+        cfg.templating.dir = Some(cfg.handler_script.clone());
+        let err = cfg.validate().expect_err("file as the templating dir");
         assert!(err.to_string().contains("directory"), "got: {err}");
 
         // The database file may not exist yet, but its directory must.
@@ -361,7 +368,9 @@ mod tests {
         let mut cfg = Config {
             handler_script: PathBuf::from("app.lua"),
             config_script: Some(PathBuf::from("config.lua")),
-            templates_dir: Some(PathBuf::from("templates")),
+            templating: TemplatingConfig {
+                dir: Some(PathBuf::from("templates")),
+            },
             database: Some(DatabaseConfig::new("data/app.db")),
             ..Config::default()
         };
@@ -373,7 +382,7 @@ mod tests {
             Some(Path::new("/bundle/config.lua"))
         );
         assert_eq!(
-            cfg.templates_dir.as_deref(),
+            cfg.templating.dir.as_deref(),
             Some(Path::new("/bundle/templates"))
         );
         assert_eq!(
@@ -456,8 +465,8 @@ mod tests {
 
     #[test]
     fn moved_keys_fail_with_directions() {
-        // The pre-phase-19 spellings are refused with the new spelling
-        // named, not as a bare unknown-field/type error.
+        // Superseded spellings are refused with the new spelling named,
+        // not as a bare unknown-field/type error.
         let path = write_temp_config("old-db.toml", "database = \"app.db\"\n");
         let err = Config::from_file(&path).expect_err("bare database string");
         std::fs::remove_file(&path).ok();
@@ -468,6 +477,48 @@ mod tests {
         let err = Config::from_file(&path).expect_err("tests_dir key");
         std::fs::remove_file(&path).ok();
         assert!(err.to_string().contains("[testing]"), "got: {err}");
+
+        let path = write_temp_config("old-templates.toml", "templates_dir = \"templates\"\n");
+        let err = Config::from_file(&path).expect_err("templates_dir key");
+        std::fs::remove_file(&path).ok();
+        assert!(err.to_string().contains("[templating]"), "got: {err}");
+        assert!(err.to_string().contains("dir"), "got: {err}");
+    }
+
+    #[test]
+    fn the_templating_section_parses_and_round_trips() {
+        let path = write_temp_config(
+            "templating.toml",
+            "[templating]\ndir = \"scripts/templates\"\n",
+        );
+        let cfg = Config::from_file(&path).expect("parse [templating]");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(
+            cfg.templating.dir.as_deref(),
+            Some(Path::new("scripts/templates"))
+        );
+
+        // The section survives `nitr check --print-config`, which serializes
+        // the effective configuration back to TOML.
+        let rendered = cfg.effective_toml().expect("render");
+        assert!(rendered.contains("[templating]"), "got: {rendered}");
+        let path = write_temp_config("templating-rt.toml", &rendered);
+        let reparsed = Config::from_file(&path).expect("reparse");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(reparsed.templating.dir, cfg.templating.dir);
+    }
+
+    /// `template` in an explicit `[std] features` list without the section
+    /// it needs is a startup error naming the new spelling.
+    #[test]
+    fn the_template_feature_requires_the_templating_dir() {
+        let mut cfg = valid_base();
+        cfg.std.features = Some(vec!["template".into()]);
+        let err = cfg.builtins().expect_err("template without a dir");
+        assert!(err.to_string().contains("[templating] dir"), "got: {err}");
+
+        cfg.templating.dir = Some(std::env::temp_dir());
+        assert_eq!(cfg.builtins().expect("with a dir"), Builtins::TEMPLATE);
     }
 
     #[test]

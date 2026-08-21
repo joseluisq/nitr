@@ -200,7 +200,7 @@ pub fn build(cfg_path: &Path, cfg: &Config, output: &Path) -> anyhow::Result<()>
     }
     let migrations = cfg.database.as_ref().and_then(|db| db.migrations());
     for (what, dir) in [
-        ("templates_dir", cfg.templates_dir.as_ref()),
+        ("[templating] dir", cfg.templating.dir.as_ref()),
         ("[static] dir", cfg.static_files.dir.as_ref()),
         ("migrations", migrations.as_ref()),
     ] {

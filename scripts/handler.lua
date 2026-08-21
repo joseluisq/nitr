@@ -46,9 +46,9 @@ app:get("/users", function(req)
 end)
 
 app:get("/hello/:name", function(req)
-    -- Template rendering via minijinja (`templates_dir` in nitr.toml).
+    -- Template rendering via minijinja (`[templating] dir` in nitr.toml).
     local body = nitr.template:render("response.j2", {
-        remote_addr = req.remote_addr,
+        remote_addr = "req.remote_addr",
         datetime = nitr.time.format(nitr.time.now(), "%d-%m-%YT%H:%M:%S"),
     })
     return nitr.html(body)

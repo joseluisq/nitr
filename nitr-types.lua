@@ -314,7 +314,7 @@ function nitr.fetch(method, url, opts) end
 ---@return table
 function nitr.await_all(handles) end
 
----The minijinja template engine, loading from `templates_dir`. (std feature: `template`)
+---The minijinja template engine, loading from `[templating] dir`. (std feature: `template`)
 nitr.template = {}
 
 ---Renders a template.

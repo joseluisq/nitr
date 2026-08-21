@@ -421,9 +421,9 @@ impl ServerBuilder {
         self
     }
 
-    /// Directory for the `template` builtin.
+    /// Directory for the `template` builtin (`[templating] dir`).
     pub fn templates_dir(mut self, path: impl Into<PathBuf>) -> Self {
-        self.cfg.templates_dir = Some(path.into());
+        self.cfg.templating.dir = Some(path.into());
         self
     }
 
@@ -701,7 +701,7 @@ fn new_runtime(
 ) -> Result<Runtime> {
     let rt = Runtime::new_with(cfg.runtime_opts()?)?;
     let env = nitr_std::BuiltinsEnv {
-        templates_dir: cfg.templates_dir.clone(),
+        templates_dir: cfg.templating.dir.clone(),
         database: cfg.database.as_ref().map(|db| db.path.clone()),
         sqlite: cfg
             .database

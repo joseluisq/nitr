@@ -86,7 +86,7 @@ impl Config {
         let checks: [(&str, Option<&PathBuf>, bool); 4] = [
             ("handler_script", Some(&self.handler_script), false),
             ("config_script", self.config_script.as_ref(), false),
-            ("templates_dir", self.templates_dir.as_ref(), true),
+            ("[templating] dir", self.templating.dir.as_ref(), true),
             ("[static] dir", self.static_files.dir.as_ref(), true),
         ];
         for (name, path, want_dir) in checks {
@@ -153,7 +153,7 @@ impl Config {
         if let Some(path) = &mut self.config_script {
             anchor(path);
         }
-        if let Some(path) = &mut self.templates_dir {
+        if let Some(path) = &mut self.templating.dir {
             anchor(path);
         }
         if let Some(path) = &mut self.static_files.dir {

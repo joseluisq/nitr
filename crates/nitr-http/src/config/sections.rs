@@ -278,6 +278,18 @@ pub struct StaticConfig {
     pub cache_control: Option<String>,
 }
 
+/// Template rendering (`[templating]` section) for the `template`
+/// builtin (`nitr.template`).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TemplatingConfig {
+    /// Directory `nitr.template` loads templates from. Unset leaves the
+    /// builtin unavailable: there is no sensible default location to
+    /// guess, and silently rendering from the wrong directory is worse
+    /// than saying the builtin is not configured.
+    pub dir: Option<PathBuf>,
+}
+
 /// Test runner settings (`[testing]` section).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]

@@ -66,12 +66,15 @@ const NITR_TOML: &str = r#"# Nitr application configuration.
 listen = "127.0.0.1:3000"
 handler_script = "app.lua"
 config_script = "config.lua"
-templates_dir = "templates"
 
 # SQLite: WAL, busy timeout and foreign keys are on by default. The data/
 # directory holds mutable state and stays out of version control.
 [database]
 path = "data/app.db"
+
+# Where `nitr.template` loads its minijinja templates from.
+[templating]
+dir = "templates"
 
 [std]
 features = ["json", "http", "log", "time", "validate", "base64", "path", "url", "db", "template"]

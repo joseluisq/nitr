@@ -54,7 +54,7 @@ pub(crate) async fn run_tests(cfg: Config, filter: Option<&str>) -> anyhow::Resu
 
     let builtins = cfg.builtins()?;
     let env = BuiltinsEnv {
-        templates_dir: cfg.templates_dir.clone(),
+        templates_dir: cfg.templating.dir.clone(),
         database: cfg.database.as_ref().map(|db| db.path.clone()),
         sqlite: cfg
             .database

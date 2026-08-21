@@ -164,7 +164,7 @@ The `nitr.*` standard library provides building blocks — enable the features y
 | `nitr.fetch(method, url, opts?)` → `client:send()` | HTTP client (shared pool, timeouts, SSRF policy with a guarded resolver, per-hop redirect checks, opt-in `retry = { attempts, backoff }` on idempotent methods, per-request outbound budget). Response: `.status`, `.headers`, `.url`, `:text()`, `:json()`, `:read()` |
 | `nitr.cache:get/set/delete/clear/remember/stats` | Bounded TTL+LRU cache shared by every state. Entries are plain data, so no Lua value crosses between states; per-process, so not a session store |
 | `nitr.await_all({...})` | Run several `fetch` handles concurrently, capped by `fetch.max_concurrent` |
-| `nitr.template:render(name, data?)` | minijinja templates from `templates_dir` |
+| `nitr.template:render(name, data?)` | minijinja templates from `[templating] dir` |
 | `nitr.db:execute/query/query_row/query_one(sql, params?)` | SQLite (`database` file); queries run on a blocking thread pool with a prepared-statement cache |
 | `nitr.db:transaction(fn)` | Atomic transaction (nestable via savepoints); rolls back on error. Use the `tx` handle inside the body — the outer `nitr.db` refuses to run while a transaction is open, rather than silently joining it |
 | `nitr.db:query_async(sql, params?, kind?)` | An unsent query, so `nitr.await_all` can run it alongside a `fetch` instead of in series |
@@ -189,12 +189,14 @@ The `nitr.*` standard library provides building blocks — enable the features y
 listen = "127.0.0.1:3000"
 handler_script = "scripts/handler.lua"
 config_script = "scripts/config.lua"    # optional
-templates_dir = "scripts/templates"     # enables `nitr.template`
 workers = 4                             # Lua states; default: CPU cores
 dev_mode = false                        # hot reload + error details
 
 [database]
 path = "scripts/file.db"                # enables `nitr.db`
+
+[templating]
+dir = "scripts/templates"               # enables `nitr.template`
 
 [std]
 # `nitr.*` standard library features; default: ["json", "http", "log",

@@ -438,7 +438,7 @@ returns = [{ type = "table" }]
 [[table]]
 name = "nitr.template"
 feature = "template"
-desc = "The minijinja template engine, loading from `templates_dir`."
+desc = "The minijinja template engine, loading from `[templating] dir`."
 methods = [
   { name = "render", params = [{ name = "name", type = "string" }, { name = "data", type = "table?" }], returns = [{ type = "string" }], desc = "Renders a template." },
 ]

@@ -16,10 +16,6 @@ handler_script = "scripts/handler.lua"
 # Optional: when absent, `nitr.cfg` is nil.
 config_script = "scripts/config.lua"
 
-# Directory for the `nitr.template` builtin (minijinja). Optional: without
-# it the `nitr.template` builtin is unavailable.
-templates_dir = "scripts/templates"
-
 # Development mode: hot-reload the handler script on change.
 # Default: false (also enabled by the --dev flag).
 dev_mode = true
@@ -158,6 +154,12 @@ path = "scripts/file.db"
 #mount = "/"                 # URL prefix
 #spa = false                 # serve index.html for unknown paths
 #cache_control = "public, max-age=3600"
+
+# Template rendering for the `nitr.template` builtin (minijinja).
+# Optional: without `dir` the builtin is unavailable — there is no default
+# location to guess.
+[templating]
+dir = "scripts/templates"
 
 # The `nitr test` runner.
 #[testing]

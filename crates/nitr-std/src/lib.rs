@@ -254,7 +254,7 @@ pub fn register_builtins(lua: &mlua::Lua, builtins: Builtins, env: &BuiltinsEnv)
                 Some(dir) => nitr.set("template", template::create_template_fn(lua, dir)?)?,
                 None => {
                     tracing::warn!(
-                        "skipping builtin `template`: `templates_dir` is not configured"
+                        "skipping builtin `template`: `[templating] dir` is not configured"
                     );
                 }
             },

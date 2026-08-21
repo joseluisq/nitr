@@ -58,7 +58,7 @@ fn watch_roots(cfg: &Config) -> Vec<PathBuf> {
     // file in it can be part of the application.
     push(cfg.handler_script.parent());
     push(cfg.config_script.as_deref().and_then(Path::parent));
-    push(cfg.templates_dir.as_deref());
+    push(cfg.templating.dir.as_deref());
     roots
 }
 
@@ -136,6 +136,7 @@ pub(crate) fn spawn(cfg: &Config, reload: tokio::sync::mpsc::Sender<()>) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::TemplatingConfig;
 
     #[test]
     fn roots_deduplicate_and_skip_missing_paths() {
@@ -147,7 +148,9 @@ mod tests {
         let mut cfg = Config {
             handler_script: dir.join("app.lua"),
             config_script: Some(dir.join("config.lua")),
-            templates_dir: Some(dir.join("templates")),
+            templating: TemplatingConfig {
+                dir: Some(dir.join("templates")),
+            },
             ..Config::default()
         };
         // Config script shares the handler's directory; templates are
@@ -156,7 +159,7 @@ mod tests {
         assert_eq!(roots, vec![dir.clone()]);
 
         // A missing templates dir elsewhere is skipped rather than fatal.
-        cfg.templates_dir = Some(PathBuf::from("/nonexistent/templates"));
+        cfg.templating.dir = Some(PathBuf::from("/nonexistent/templates"));
         let roots = watch_roots(&cfg);
         assert_eq!(roots, vec![dir.clone()]);
 

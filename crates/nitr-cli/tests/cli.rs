@@ -143,15 +143,48 @@ fn env_files_feed_overrides_and_the_process_environment_wins() {
 fn renamed_env_variables_fail_with_the_new_name() {
     require_runnable_binary!();
     let dir = scaffold("env-rename", true);
+    for (stale, replacement) in [
+        ("NITR_DATABASE", "NITR_DATABASE_PATH"),
+        ("NITR_TEMPLATES_DIR", "NITR_TEMPLATING_DIR"),
+    ] {
+        let out = nitr()
+            .current_dir(&dir)
+            .env(stale, "somewhere")
+            .args(["check"])
+            .output()
+            .expect("run check");
+        assert!(
+            !out.status.success(),
+            "{stale} must refuse to start rather than be ignored"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(replacement), "got: {stderr}");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The sectioned override follows the `NITR_<SECTION>_<OPTION>` scheme and
+/// lands in `[templating] dir`.
+#[test]
+fn the_templating_dir_can_be_overridden_from_the_environment() {
+    require_runnable_binary!();
+    let dir = scaffold("env-templating", true);
+    // The path must exist: a missing one is a startup error by design.
+    std::fs::create_dir_all(dir.join("tpl")).expect("mkdir tpl");
     let out = nitr()
         .current_dir(&dir)
-        .env("NITR_DATABASE", "app.db")
-        .args(["check"])
+        .env("NITR_TEMPLATING_DIR", "tpl")
+        .args(["check", "--print-config"])
         .output()
         .expect("run check");
-    assert!(!out.status.success(), "the stale name must refuse to start");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("NITR_DATABASE_PATH"), "got: {stderr}");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("[templating]"), "got: {stdout}");
+    assert!(stdout.contains("dir = \"tpl\""), "got: {stdout}");
     std::fs::remove_dir_all(&dir).ok();
 }
 

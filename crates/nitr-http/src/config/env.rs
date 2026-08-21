@@ -42,22 +42,23 @@ impl Config {
     /// current values.
     ///
     /// Top-level keys keep their plain names: `NITR_LISTEN`,
-    /// `NITR_HANDLER_SCRIPT`, `NITR_CONFIG_SCRIPT`, `NITR_TEMPLATES_DIR`,
-    /// `NITR_WORKERS`, `NITR_MAX_STREAMS`, `NITR_DEV_MODE`,
-    /// `NITR_PIDFILE`. A sectioned option is named
-    /// `NITR_<SECTION>_<OPTION>`: `NITR_DATABASE_PATH`,
+    /// `NITR_HANDLER_SCRIPT`, `NITR_CONFIG_SCRIPT`, `NITR_WORKERS`,
+    /// `NITR_MAX_STREAMS`, `NITR_DEV_MODE`, `NITR_PIDFILE`. A sectioned
+    /// option is named `NITR_<SECTION>_<OPTION>`: `NITR_DATABASE_PATH`,
+    /// `NITR_TEMPLATING_DIR`,
     /// `NITR_TESTING_DIR`, `NITR_ENV_FILE`, `NITR_LUA_MEMORY_LIMIT`,
     /// `NITR_LUA_EXEC_TIMEOUT_MS`, `NITR_LIMITS_POOL_WAIT_MS`,
     /// `NITR_SHUTDOWN_GRACE`, `NITR_COMPRESSION_ENABLED`,
     /// `NITR_LOG_FORMAT`, `NITR_LOG_LEVEL`.
     pub fn apply_env(&mut self) -> Result {
-        // The pre-phase-19 names are refused with the rename spelled out:
+        // Superseded names are refused with the rename spelled out:
         // silently ignoring them would turn a stale deployment manifest
         // into a config mystery.
         for (old, new) in [
             ("NITR_DATABASE", "NITR_DATABASE_PATH"),
             ("NITR_POOL_WAIT_MS", "NITR_LIMITS_POOL_WAIT_MS"),
             ("NITR_COMPRESSION", "NITR_COMPRESSION_ENABLED"),
+            ("NITR_TEMPLATES_DIR", "NITR_TEMPLATING_DIR"),
         ] {
             if env_var(old).is_some() {
                 return Err(Error::Config(format!(
@@ -74,8 +75,8 @@ impl Config {
         if let Some(v) = env_var("NITR_CONFIG_SCRIPT") {
             self.config_script = Some(PathBuf::from(v));
         }
-        if let Some(v) = env_var("NITR_TEMPLATES_DIR") {
-            self.templates_dir = Some(PathBuf::from(v));
+        if let Some(v) = env_var("NITR_TEMPLATING_DIR") {
+            self.templating.dir = Some(PathBuf::from(v));
         }
         if let Some(v) = env_var("NITR_DATABASE_PATH") {
             // Overrides only the path; the pragmas stay as configured.

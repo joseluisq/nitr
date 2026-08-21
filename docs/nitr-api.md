@@ -78,7 +78,7 @@ Runs fetch handles (and `db:query_async` handles) concurrently; returns their re
 
 ### `nitr.template` (std feature: `template`)
 
-The minijinja template engine, loading from `templates_dir`.
+The minijinja template engine, loading from `[templating] dir`.
 
 - `nitr.template:render(name, data) -> string` — Renders a template.
 
