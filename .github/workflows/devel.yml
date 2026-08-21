@@ -318,31 +318,6 @@ jobs:
       run: |
         ${{ env.CARGO_BIN }} test --verbose ${{ env.CARGO_FEATURES }} ${{ env.TARGET_FLAGS }} ${{ env.SKIP_TESTS }}
 
-  # The panic boundary (catch_unwind → 500 + state recycle) only exists
-  # under `panic = "unwind"`, and only this job would catch a release
-  # profile quietly switching to abort: the debug-profile test run passes
-  # either way because the test profile always unwinds. Slower than the
-  # debug run, so it builds only what the assertion needs.
-  release-profile:
-    name: Test (release profile)
-    runs-on: ubuntu-24.04
-    env:
-      RUST_BACKTRACE: 1
-    steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 1
-
-    - name: Install stable toolchain
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        toolchain: stable
-
-    - name: Panic containment under the shipped profile
-      run: |
-        cargo test -p nitr --release --features=all --test resilience
-
     - name: Run build
       shell: bash
       run: |
@@ -384,6 +359,36 @@ jobs:
         else
           echo "WARN: some arm, bsd, illumos, ppc64 or s390x targets are unable to execute on CI for now!"
         fi
+
+  # Runs the resilience suite under the shipped profile's *optimization*
+  # semantics — fat LTO, opt-level 3, and above all `overflow-checks`,
+  # which the debug run cannot distinguish from its own defaults.
+  #
+  # It deliberately does NOT prove the panic policy: Cargo ignores `panic`
+  # for the test and bench profiles, so a test binary unwinds even when
+  # `[profile.release]` says abort. That property is asserted statically
+  # against the manifest instead, by the test
+  # `the_release_profile_unwinds_so_the_panic_boundary_is_real` in the same
+  # file, which runs here and in the debug matrix alike.
+  release-profile:
+    name: Test (release profile)
+    runs-on: ubuntu-24.04
+    env:
+      RUST_BACKTRACE: 1
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+
+    - name: Install stable toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: stable
+
+    - name: Test with release profile
+      run: |
+        cargo test -p nitr --release --features=all --test resilience
 
   docs-check:
     name: Docs check

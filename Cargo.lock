@@ -1402,6 +1402,7 @@ dependencies = [
  "rusqlite",
  "serde_json",
  "tokio",
+ "toml",
  "tracing-subscriber",
 ]
 

@@ -187,8 +187,65 @@ async fn a_saturated_pool_sheds_instead_of_queueing() {
     std::fs::remove_file(&handler).ok();
 }
 
+/// The shipped release profile must unwind, because everything the test
+/// below proves depends on it.
+///
+/// This has to be asserted statically, against the manifest, and cannot be
+/// folded into the runtime test: Cargo *ignores* `panic` for the `test` and
+/// `bench` profiles (the harness needs to unwind to report failures), so a
+/// test binary always unwinds no matter what `[profile.release]` says —
+/// even under `cargo test --release`. Confirmed by inspection: the test
+/// target is compiled with no `-C panic` flag at all, while the `nitr`
+/// binary under the same profile gets `-C panic=abort`. So a run of
+/// `a_panic_becomes_a_500_and_recycles_the_state` proves the boundary works
+/// in *some* build; only this test proves it is the shipped one.
+#[test]
+fn the_release_profile_unwinds_so_the_panic_boundary_is_real() {
+    // Walk up to the workspace manifest. Outside a workspace checkout
+    // (a packaged crate, say) there is no profile to check and nothing to
+    // assert, so skip rather than fail — the same convention the
+    // cross-compiled CLI tests use.
+    let mut dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = loop {
+        let candidate = dir.join("Cargo.toml");
+        if std::fs::read_to_string(&candidate).is_ok_and(|text| text.contains("[workspace]")) {
+            break candidate;
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => {
+                eprintln!("skipping: no workspace manifest above this crate");
+                return;
+            }
+        }
+    };
+
+    let text = std::fs::read_to_string(&manifest).expect("read the workspace manifest");
+    let parsed: toml::Value = text.parse().expect("parse the workspace manifest");
+    let panic_setting = parsed
+        .get("profile")
+        .and_then(|profiles| profiles.get("release"))
+        .and_then(|release| release.get("panic"))
+        .and_then(|value| value.as_str());
+
+    // Absent is correct: the default is `unwind`. An explicit "unwind" is
+    // equally fine; anything else disarms the boundary.
+    assert!(
+        matches!(panic_setting, None | Some("unwind")),
+        "[profile.release] sets panic = {panic_setting:?} in {}.\n\
+         Aborting on panic makes the request panic boundary in \
+         nitr-http's `handle()` dead code: a panic in any request-reachable \
+         Rust code would kill the process and every in-flight connection \
+         instead of becoming a 500 with a recycled Lua state.",
+        manifest.display()
+    );
+}
+
 /// A panic in Rust code called from Lua becomes a 500 instead of killing the
 /// connection, and the damaged state is recycled so the pool keeps its size.
+///
+/// Note that this proves the boundary works, but not that the *shipped*
+/// binary has it — see the static profile check above for why.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_panic_becomes_a_500_and_recycles_the_state() {
     let (server, addr, handler) = build(base_config(1)).await;
