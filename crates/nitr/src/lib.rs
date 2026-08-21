@@ -18,6 +18,7 @@
 //!   HTTP/Lua bridge.
 
 // Extern crates
+pub use nitr_core::diag;
 pub use nitr_std as stdlib;
 
 pub use nitr_http::service;

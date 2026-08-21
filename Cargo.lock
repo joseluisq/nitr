@@ -1420,6 +1420,7 @@ dependencies = [
  "tar",
  "tokio",
  "toml",
+ "tracing",
  "tracing-subscriber",
 ]
 

@@ -5,17 +5,10 @@
 //! only — stderr must be a TTY and `NO_COLOR` unset. The layout mirrors
 //! `anyhow`'s report (`Error: ...` + `Caused by:` chain) so a piped or
 //! non-TTY run prints byte-identical output to the previous behavior.
+//! The line painter itself is shared with the server's log stream and
+//! lives in [`nitr::diag`].
 
 use std::io::IsTerminal as _;
-
-const RESET: &str = "\x1b[0m";
-const BOLD: &str = "\x1b[1m";
-const DIM: &str = "\x1b[2m";
-const RED: &str = "\x1b[31m";
-const GREEN: &str = "\x1b[32m";
-const MAGENTA: &str = "\x1b[35m";
-const CYAN: &str = "\x1b[36m";
-const BLUE: &str = "\x1b[34m";
 
 /// Prints an error report to stderr, colorized when it is a terminal.
 pub(crate) fn report(err: &anyhow::Error) {
@@ -27,7 +20,7 @@ pub(crate) fn report(err: &anyhow::Error) {
     if causes.peek().is_some() {
         out.push('\n');
         if colored {
-            out.push_str(&format!("{BOLD}Caused by:{RESET}"));
+            out.push_str(&nitr::diag::paint_line("Caused by:"));
         } else {
             out.push_str("Caused by:");
         }
@@ -44,7 +37,7 @@ fn push_block(out: &mut String, text: &str, indent: &str, colored: bool) {
     for line in text.lines() {
         out.push_str(indent);
         if colored {
-            out.push_str(&paint_line(line));
+            out.push_str(&nitr::diag::paint_line(line));
         } else {
             out.push_str(line);
         }
@@ -52,142 +45,53 @@ fn push_block(out: &mut String, text: &str, indent: &str, colored: bool) {
     }
 }
 
-/// Applies the rustc-like palette to one diagnostic line: red for the error
-/// headline and caret, blue for the gutter, cyan for the location, dim for
-/// tracebacks, and a minimal Lua highlight inside source lines.
-fn paint_line(line: &str) -> String {
-    let trimmed = line.trim_start();
-    let indent = &line[..line.len() - trimmed.len()];
+/// An event formatter that paints diagnostics in the log stream.
+///
+/// Delegates to the wrapped formatter, then applies
+/// [`nitr::diag::paint_line`] to every formatted line. This is the only
+/// layer where color *can* be added: `tracing-subscriber` strips ANSI
+/// control sequences from message content (terminal-injection
+/// hardening), so a painted string handed to a log macro arrives as
+/// literal `\x1b` text. Painting after formatting keeps that protection
+/// — hostile message content is already sanitized by the time the
+/// painter sees it — while dev-mode reload failures and tracebacks get
+/// the same rustc-like palette as startup errors.
+pub(crate) struct PaintedFormat<F>(pub(crate) F);
 
-    // `Error: ...` / `error: ...` headlines (`script error:` is how
-    // `Error::Script` diagnostics display).
-    for prefix in ["Error:", "script error:", "error:"] {
-        if let Some(message) = trimmed.strip_prefix(prefix) {
-            return format!("{indent}{BOLD}{RED}{prefix}{RESET}{BOLD}{message}{RESET}");
+impl<S, N, F> tracing_subscriber::fmt::FormatEvent<S, N> for PaintedFormat<F>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    N: for<'a> tracing_subscriber::fmt::FormatFields<'a> + 'static,
+    F: tracing_subscriber::fmt::FormatEvent<S, N>,
+{
+    fn format_event(
+        &self,
+        ctx: &tracing_subscriber::fmt::FmtContext<'_, S, N>,
+        mut writer: tracing_subscriber::fmt::format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        let mut buf = String::new();
+        self.0.format_event(
+            ctx,
+            tracing_subscriber::fmt::format::Writer::new(&mut buf),
+            event,
+        )?;
+        // A single-line event is the overwhelmingly common case, and its
+        // one line starts with the subscriber's own (already colored)
+        // prefix, which matches no diagnostic shape — skip the rebuild.
+        if !buf.trim_end_matches('\n').contains('\n') {
+            return writer.write_str(&buf);
         }
-    }
-    // `  --> path:line`
-    if let Some(location) = trimmed.strip_prefix("--> ") {
-        return format!("{indent}{BOLD}{BLUE}-->{RESET} {CYAN}{location}{RESET}");
-    }
-    // Caret marker: `   | ^^^^^`
-    if let Some((gutter, rest)) = line.split_once('|')
-        && gutter.trim().is_empty()
-        && !rest.trim().is_empty()
-        && rest.trim().chars().all(|c| c == '^')
-    {
-        return format!("{gutter}{BOLD}{BLUE}|{RESET}{BOLD}{RED}{rest}{RESET}");
-    }
-    // Gutter lines: `  15 | code` and the bare `     |` spacer.
-    if let Some((gutter, code)) = line.split_once('|')
-        && gutter.trim().chars().all(|c| c.is_ascii_digit())
-    {
-        return format!("{BOLD}{BLUE}{gutter}|{RESET}{}", paint_lua(code));
-    }
-    // Tracebacks and their tab-indented frames.
-    if trimmed.starts_with("stack traceback:") || line.starts_with('\t') {
-        return format!("{DIM}{line}{RESET}");
-    }
-    if trimmed == "Caused by:" {
-        return format!("{indent}{BOLD}Caused by:{RESET}");
-    }
-    line.to_string()
-}
-
-const LUA_KEYWORDS: &[&str] = &[
-    "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "goto", "if", "in",
-    "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while",
-];
-
-/// A single-line Lua highlight: comments dimmed, strings green, keywords
-/// magenta. Line-local by design — a snippet is a few lines around one
-/// error, so multi-line string/comment state is not worth carrying.
-fn paint_lua(code: &str) -> String {
-    let mut out = String::with_capacity(code.len() + 16);
-    let bytes = code.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let rest = &code[i..];
-        // A comment runs to the end of the line.
-        if rest.starts_with("--") {
-            out.push_str(DIM);
-            out.push_str(GREEN);
-            out.push_str(rest);
-            out.push_str(RESET);
-            break;
-        }
-        // A quoted string (line-local; an unterminated one just stays green
-        // to the end of the line).
-        if bytes[i] == b'"' || bytes[i] == b'\'' {
-            let quote = bytes[i] as char;
-            let mut end = i + 1;
-            while end < bytes.len() {
-                if bytes[end] == b'\\' {
-                    end += 2;
-                    continue;
-                }
-                if bytes[end] as char == quote {
-                    end += 1;
-                    break;
-                }
-                end += 1;
+        let mut lines = buf.lines().peekable();
+        while let Some(line) = lines.next() {
+            writer.write_str(&nitr::diag::paint_line(line))?;
+            if lines.peek().is_some() {
+                writer.write_char('\n')?;
             }
-            let end = end.min(bytes.len());
-            out.push_str(GREEN);
-            out.push_str(&code[i..end]);
-            out.push_str(RESET);
-            i = end;
-            continue;
         }
-        // A word: keyword or identifier.
-        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
-            let mut end = i + 1;
-            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
-                end += 1;
-            }
-            let word = &code[i..end];
-            if LUA_KEYWORDS.contains(&word) {
-                out.push_str(MAGENTA);
-                out.push_str(word);
-                out.push_str(RESET);
-            } else {
-                out.push_str(word);
-            }
-            i = end;
-            continue;
+        if buf.ends_with('\n') {
+            writer.write_char('\n')?;
         }
-        // Invariant: every branch above advances `i` by whole-character
-        // widths, so `i` always sits on a char boundary inside a non-empty
-        // remainder (`i < bytes.len()` guards the loop).
-        #[allow(clippy::expect_used)]
-        let ch = code[i..].chars().next().expect("i is on a char boundary");
-        out.push(ch);
-        i += ch.len_utf8();
-    }
-    out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn headline_arrow_gutter_and_caret_are_painted() {
-        assert!(paint_line("Error: script error").contains(RED));
-        assert!(paint_line("  --> app.lua:15").contains(CYAN));
-        assert!(paint_line("  15 |     local x = 1").starts_with(BOLD));
-        assert!(paint_line("     |            ^^^^^").contains(RED));
-        assert!(paint_line("\tapp.lua:14: in function").starts_with(DIM));
-    }
-
-    #[test]
-    fn lua_highlight_covers_keywords_strings_and_comments() {
-        let painted = paint_lua("local s = \"text\" -- note");
-        assert!(painted.contains(&format!("{MAGENTA}local{RESET}")));
-        assert!(painted.contains(&format!("{GREEN}\"text\"{RESET}")));
-        assert!(painted.contains(&format!("{DIM}{GREEN}-- note{RESET}")));
-        // Identifiers that merely contain a keyword stay unpainted.
-        let painted = paint_lua("ending = localize()");
-        assert!(!painted.contains(MAGENTA), "got: {painted}");
+        Ok(())
     }
 }

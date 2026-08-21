@@ -108,7 +108,7 @@ pub(crate) async fn run_tests(cfg: Config, filter: Option<&str>) -> anyhow::Resu
             Ok(chunk) => chunk,
             Err(err) => {
                 failed += 1;
-                println!("FAIL {name}\n     {err}");
+                println!("{} {name}\n     {err}", nitr::diag::console_fail("FAIL"));
                 continue;
             }
         };
@@ -121,11 +121,11 @@ pub(crate) async fn run_tests(cfg: Config, filter: Option<&str>) -> anyhow::Resu
             match file_err {
                 None => {
                     passed += 1;
-                    println!("PASS {name}");
+                    println!("{} {name}", nitr::diag::console_ok("PASS"));
                 }
                 Some(err) => {
                     failed += 1;
-                    println!("FAIL {name}\n     {err}");
+                    println!("{} {name}\n     {err}", nitr::diag::console_fail("FAIL"));
                 }
             }
             continue;
@@ -138,10 +138,10 @@ pub(crate) async fn run_tests(cfg: Config, filter: Option<&str>) -> anyhow::Resu
             }
             if outcome.ok {
                 passed += 1;
-                println!("  ok   {}", outcome.name);
+                println!("  {}   {}", nitr::diag::console_ok("ok"), outcome.name);
             } else {
                 failed += 1;
-                println!("  FAIL {}", outcome.name);
+                println!("  {} {}", nitr::diag::console_fail("FAIL"), outcome.name);
                 if let Some(err) = outcome.err {
                     for line in err.lines() {
                         println!("       {line}");
@@ -153,16 +153,23 @@ pub(crate) async fn run_tests(cfg: Config, filter: Option<&str>) -> anyhow::Resu
         // setup) is its own failure, on top of whatever tests recorded.
         if let Some(err) = file_err {
             failed += 1;
-            println!("  FAIL {name} (outside any test)\n     {err}");
+            println!(
+                "  {} {name} (outside any test)\n     {err}",
+                nitr::diag::console_fail("FAIL")
+            );
         }
     }
+    // The verdict at a glance: green when everything passed, the failure
+    // count red when anything did not.
+    let passed_part = nitr::diag::console_ok(&format!("{passed} passed"));
+    let failed_part = match failed {
+        0 => format!("{failed} failed"),
+        _ => nitr::diag::console_fail(&format!("{failed} failed")),
+    };
     match skipped {
-        0 => println!(
-            "\n{passed} passed, {failed} failed ({} file(s))",
-            files.len()
-        ),
+        0 => println!("\n{passed_part}, {failed_part} ({} file(s))", files.len()),
         _ => println!(
-            "\n{passed} passed, {failed} failed, {skipped} filtered out ({} file(s))",
+            "\n{passed_part}, {failed_part}, {skipped} filtered out ({} file(s))",
             files.len()
         ),
     }

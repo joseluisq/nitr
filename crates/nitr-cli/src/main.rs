@@ -144,9 +144,31 @@ fn init_logging(cfg: Option<&Config>, dev: bool) {
     let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE);
-    match cfg.map(|c| c.log.format) {
-        Some(nitr::LogFormat::Json) => builder.json().init(),
-        _ => builder.init(),
+    let json = matches!(cfg.map(|c| c.log.format), Some(nitr::LogFormat::Json));
+    // One color decision drives everything: the log format (JSON must
+    // never carry ANSI), the stream the subscriber writes to (stdout),
+    // and the user's `NO_COLOR` preference. The same bool goes to
+    // tracing's own ANSI support (level and field coloring), to the
+    // diagnostic-painting event formatter (source snippets, tracebacks
+    // — see `diag::PaintedFormat` for why painting must happen at the
+    // formatter layer), and to the test runner's markers, so they can
+    // never disagree — a terminal gets all of it, a pipe or shipper
+    // gets byte-clean plain text.
+    use std::io::IsTerminal as _;
+    let colors = !json
+        && std::io::stdout().is_terminal()
+        && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
+    nitr::diag::set_console_colors(colors);
+    if json {
+        builder.json().init();
+    } else if colors {
+        builder
+            .event_format(diag::PaintedFormat(
+                tracing_subscriber::fmt::format().with_ansi(true),
+            ))
+            .init();
+    } else {
+        builder.with_ansi(false).init();
     }
 }
 
