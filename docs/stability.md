@@ -19,7 +19,8 @@ below describe the *shape* of the promise that hardens at 1.0.
 
 Deprecations warn for **one minor version** before removal, and the warning
 names the replacement (`use nitr.time.format instead of ...`). Removals and
-renames are recorded in [CHANGELOG.md](../CHANGELOG.md).
+renames will be recorded in a `CHANGELOG.md` starting with the first
+release.
 
 ## Minimum supported Rust version
 
