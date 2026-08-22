@@ -162,6 +162,40 @@ async fn flush(file: &mut tokio::fs::File, path: &str) -> mlua::Result<()> {
         .map_err(|err| mlua::Error::RuntimeError(format!("failed writing to `{path}`: {err}")))
 }
 
+/// Drives the whole multipart parse over an in-memory body the way
+/// `req:multipart()` does — boundary extraction, part counting against
+/// `max_parts`, and the per-field byte cap applied while reading — but
+/// without a Lua state or disk writes. Exposed for the fuzz target only;
+/// the Lua-facing `LuaPart` methods are covered by the integration tests.
+#[doc(hidden)]
+pub async fn consume_for_fuzzing(
+    content_type: Option<&str>,
+    body: bytes::Bytes,
+    max_parts: usize,
+    max_field_bytes: u64,
+) -> mlua::Result<usize> {
+    let boundary = boundary(content_type)?;
+    let stream = futures_util::stream::once(async move { Ok::<_, std::convert::Infallible>(body) });
+    let mut parser = multer::Multipart::new(stream, boundary);
+    let mut count = 0usize;
+    while let Some(mut field) = parser.next_field().await.into_lua_err()? {
+        count += 1;
+        if count > max_parts {
+            return Err(mlua::Error::RuntimeError(format!(
+                "multipart body has more than {max_parts} parts"
+            )));
+        }
+        let mut read = 0u64;
+        while let Some(chunk) = field.chunk().await.into_lua_err()? {
+            read += chunk.len() as u64;
+            if read > max_field_bytes {
+                return Err(too_large("field", "field", max_field_bytes));
+            }
+        }
+    }
+    Ok(count)
+}
+
 /// The `boundary` parameter of a `multipart/form-data` content type.
 pub(crate) fn boundary(content_type: Option<&str>) -> mlua::Result<String> {
     let content_type = content_type.ok_or_else(|| {
@@ -172,4 +206,41 @@ pub(crate) fn boundary(content_type: Option<&str>) -> mlua::Result<String> {
             "req:multipart() requires a multipart/form-data body, got `{content_type}`"
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn boundary_extracts_and_rejects() {
+        assert_eq!(
+            boundary(Some("multipart/form-data; boundary=XyZ09")).expect("boundary"),
+            "XyZ09"
+        );
+        assert!(boundary(None).is_err());
+        assert!(boundary(Some("application/json")).is_err());
+        assert!(
+            boundary(Some("multipart/form-data")).is_err(),
+            "no boundary parameter"
+        );
+    }
+
+    proptest::proptest! {
+        /// Property: boundary extraction is total over arbitrary header
+        /// text — the content type is fully attacker-controlled.
+        #[test]
+        fn prop_boundary_parsing_is_total(content_type in "[ -~]{0,60}") {
+            let _ = boundary(Some(&content_type));
+        }
+
+        /// Property: a well-formed content type round-trips its boundary
+        /// token back out exactly. (Unquoted parameter values are HTTP
+        /// tokens, so the alphabet stays inside token characters.)
+        #[test]
+        fn prop_wellformed_boundaries_round_trip(token in "[A-Za-z0-9][A-Za-z0-9._+-]{0,29}") {
+            let content_type = format!("multipart/form-data; boundary={token}");
+            proptest::prop_assert_eq!(boundary(Some(&content_type)).expect("boundary"), token);
+        }
+    }
 }

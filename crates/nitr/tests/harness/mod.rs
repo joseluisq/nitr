@@ -101,14 +101,20 @@ pub async fn wait_until_listening(addr: SocketAddr) {
 /// Builder for a [`TestServer`]: typed config overrides over a default
 /// minimal [`nitr::Config`], scripts and databases placed in the test's
 /// private directory, readiness waited for, teardown bounded.
+type ModuleFn = Box<dyn Fn(&mlua::Lua) -> mlua::Result<mlua::Table> + Send + Sync + 'static>;
+type SetupFn = Box<dyn Fn(&mlua::Lua) -> mlua::Result<()> + Send + Sync + 'static>;
+
 pub struct Builder {
     dir: TestDir,
     cfg: nitr::Config,
     handler: Option<String>,
     config_script: Option<String>,
     builtins: Option<nitr::Builtins>,
+    modules: Vec<(String, ModuleFn)>,
+    setup_fns: Vec<SetupFn>,
     seed_sql: Vec<String>,
     db_path: Option<PathBuf>,
+    listener: Option<std::net::TcpListener>,
 }
 
 impl TestServer {
@@ -126,8 +132,11 @@ impl TestServer {
             handler: None,
             config_script: None,
             builtins: None,
+            modules: Vec::new(),
+            setup_fns: Vec::new(),
             seed_sql: Vec::new(),
             db_path: None,
+            listener: None,
         }
     }
 }
@@ -171,12 +180,44 @@ impl Builder {
         self
     }
 
+    /// A Rust extension module mounted at `nitr.ext.<name>` in every
+    /// state, exactly as [`nitr::ServerBuilder::module`] mounts it.
+    pub fn module(
+        mut self,
+        name: &str,
+        f: impl Fn(&mlua::Lua) -> mlua::Result<mlua::Table> + Send + Sync + 'static,
+    ) -> Self {
+        self.modules.push((name.to_string(), Box::new(f)));
+        self
+    }
+
     /// Configures a SQLite database at `name` inside the test directory.
     pub fn database(mut self, name: &str) -> Self {
         let path = self.dir.join(name);
         self.cfg.database = Some(nitr::DatabaseConfig::new(&path));
         self.db_path = Some(path);
         self
+    }
+
+    /// A per-state setup closure, the [`nitr::ServerBuilder::setup`]
+    /// escape hatch.
+    pub fn setup(
+        mut self,
+        f: impl Fn(&mlua::Lua) -> mlua::Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        self.setup_fns.push(Box::new(f));
+        self
+    }
+
+    /// Reserves the server's address before [`Builder::spawn`], for
+    /// handler scripts that must know their own base URL (a self-calling
+    /// `fetch` aggregation, say). The listener is kept and adopted by the
+    /// server, so the port cannot be taken in between.
+    pub fn reserve(&mut self) -> SocketAddr {
+        let (listener, addr) = reserve_addr();
+        self.cfg.listen = addr;
+        self.listener = Some(listener);
+        addr
     }
 
     /// A SQL batch executed against the configured database before the
@@ -208,6 +249,12 @@ impl Builder {
         if let Some(builtins) = self.builtins {
             builder = builder.builtins(builtins);
         }
+        for (name, f) in std::mem::take(&mut self.modules) {
+            builder = builder.module(&name, f);
+        }
+        for f in std::mem::take(&mut self.setup_fns) {
+            builder = builder.setup(f);
+        }
         builder
     }
 
@@ -228,8 +275,17 @@ impl Builder {
 
     /// Spawns the server and waits until it answers on its port.
     pub async fn spawn(mut self) -> TestServer {
-        let (listener, addr) = reserve_addr();
-        self.cfg.listen = addr;
+        let (listener, addr) = match self.listener.take() {
+            Some(listener) => {
+                let addr = self.cfg.listen;
+                (listener, addr)
+            }
+            None => {
+                let (listener, addr) = reserve_addr();
+                self.cfg.listen = addr;
+                (listener, addr)
+            }
+        };
         let server = self
             .prepare()
             .listener(listener)
@@ -238,6 +294,7 @@ impl Builder {
             .expect("build server");
 
         let (stop, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let pool = server.pool();
         let served = tokio::spawn(server.serve_with_shutdown(async {
             let _ = stop_rx.await;
         }));
@@ -245,6 +302,7 @@ impl Builder {
 
         TestServer {
             addr,
+            pool,
             // No automatic decompression and no redirect following:
             // integration tests assert on the bytes and headers actually
             // sent.
@@ -271,6 +329,7 @@ pub struct TestServer {
     client: reqwest::Client,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     served: Option<tokio::task::JoinHandle<nitr::Result>>,
+    pool: std::sync::Arc<nitr::RuntimePool>,
     db_path: Option<PathBuf>,
     dir: TestDir,
 }
@@ -278,6 +337,19 @@ pub struct TestServer {
 impl TestServer {
     pub fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// The runtime pool serving requests, for assertions on its size and
+    /// refill behavior after a state is damaged.
+    pub fn pool(&self) -> &nitr::RuntimePool {
+        &self.pool
+    }
+
+    /// Whether the serve task has already exited — a server that failed
+    /// to come up (say, a stolen port for a secondary bind) rather than
+    /// one still serving.
+    pub fn serve_finished(&self) -> bool {
+        self.served.as_ref().is_some_and(|task| task.is_finished())
     }
 
     /// The raw client, for requests the conveniences below don't cover.
@@ -322,10 +394,17 @@ impl TestServer {
     /// the shutdown — post-stop assertions (a rolled-back database, an
     /// uploaded file) still have their evidence.
     pub async fn stop(&mut self) {
+        self.shutdown().await.expect("clean shutdown");
+    }
+
+    /// Like [`stop`](Self::stop), but hands back the serve result instead
+    /// of asserting on it — for tests whose subject is the shutdown
+    /// outcome itself (an expired drain deadline reports an error).
+    pub async fn shutdown(&mut self) -> nitr::Result {
         let _ = self.stop.take().expect("not stopped").send(());
         let served = self.served.take().expect("not stopped");
         match tokio::time::timeout(Duration::from_secs(10), served).await {
-            Ok(task) => task.expect("server task").expect("clean shutdown"),
+            Ok(task) => task.expect("server task"),
             Err(_) => panic!("the server did not shut down within 10s"),
         }
     }

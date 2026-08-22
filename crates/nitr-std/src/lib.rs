@@ -51,6 +51,7 @@ pub use utils::error_lua_value;
 #[doc(hidden)]
 pub mod fuzzing {
     pub use crate::http::{sign, verify};
+    pub use crate::json::create_json_fn;
     pub use crate::path::{
         basename, dirname, is_absolute, is_windows_style, join, normalize, split_root,
     };

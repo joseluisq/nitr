@@ -26,6 +26,15 @@ pub(crate) mod watch;
 
 pub mod testing;
 
+/// Internal functions exposed for the fuzz targets in `fuzz/` only.
+/// Not part of the public API; no stability promise applies here.
+#[doc(hidden)]
+pub mod fuzzing {
+    #[cfg(feature = "multipart")]
+    pub use crate::multipart::consume_for_fuzzing as consume_multipart;
+    pub use crate::range::{Resolved, parse as parse_range};
+}
+
 /// The hyper `Service` dispatching requests to the Lua pool.
 pub mod service;
 

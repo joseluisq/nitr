@@ -2,40 +2,28 @@
 //! serving (conditional requests, traversal protection, SPA fallback,
 //! `app:static` and `[static]` config), and the in-process test client.
 
-use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+// Each test binary uses a subset of the shared harness.
+#![allow(dead_code)]
 
-fn scratch_dir(name: &str) -> PathBuf {
-    // The counter keeps every call on its own directory, so no two tests
-    // can ever write into (or truncate files in) the same tree.
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    let dir =
-        std::env::temp_dir().join(format!("nitr-platform-{}-{id}-{name}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    dir
-}
+mod harness;
 
-/// Binds port 0 (the OS picks a free port) and keeps the listener alive.
-/// The server adopts it via `.listener(...)`, so the port can never be
-/// taken by another test between choosing it and serving on it.
-fn reserve_addr() -> (std::net::TcpListener, SocketAddr) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind port 0");
-    let addr = listener.local_addr().expect("local addr");
-    (listener, addr)
-}
+use harness::{TestDir, TestServer};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn static_files_and_spa_end_to_end() {
-    // Site layout: index.html + assets/app.js, plus an SPA mount.
-    let site = scratch_dir("site");
-    std::fs::create_dir_all(site.join("assets")).expect("mkdir assets");
-    std::fs::write(site.join("index.html"), "<h1>home</h1>").expect("write index");
-    std::fs::write(site.join("assets/app.js"), "console.log('hi')").expect("write js");
+    let builder = TestServer::builder("platform-static")
+        .builtins(nitr::Builtins::JSON | nitr::Builtins::HTTP)
+        .config(|cfg| cfg.workers = 1);
 
-    let spa = scratch_dir("spa");
-    std::fs::write(spa.join("index.html"), "<div id=app></div>").expect("write spa index");
+    // Site layout inside the test's own directory: index.html +
+    // assets/app.js, plus an SPA mount.
+    builder.dir().write("site/index.html", "<h1>home</h1>");
+    builder
+        .dir()
+        .write("site/assets/app.js", "console.log('hi')");
+    builder.dir().write("spa/index.html", "<div id=app></div>");
+    let site = builder.dir().join("site");
+    let spa = builder.dir().join("spa");
 
     // `{:?}` renders the path as a quoted, escaped literal: Windows paths
     // contain backslashes, which a bare `display()` inside a double-quoted
@@ -52,29 +40,11 @@ return app
         site = site.to_string_lossy(),
         spa = spa.to_string_lossy(),
     );
-    let handler = std::env::temp_dir().join(format!("nitr-platform-{}.lua", std::process::id()));
-    std::fs::write(&handler, app).expect("write handler");
 
-    let (listener, addr) = reserve_addr();
-    let server = nitr::Server::builder()
-        .listen(addr)
-        .listener(listener)
-        .handler_script(&handler)
-        .builtins(nitr::Builtins::JSON | nitr::Builtins::HTTP)
-        .workers(1)
-        .build()
-        .await
-        .expect("build server");
-
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let served = tokio::spawn(server.serve_with_shutdown(async {
-        let _ = stop_rx.await;
-    }));
-    let base = format!("http://{addr}");
-    let client = reqwest::Client::new();
+    let mut server = builder.handler(app).spawn().await;
 
     // Directory index + content type.
-    let resp = client.get(format!("{base}/")).send().await.expect("index");
+    let resp = server.get("/").await;
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.headers()["content-type"], "text/html");
     let etag = resp.headers()["etag"].to_str().expect("etag").to_string();
@@ -82,8 +52,9 @@ return app
     assert_eq!(resp.text().await.expect("body"), "<h1>home</h1>");
 
     // Conditional revalidation with the returned ETag.
-    let resp = client
-        .get(format!("{base}/"))
+    let resp = server
+        .client()
+        .get(server.url("/"))
         .header("if-none-match", &etag)
         .send()
         .await
@@ -92,11 +63,7 @@ return app
     assert!(resp.text().await.expect("empty body").is_empty());
 
     // Nested asset with a JS content type.
-    let resp = client
-        .get(format!("{base}/assets/app.js"))
-        .send()
-        .await
-        .expect("asset");
+    let resp = server.get("/assets/app.js").await;
     assert_eq!(resp.status(), 200);
     assert!(
         resp.headers()["content-type"]
@@ -111,51 +78,33 @@ return app
         "/%2e%2e/Cargo.toml",
         "/assets/../../etc/passwd",
     ] {
-        let resp = client
-            .get(format!("{base}{path}"))
-            .send()
-            .await
-            .expect("traversal");
+        let resp = server.get(path).await;
         assert_eq!(resp.status(), 404, "{path} must be rejected");
     }
 
     // Lua routes still win over the root static mount.
-    let resp = client
-        .get(format!("{base}/api/ping"))
-        .send()
-        .await
-        .expect("api");
+    let resp = server.get("/api/ping").await;
     assert_eq!(resp.headers()["content-type"], "application/json");
 
     // SPA fallback serves the index for unknown paths under its mount.
-    let resp = client
-        .get(format!("{base}/spa/some/client/route"))
-        .send()
-        .await
-        .expect("spa");
+    let resp = server.get("/spa/some/client/route").await;
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.text().await.expect("spa body"), "<div id=app></div>");
 
     // Unknown path outside any mount is still a 404.
-    let resp = client
-        .get(format!("{base}/missing.txt"))
-        .send()
-        .await
-        .expect("missing");
+    let resp = server.get("/missing.txt").await;
     assert_eq!(resp.status(), 404);
 
-    let _ = stop_tx.send(());
-    served.await.expect("task").expect("shutdown");
-    std::fs::remove_file(&handler).ok();
-    std::fs::remove_dir_all(&site).ok();
-    std::fs::remove_dir_all(&spa).ok();
+    server.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_client_dispatches_in_process() {
-    let handler = std::env::temp_dir().join(format!("nitr-tc-{}.lua", std::process::id()));
-    std::fs::write(
-        &handler,
+    // The in-process TestClient is the subject here, so the server is
+    // built by hand — but its script still lives in a private TestDir.
+    let dir = TestDir::new("platform-testclient");
+    let handler = dir.write(
+        "app.lua",
         r#"
         local app = nitr.app()
         app:get("/hello/:name", function(req)
@@ -166,8 +115,7 @@ async fn test_client_dispatches_in_process() {
         end)
         return app
         "#,
-    )
-    .expect("write handler");
+    );
 
     // No listen address is ever bound: the client dispatches in-process.
     let server = nitr::Server::builder()
@@ -208,6 +156,4 @@ async fn test_client_dispatches_in_process() {
         .await
         .expect("404");
     assert_eq!(resp.status, 404);
-
-    std::fs::remove_file(&handler).ok();
 }

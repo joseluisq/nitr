@@ -1,14 +1,18 @@
-//! End-to-end tests for phase 10: what Nitr does when things go wrong.
+//! End-to-end tests for what Nitr does when things go wrong.
 //!
-//! Load shedding, panic containment, the sandbox budget applied to
-//! user-created coroutines, request-body counting, client disconnects, and
-//! the graceful-shutdown drain — each asserted through the real server.
+//! Load shedding, panic containment, failure isolation between concurrent
+//! requests, the sandbox budgets (instructions and memory), request-body
+//! counting and stall bounds, client disconnects, and the
+//! graceful-shutdown drain — each asserted through the real server.
 
-use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+// Each test binary uses a subset of the shared harness.
+#![allow(dead_code)]
+
+mod harness;
+
 use std::time::Duration;
 
+use harness::TestServer;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 const APP_SCRIPT: &str = r#"
@@ -64,42 +68,6 @@ end)
 return app
 "#;
 
-fn write_temp_script(name: &str, content: &str) -> PathBuf {
-    // Every test here is a thread of one process, and the shared `build()`
-    // helper passes the same `name` for all of them. `fs::write` truncates
-    // before writing, so two tests on one path hand one server a half-written
-    // script. The counter keeps every call on its own file.
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
-        "nitr-resilience-{}-{id}-{name}",
-        std::process::id()
-    ));
-    std::fs::write(&path, content).expect("write temp script");
-    path
-}
-
-/// Binds port 0 (the OS picks a free port) and keeps the listener alive.
-/// The server adopts it via `.listener(...)`, so the port can never be
-/// taken by another test between choosing it and serving on it.
-fn reserve_addr() -> (std::net::TcpListener, SocketAddr) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind port 0");
-    let addr = listener.local_addr().expect("local addr");
-    (listener, addr)
-}
-
-/// Waits for the spawned server to actually bind, so a test that opens a
-/// raw socket does not race the `serve()` task to the listener.
-async fn wait_until_listening(addr: SocketAddr) {
-    for _ in 0..200 {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("the server never started listening on {addr}");
-}
-
 /// A Lua-visible module that can do the two things no sandboxed script can:
 /// suspend on a real timer, and panic in Rust.
 fn testutil(lua: &mlua::Lua) -> mlua::Result<mlua::Table> {
@@ -120,34 +88,21 @@ fn testutil(lua: &mlua::Lua) -> mlua::Result<mlua::Table> {
     Ok(t)
 }
 
-/// Builds a one-state server on a free port with the shared app script.
-async fn build(mut cfg: nitr::Config) -> (nitr::Server, SocketAddr, PathBuf) {
-    let handler = write_temp_script("app.lua", APP_SCRIPT);
-    let (listener, addr) = reserve_addr();
-    cfg.listen = addr;
-    let server = nitr::Server::builder()
-        .config(cfg)
-        .listener(listener)
-        .handler_script(&handler)
+/// A running server with the shared app script and the testutil module;
+/// `tune` adjusts workers, limits, and shutdown timing.
+async fn start(tune: impl FnOnce(&mut nitr::Config)) -> TestServer {
+    TestServer::builder("resilience")
+        .handler(APP_SCRIPT)
         .builtins(nitr::Builtins::JSON | nitr::Builtins::HTTP)
         .module("testutil", testutil)
-        .build()
+        // Keep the drain short so shutdown assertions do not idle for 35s.
+        .config(|cfg| {
+            cfg.shutdown.grace = 1;
+            cfg.shutdown.stream_grace = 0;
+        })
+        .config(tune)
+        .spawn()
         .await
-        .expect("build server");
-    (server, addr, handler)
-}
-
-fn base_config(workers: usize) -> nitr::Config {
-    // `build()` reserves the real address; this placeholder is never bound.
-    let mut cfg = nitr::Config {
-        listen: "127.0.0.1:0".parse().expect("addr"),
-        workers,
-        ..Default::default()
-    };
-    // Keep the drain short so shutdown assertions do not idle for 35s.
-    cfg.shutdown.grace = 1;
-    cfg.shutdown.stream_grace = 0;
-    cfg
 }
 
 // ---------------------------------------------------------------------------
@@ -156,33 +111,23 @@ fn base_config(workers: usize) -> nitr::Config {
 /// with 503 + `Retry-After` instead of queueing behind the pool.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_saturated_pool_sheds_instead_of_queueing() {
-    let mut cfg = base_config(1);
-    cfg.limits.pool_wait_ms = 200;
-    let (server, addr, handler) = build(cfg).await;
-
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let served = tokio::spawn(server.serve_with_shutdown(async {
-        let _ = stop_rx.await;
-    }));
-    wait_until_listening(addr).await;
-
-    let base = format!("http://{addr}");
-    let client = reqwest::Client::new();
+    let mut h = start(|cfg| {
+        cfg.workers = 1;
+        cfg.limits.pool_wait_ms = 200;
+    })
+    .await;
+    let client = h.client().clone();
 
     // Occupy the only state for 3s.
     let slow = tokio::spawn({
         let client = client.clone();
-        let url = format!("{base}/slow");
+        let url = h.url("/slow");
         async move { client.get(url).send().await }
     });
     // Give the slow request time to check the state out.
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let resp = client
-        .get(format!("{base}/ok"))
-        .send()
-        .await
-        .expect("shed response");
+    let resp = h.get("/ok").await;
     assert_eq!(resp.status(), 503);
     assert_eq!(resp.headers()["retry-after"], "1");
 
@@ -192,16 +137,10 @@ async fn a_saturated_pool_sheds_instead_of_queueing() {
     assert_eq!(slow.text().await.expect("slow body"), "slow");
 
     // And the state is back in circulation afterwards.
-    let resp = client
-        .get(format!("{base}/ok"))
-        .send()
-        .await
-        .expect("recovered response");
+    let resp = h.get("/ok").await;
     assert_eq!(resp.status(), 200);
 
-    let _ = stop_tx.send(());
-    served.await.expect("server task").expect("clean shutdown");
-    std::fs::remove_file(&handler).ok();
+    h.stop().await;
 }
 
 /// The shipped release profile must unwind, because everything the test
@@ -265,70 +204,156 @@ fn the_release_profile_unwinds_so_the_panic_boundary_is_real() {
 /// binary has it — see the static profile check above for why.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_panic_becomes_a_500_and_recycles_the_state() {
-    let (server, addr, handler) = build(base_config(1)).await;
-    let pool = server.pool();
+    let mut h = start(|cfg| cfg.workers = 1).await;
 
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let served = tokio::spawn(server.serve_with_shutdown(async {
-        let _ = stop_rx.await;
-    }));
-    wait_until_listening(addr).await;
-
-    let base = format!("http://{addr}");
-    let client = reqwest::Client::new();
-
-    let resp = client
-        .get(format!("{base}/panic"))
-        .send()
-        .await
-        .expect("the connection must survive the panic");
+    let resp = h.get("/panic").await;
     assert_eq!(resp.status(), 500);
 
     // The state was dropped and rebuilt off the request path; wait for the
     // replacement rather than assuming an ordering.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while pool.available() == 0 && std::time::Instant::now() < deadline {
+    while h.pool().available() == 0 && std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(pool.size(), 1, "the pool must not shrink");
+    assert_eq!(h.pool().size(), 1, "the pool must not shrink");
 
     // And the server keeps serving on the replacement.
-    let resp = client
-        .get(format!("{base}/ok"))
-        .send()
-        .await
-        .expect("post-panic response");
+    let resp = h.get("/ok").await;
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.text().await.expect("body"), "ok");
 
-    let _ = stop_tx.send(());
-    served.await.expect("server task").expect("clean shutdown");
-    std::fs::remove_file(&handler).ok();
+    h.stop().await;
+}
+
+/// The audit's draft invariant, asserted directly: a failure in one
+/// request — here the worst kind, a Rust panic that damages its state —
+/// must not disturb unrelated requests running concurrently on other
+/// states, and the pool must refill to full strength afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panic_does_not_disturb_concurrent_requests_on_other_states() {
+    let mut h = start(|cfg| cfg.workers = 4).await;
+    let client = h.client().clone();
+
+    // Three in-flight requests, each holding its own state for 3s.
+    let inflight: Vec<_> = (0..3)
+        .map(|_| {
+            tokio::spawn({
+                let client = client.clone();
+                let url = h.url("/slow");
+                async move { client.get(url).send().await }
+            })
+        })
+        .collect();
+    // Let them all check their states out.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // The fourth state panics mid-request.
+    let resp = h.get("/panic").await;
+    assert_eq!(resp.status(), 500);
+
+    // Every concurrent request completes untouched.
+    for task in inflight {
+        let resp = task
+            .await
+            .expect("in-flight task")
+            .expect("a neighbor's panic must not cut this connection");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.expect("body"), "slow");
+    }
+
+    // The damaged state is replaced: the pool refills to all four.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while h.pool().available() < 4 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(h.pool().size(), 4, "the pool must refill, not shrink");
+
+    let resp = h.get("/ok").await;
+    assert_eq!(resp.status(), 200);
+
+    h.stop().await;
+}
+
+/// The Lua memory limit actually fires: the failure is classified
+/// `memory` (visible to `on_error`), the poisoned state is recycled, and
+/// the next request runs on a fresh one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_memory_limit_fires_and_the_state_is_recycled() {
+    let mut h = TestServer::builder("resilience-memory")
+        .handler(
+            r#"
+local app = nitr.app()
+
+app:get("/ok", function(req)
+    return nitr.text("ok")
+end)
+
+app:get("/hog", function(req)
+    local t = {}
+    local i = 0
+    while true do
+        i = i + 1
+        t[i] = string.rep("x", 8192) .. tostring(i)
+    end
+end)
+
+app:on_error(function(err, req)
+    return { status = 500, body = "kind=" .. err.kind }
+end)
+
+return app
+"#,
+        )
+        .builtins(nitr::Builtins::JSON | nitr::Builtins::HTTP)
+        .config(|cfg| {
+            cfg.workers = 1;
+            // Small enough to hit fast, large enough for the app itself.
+            cfg.lua.memory_limit = 4 * 1024 * 1024;
+            cfg.shutdown.grace = 1;
+            cfg.shutdown.stream_grace = 0;
+        })
+        .spawn()
+        .await;
+
+    let resp = h.get("/hog").await;
+    assert_eq!(resp.status(), 500);
+    assert_eq!(
+        resp.text().await.expect("body"),
+        "kind=memory",
+        "the classification must name the memory limit, not a script bug"
+    );
+
+    // The poisoned state is dropped and rebuilt off the request path.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while h.pool().available() == 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(h.pool().size(), 1, "the pool must not shrink");
+
+    // And the replacement state has a fresh heap.
+    let resp = h.get("/ok").await;
+    assert_eq!(resp.status(), 200);
+
+    h.stop().await;
 }
 
 /// The execution budget reaches inside a coroutine the script created, which
 /// a per-thread hook would let run forever.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_user_coroutine_cannot_escape_the_execution_budget() {
-    let mut cfg = base_config(1);
-    cfg.lua.exec_timeout_ms = 1_000;
-    // Config validation refuses a pool wait above the request budget.
-    cfg.limits.pool_wait_ms = 1_000;
-    let (server, addr, handler) = build(cfg).await;
-
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let served = tokio::spawn(server.serve_with_shutdown(async {
-        let _ = stop_rx.await;
-    }));
-    wait_until_listening(addr).await;
-
-    let base = format!("http://{addr}");
-    let client = reqwest::Client::new();
+    let mut h = start(|cfg| {
+        cfg.workers = 1;
+        cfg.lua.exec_timeout_ms = 1_000;
+        // Config validation refuses a pool wait above the request budget.
+        cfg.limits.pool_wait_ms = 1_000;
+    })
+    .await;
+    let client = h.client().clone();
 
     let started = std::time::Instant::now();
     let resp = tokio::time::timeout(
         Duration::from_secs(10),
-        client.get(format!("{base}/coroutine-spin")).send(),
+        client.get(h.url("/coroutine-spin")).send(),
     )
     .await
     .expect("the spinning coroutine must be stopped, not run forever")
@@ -341,39 +366,28 @@ async fn a_user_coroutine_cannot_escape_the_execution_budget() {
     );
 
     // The state recovers and serves the next request.
-    let resp = client
-        .get(format!("{base}/ok"))
-        .send()
-        .await
-        .expect("post-timeout response");
+    let resp = h.get("/ok").await;
     assert_eq!(resp.status(), 200);
 
-    let _ = stop_tx.send(());
-    served.await.expect("server task").expect("clean shutdown");
-    std::fs::remove_file(&handler).ok();
+    h.stop().await;
 }
 
 /// A chunked body declares no length, so the ceiling has to be enforced on
 /// the bytes that actually arrive.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_oversized_chunked_body_is_rejected_with_413() {
-    let mut cfg = base_config(1);
-    cfg.limits.max_body_bytes = 1024;
-    let (server, addr, handler) = build(cfg).await;
-
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let served = tokio::spawn(server.serve_with_shutdown(async {
-        let _ = stop_rx.await;
-    }));
-    wait_until_listening(addr).await;
-
-    let base = format!("http://{addr}");
-    let client = reqwest::Client::new();
+    let mut h = start(|cfg| {
+        cfg.workers = 1;
+        cfg.limits.max_body_bytes = 1024;
+    })
+    .await;
 
     // A chunked body carries no Content-Length, so the declared-size check
     // cannot see it: only the running count can. Written on a raw socket
     // because the test client always sets a length.
-    let mut sock = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let mut sock = tokio::net::TcpStream::connect(h.addr())
+        .await
+        .expect("connect");
     sock.write_all(b"POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n")
         .await
         .expect("write headers");
@@ -397,18 +411,12 @@ async fn an_oversized_chunked_body_is_rejected_with_413() {
         .expect("the server must answer, not hang")
         .expect("read response");
     let head = String::from_utf8_lossy(&raw[..n]);
-    let status = head.lines().next().unwrap_or_default();
-    assert!(
-        status.contains("413"),
-        "expected a 413 status line, got: {status}"
-    );
-    // Hang up: the unread tail of the body would otherwise keep this
-    // connection busy through the drain below.
-    drop(sock);
+    assert!(head.starts_with("HTTP/1.1 413"), "got: {head}");
 
-    // A body under the ceiling still round-trips.
-    let resp = client
-        .post(format!("{base}/echo"))
+    // An honest small body still passes.
+    let resp = h
+        .client()
+        .post(h.url("/echo"))
         .body("small")
         .send()
         .await
@@ -416,9 +424,7 @@ async fn an_oversized_chunked_body_is_rejected_with_413() {
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.text().await.expect("body"), "small");
 
-    let _ = stop_tx.send(());
-    served.await.expect("server task").expect("clean shutdown");
-    std::fs::remove_file(&handler).ok();
+    h.stop().await;
 }
 
 /// When the client hangs up mid-request, the handler future is dropped and
@@ -426,18 +432,16 @@ async fn an_oversized_chunked_body_is_rejected_with_413() {
 /// handler duration serving a response nobody will read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_client_disconnect_releases_the_pooled_state() {
-    let mut cfg = base_config(1);
-    cfg.limits.pool_wait_ms = 500;
-    let (server, addr, handler) = build(cfg).await;
-
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let served = tokio::spawn(server.serve_with_shutdown(async {
-        let _ = stop_rx.await;
-    }));
-    wait_until_listening(addr).await;
+    let mut h = start(|cfg| {
+        cfg.workers = 1;
+        cfg.limits.pool_wait_ms = 500;
+    })
+    .await;
 
     // Raw socket: send the request, then hang up while the handler sleeps.
-    let mut sock = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let mut sock = tokio::net::TcpStream::connect(h.addr())
+        .await
+        .expect("connect");
     sock.write_all(b"GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n")
         .await
         .expect("write request");
@@ -448,48 +452,40 @@ async fn a_client_disconnect_releases_the_pooled_state() {
 
     // The 3s handler is long gone; if the state were still checked out this
     // would exceed the 500ms wait budget and come back 503.
-    let client = reqwest::Client::new();
-    let resp = client
-        .get(format!("http://{addr}/ok"))
-        .send()
-        .await
-        .expect("post-disconnect response");
+    let resp = h.get("/ok").await;
     assert_eq!(
         resp.status(),
         200,
         "the abandoned request must not keep holding the only Lua state"
     );
 
-    let _ = stop_tx.send(());
-    served.await.expect("server task").expect("clean shutdown");
-    std::fs::remove_file(&handler).ok();
+    h.stop().await;
 }
 
 /// An in-flight request finishes after the shutdown signal, and the server
 /// reports a clean drain.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shutdown_drains_in_flight_requests() {
-    let mut cfg = base_config(2);
-    // The slow handler needs 3s; give the drain room to finish it.
-    cfg.shutdown.grace = 10;
-    let (server, addr, handler) = build(cfg).await;
+    let mut h = start(|cfg| {
+        cfg.workers = 2;
+        // The slow handler needs 3s; give the drain room to finish it.
+        cfg.shutdown.grace = 10;
+    })
+    .await;
+    let client = h.client().clone();
+    let addr = h.addr();
 
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let served = tokio::spawn(server.serve_with_shutdown(async {
-        let _ = stop_rx.await;
-    }));
-    wait_until_listening(addr).await;
-
-    let client = reqwest::Client::new();
     let inflight = tokio::spawn({
         let client = client.clone();
-        let url = format!("http://{addr}/slow");
+        let url = h.url("/slow");
         async move { client.get(url).send().await }
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // Signal shutdown while the request is still running.
-    let _ = stop_tx.send(());
+    // Signal shutdown while the request is still running; `shutdown`
+    // resolves only after the drain, so run it concurrently with the
+    // in-flight request's completion.
+    let drained = tokio::spawn(async move { h.shutdown().await });
 
     let resp = inflight
         .await
@@ -498,9 +494,9 @@ async fn shutdown_drains_in_flight_requests() {
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.text().await.expect("body"), "slow");
 
-    served
+    drained
         .await
-        .expect("server task")
+        .expect("shutdown task")
         .expect("a drained shutdown is not an error");
 
     // The listener is closed: no new connection is accepted.
@@ -513,40 +509,30 @@ async fn shutdown_drains_in_flight_requests() {
                 .is_err(),
         "the server must stop accepting after the drain"
     );
-
-    std::fs::remove_file(&handler).ok();
 }
 
 /// A request that outlives the drain deadline is cut, and the server says so
 /// rather than exiting as if nothing happened.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_expired_drain_deadline_is_reported() {
-    // 1s of grace against a 3s handler.
-    let (server, addr, handler) = build(base_config(2)).await;
+    // 1s of grace (the suite default) against a 3s handler.
+    let mut h = start(|cfg| cfg.workers = 2).await;
+    let client = h.client().clone();
 
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let served = tokio::spawn(server.serve_with_shutdown(async {
-        let _ = stop_rx.await;
-    }));
-    wait_until_listening(addr).await;
-
-    let client = reqwest::Client::new();
     let inflight = tokio::spawn({
-        let url = format!("http://{addr}/slow");
+        let url = h.url("/slow");
         async move { client.get(url).send().await }
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let _ = stop_tx.send(());
 
-    let err = served
+    let err = h
+        .shutdown()
         .await
-        .expect("server task")
         .expect_err("a truncated shutdown must surface");
     assert!(matches!(err, nitr::Error::ShutdownTimeout), "got: {err:?}");
 
     // The abandoned request was cut rather than answered.
     let _ = inflight.await;
-    std::fs::remove_file(&handler).ok();
 }
 
 /// Phase 24: encoding a deeply nested table is an ordinary catchable Lua
@@ -555,22 +541,9 @@ async fn an_expired_drain_deadline_is_reported() {
 /// levels before the guard existed).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn deep_json_serialization_is_a_catchable_error_not_an_abort() {
-    let (server, addr, handler) = build(base_config(1)).await;
+    let mut h = start(|cfg| cfg.workers = 1).await;
 
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let served = tokio::spawn(server.serve_with_shutdown(async {
-        let _ = stop_rx.await;
-    }));
-    wait_until_listening(addr).await;
-
-    let base = format!("http://{addr}");
-    let client = reqwest::Client::new();
-
-    let resp = client
-        .get(format!("{base}/deep-json"))
-        .send()
-        .await
-        .expect("the process must survive the encode");
+    let resp = h.get("/deep-json").await;
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.expect("body");
     assert!(
@@ -580,12 +553,10 @@ async fn deep_json_serialization_is_a_catchable_error_not_an_abort() {
 
     // And the state is unharmed: no recycling was needed, the next
     // request runs on the same pool.
-    let resp = client.get(format!("{base}/ok")).send().await.expect("ok");
+    let resp = h.get("/ok").await;
     assert_eq!(resp.status(), 200);
 
-    let _ = stop_tx.send(());
-    served.await.expect("server task").expect("clean shutdown");
-    std::fs::remove_file(&handler).ok();
+    h.stop().await;
 }
 
 /// A client that stops sending its body mid-way is answered `408` with
@@ -593,17 +564,15 @@ async fn deep_json_serialization_is_a_catchable_error_not_an_abort() {
 /// compute budget notices.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stalled_body_is_answered_408_and_the_connection_is_closed() {
-    let mut cfg = base_config(1);
-    cfg.limits.body_read_ms = 200;
-    let (server, addr, handler) = build(cfg).await;
+    let mut h = start(|cfg| {
+        cfg.workers = 1;
+        cfg.limits.body_read_ms = 200;
+    })
+    .await;
 
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let served = tokio::spawn(server.serve_with_shutdown(async {
-        let _ = stop_rx.await;
-    }));
-    wait_until_listening(addr).await;
-
-    let mut sock = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let mut sock = tokio::net::TcpStream::connect(h.addr())
+        .await
+        .expect("connect");
     sock.write_all(b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\nabc")
         .await
         .expect("write partial body");
@@ -620,17 +589,10 @@ async fn a_stalled_body_is_answered_408_and_the_connection_is_closed() {
     // `read_to_end` returning proves the close was real, not just a header.
 
     // The pool is intact: a fresh connection is served immediately.
-    let client = reqwest::Client::new();
-    let resp = client
-        .get(format!("http://{addr}/ok"))
-        .send()
-        .await
-        .expect("post-stall request");
+    let resp = h.get("/ok").await;
     assert_eq!(resp.status(), 200);
 
-    let _ = stop_tx.send(());
-    served.await.expect("server task").expect("clean shutdown");
-    std::fs::remove_file(&handler).ok();
+    h.stop().await;
 }
 
 /// The stall bound clocks progress, not total transfer: a trickled body
@@ -638,17 +600,15 @@ async fn a_stalled_body_is_answered_408_and_the_connection_is_closed() {
 /// whole upload takes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_slow_but_moving_body_is_not_punished() {
-    let mut cfg = base_config(1);
-    cfg.limits.body_read_ms = 300;
-    let (server, addr, handler) = build(cfg).await;
+    let mut h = start(|cfg| {
+        cfg.workers = 1;
+        cfg.limits.body_read_ms = 300;
+    })
+    .await;
 
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let served = tokio::spawn(server.serve_with_shutdown(async {
-        let _ = stop_rx.await;
-    }));
-    wait_until_listening(addr).await;
-
-    let mut sock = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let mut sock = tokio::net::TcpStream::connect(h.addr())
+        .await
+        .expect("connect");
     sock.write_all(b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\n")
         .await
         .expect("write headers");
@@ -670,9 +630,7 @@ async fn a_slow_but_moving_body_is_not_punished() {
         "the echo must be whole: {head}"
     );
 
-    let _ = stop_tx.send(());
-    served.await.expect("server task").expect("clean shutdown");
-    std::fs::remove_file(&handler).ok();
+    h.stop().await;
 }
 
 /// The header deadline is configurable now (it was a hardcoded 30 s): a
@@ -680,18 +638,16 @@ async fn a_slow_but_moving_body_is_not_punished() {
 /// `[limits] header_read_ms`, not half a minute later.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_incomplete_header_read_is_cut_at_the_configured_deadline() {
-    let mut cfg = base_config(1);
-    cfg.limits.header_read_ms = 300;
-    let (server, addr, handler) = build(cfg).await;
-
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let served = tokio::spawn(server.serve_with_shutdown(async {
-        let _ = stop_rx.await;
-    }));
-    wait_until_listening(addr).await;
+    let mut h = start(|cfg| {
+        cfg.workers = 1;
+        cfg.limits.header_read_ms = 300;
+    })
+    .await;
 
     let started = std::time::Instant::now();
-    let mut sock = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let mut sock = tokio::net::TcpStream::connect(h.addr())
+        .await
+        .expect("connect");
     sock.write_all(b"GET /ok HT")
         .await
         .expect("partial request");
@@ -713,7 +669,5 @@ async fn an_incomplete_header_read_is_cut_at_the_configured_deadline() {
         "no request existed to answer: {head}"
     );
 
-    let _ = stop_tx.send(());
-    served.await.expect("server task").expect("clean shutdown");
-    std::fs::remove_file(&handler).ok();
+    h.stop().await;
 }

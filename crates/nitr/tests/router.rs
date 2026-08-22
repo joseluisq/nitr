@@ -2,9 +2,12 @@
 //! matching (404/405), path parameters, middleware composition and
 //! short-circuiting, the app error handler, and `nitr.cfg`.
 
-use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+// Each test binary uses a subset of the shared harness.
+#![allow(dead_code)]
+
+mod harness;
+
+use harness::TestServer;
 
 const APP_SCRIPT: &str = r#"
 local app = nitr.app()
@@ -71,77 +74,40 @@ const CFG_SCRIPT: &str = r#"
 return { name = "from-config" }
 "#;
 
-fn write_temp_script(name: &str, content: &str) -> PathBuf {
-    // `fs::write` truncates before writing, so a path two tests share is a
-    // race; the counter keeps every call on its own file.
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("nitr-router-{}-{id}-{name}", std::process::id()));
-    std::fs::write(&path, content).expect("write temp script");
-    path
-}
-
-/// Grabs a free loopback port from the OS.
-/// Binds port 0 (the OS picks a free port) and keeps the listener alive.
-/// The server adopts it via `.listener(...)`, so the port can never be
-/// taken by another test between choosing it and serving on it.
-fn reserve_addr() -> (std::net::TcpListener, SocketAddr) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind port 0");
-    let addr = listener.local_addr().expect("local addr");
-    (listener, addr)
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn routes_middleware_and_errors_end_to_end() {
-    let handler = write_temp_script("app.lua", APP_SCRIPT);
-    let config = write_temp_script("cfg.lua", CFG_SCRIPT);
-    let (listener, addr) = reserve_addr();
-
-    let server = nitr::Server::builder()
-        .listen(addr)
-        .listener(listener)
-        .handler_script(&handler)
-        .config_script(&config)
+    let mut server = TestServer::builder("router")
+        .handler(APP_SCRIPT)
+        .config_script(CFG_SCRIPT)
         .builtins(nitr::Builtins::JSON)
-        .workers(2)
-        .build()
-        .await
-        .expect("build server");
-
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let served = tokio::spawn(server.serve_with_shutdown(async {
-        let _ = stop_rx.await;
-    }));
-
-    let base = format!("http://{addr}");
-    let client = reqwest::Client::new();
+        .config(|cfg| cfg.workers = 2)
+        .spawn()
+        .await;
 
     // Plain route + global middleware tag.
-    let resp = client.get(format!("{base}/")).send().await.expect("GET /");
+    let resp = server.get("/").await;
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.headers()["x-global"], "1");
     assert_eq!(resp.text().await.expect("body"), "home");
 
     // Path parameters.
-    let resp = client
-        .get(format!("{base}/users/42"))
-        .send()
-        .await
-        .expect("GET /users/42");
+    let resp = server.get("/users/42").await;
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.text().await.expect("body"), "user 42");
 
     // Method routing.
-    let resp = client
-        .post(format!("{base}/users"))
+    let resp = server
+        .client()
+        .post(server.url("/users"))
         .send()
         .await
         .expect("POST /users");
     assert_eq!(resp.status(), 201);
 
     // 405 with an Allow header for a known path with the wrong method.
-    let resp = client
-        .delete(format!("{base}/users/42"))
+    let resp = server
+        .client()
+        .delete(server.url("/users/42"))
         .send()
         .await
         .expect("DELETE /users/42");
@@ -151,26 +117,19 @@ async fn routes_middleware_and_errors_end_to_end() {
     assert_eq!(resp.headers()["allow"], "GET, HEAD, OPTIONS");
 
     // 404 for an unregistered path: Lua is never invoked.
-    let resp = client
-        .get(format!("{base}/nope"))
-        .send()
-        .await
-        .expect("GET /nope");
+    let resp = server.get("/nope").await;
     assert_eq!(resp.status(), 404);
 
     // Per-route middleware short-circuits without auth...
-    let resp = client
-        .get(format!("{base}/admin"))
-        .send()
-        .await
-        .expect("GET /admin");
+    let resp = server.get("/admin").await;
     assert_eq!(resp.status(), 401);
     // ...but the global middleware still wrapped the response.
     assert_eq!(resp.headers()["x-global"], "1");
 
     // ...and passes through with credentials.
-    let resp = client
-        .get(format!("{base}/admin"))
+    let resp = server
+        .client()
+        .get(server.url("/admin"))
         .header("authorization", "secret")
         .send()
         .await
@@ -179,93 +138,62 @@ async fn routes_middleware_and_errors_end_to_end() {
     assert_eq!(resp.text().await.expect("body"), "admin");
 
     // Trailing catch-all captures the rest of the path.
-    let resp = client
-        .get(format!("{base}/files/a/b.txt"))
-        .send()
-        .await
-        .expect("GET /files/a/b.txt");
+    let resp = server.get("/files/a/b.txt").await;
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.text().await.expect("body"), "a/b.txt");
 
     // A handler error reaches app:on_error with the same request object.
-    let resp = client
-        .get(format!("{base}/boom"))
-        .send()
-        .await
-        .expect("GET /boom");
+    let resp = server.get("/boom").await;
     assert_eq!(resp.status(), 500);
     assert_eq!(resp.headers()["x-err"], "handled");
     assert_eq!(resp.text().await.expect("body"), "handled: /boom");
 
     // The config snapshot is reachable as nitr.cfg.
-    let resp = client
-        .get(format!("{base}/cfg"))
-        .send()
-        .await
-        .expect("GET /cfg");
+    let resp = server.get("/cfg").await;
     assert_eq!(resp.text().await.expect("body"), "from-config");
 
-    let _ = stop_tx.send(());
-    served
-        .await
-        .expect("server task")
-        .expect("server shutdown cleanly");
-
-    std::fs::remove_file(&handler).ok();
-    std::fs::remove_file(&config).ok();
+    server.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn use_after_a_route_fails_at_startup() {
-    let handler = write_temp_script(
-        "use-after-route.lua",
-        r#"
-        local app = nitr.app()
-        app:get("/", function(req) return { status = 200 } end)
-        app:use(function(next) return next end)
-        return app
-        "#,
-    );
-
-    // `build()` never binds, so any address will do for a build-error test.
-    let err = nitr::Server::builder()
-        .listen("127.0.0.1:0".parse().expect("addr"))
-        .handler_script(&handler)
+    let mut builder = TestServer::builder("router-use-after")
+        .handler(
+            r#"
+            local app = nitr.app()
+            app:get("/", function(req) return { status = 200 } end)
+            app:use(function(next) return next end)
+            return app
+            "#,
+        )
         .builtins(nitr::Builtins::JSON)
-        .workers(1)
-        .build()
+        .config(|cfg| cfg.workers = 1);
+    let err = builder
+        .try_build()
         .await
         .expect_err("app:use after a route must fail the build");
     assert!(
         err.to_string().contains("before registering routes"),
         "got: {err}"
     );
-
-    std::fs::remove_file(&handler).ok();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn duplicate_routes_fail_at_startup() {
-    let handler = write_temp_script(
-        "duplicate.lua",
-        r#"
-        local app = nitr.app()
-        app:get("/x", function(req) return { status = 200 } end)
-        app:get("/x", function(req) return { status = 200 } end)
-        return app
-        "#,
-    );
-
-    // `build()` never binds, so any address will do for a build-error test.
-    let err = nitr::Server::builder()
-        .listen("127.0.0.1:0".parse().expect("addr"))
-        .handler_script(&handler)
+    let mut builder = TestServer::builder("router-duplicate")
+        .handler(
+            r#"
+            local app = nitr.app()
+            app:get("/x", function(req) return { status = 200 } end)
+            app:get("/x", function(req) return { status = 200 } end)
+            return app
+            "#,
+        )
         .builtins(nitr::Builtins::JSON)
-        .workers(1)
-        .build()
+        .config(|cfg| cfg.workers = 1);
+    let err = builder
+        .try_build()
         .await
         .expect_err("duplicate route must fail the build");
     assert!(err.to_string().contains("duplicate route"), "got: {err}");
-
-    std::fs::remove_file(&handler).ok();
 }

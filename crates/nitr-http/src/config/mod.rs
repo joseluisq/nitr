@@ -479,6 +479,48 @@ mod tests {
         assert_eq!(cfg.limits.body_read_ms, 250);
     }
 
+    proptest::proptest! {
+        /// Property: over arbitrary numeric limit combinations, validation
+        /// is total — it accepts, or refuses with an error naming a
+        /// setting; it never panics — and the pool-wait/exec-budget
+        /// contradiction is always the refusal it promises.
+        #[test]
+        fn prop_limit_validation_is_total_and_names_the_setting(
+            workers in 1usize..8,
+            max_streams in proptest::option::of(0usize..8),
+            pool_wait_ms in 0u64..100_000,
+            exec_timeout_ms in 0u64..100_000,
+            body_read_ms in 0u64..100_000,
+            header_read_ms in 0u64..100_000,
+        ) {
+            let mut cfg = valid_base();
+            cfg.workers = workers;
+            cfg.max_streams = max_streams;
+            cfg.limits.pool_wait_ms = pool_wait_ms;
+            cfg.limits.body_read_ms = body_read_ms;
+            cfg.limits.header_read_ms = header_read_ms;
+            cfg.lua.exec_timeout_ms = exec_timeout_ms;
+
+            match cfg.validate() {
+                Ok(()) => {
+                    proptest::prop_assert!(
+                        !(pool_wait_ms > exec_timeout_ms
+                            && pool_wait_ms != 0
+                            && exec_timeout_ms != 0),
+                        "the pool-wait contradiction must refuse"
+                    );
+                }
+                Err(err) => {
+                    let msg = err.to_string();
+                    proptest::prop_assert!(
+                        msg.contains("pool_wait_ms") || msg.contains("max_streams"),
+                        "a refusal must name the offending setting: {msg}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn moved_keys_fail_with_directions() {
         // Superseded spellings are refused with the new spelling named,

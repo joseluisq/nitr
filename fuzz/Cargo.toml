@@ -16,6 +16,10 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 nitr-std = { path = "../crates/nitr-std" }
+nitr-http = { path = "../crates/nitr-http", features = ["multipart"] }
+mlua = { version = "0.12", features = ["lua54", "vendored", "serialize", "send"] }
+tokio = { version = "1", features = ["rt"] }
+bytes = "1"
 
 [[bin]]
 name = "cookie_verify"
@@ -34,6 +38,27 @@ bench = false
 [[bin]]
 name = "path_lexical"
 path = "fuzz_targets/path_lexical.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "json_lua"
+path = "fuzz_targets/json_lua.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "range_header"
+path = "fuzz_targets/range_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "multipart"
+path = "fuzz_targets/multipart.rs"
 test = false
 doc = false
 bench = false

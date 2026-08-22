@@ -8,12 +8,14 @@ on:
     paths:
       - "**/Cargo.lock"
       - "**/Cargo.toml"
+      - deny.toml
   pull_request:
     branches:
       - master
     paths:
       - "**/Cargo.lock"
       - "**/Cargo.toml"
+      - deny.toml
 
 jobs:
   audit:
@@ -26,3 +28,17 @@ jobs:
       - uses: actions-rs/audit-check@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Licenses, bans, duplicate versions, and registry hygiene on top of the
+  # advisory check. The policy lives in deny.toml, runnable locally with
+  # `cargo deny check`.
+  deny:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check

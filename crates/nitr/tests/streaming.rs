@@ -2,10 +2,14 @@
 //! SSE, the per-chunk execution budget, the `max_streams` cap, and client
 //! disconnect recovery.
 
-use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+// Each test binary uses a subset of the shared harness.
+#![allow(dead_code)]
+
+mod harness;
+
 use std::time::Duration;
+
+use harness::TestServer;
 
 const APP_SCRIPT: &str = r#"
 local app = nitr.app()
@@ -67,57 +71,23 @@ end)
 return app
 "#;
 
-fn write_temp_script(name: &str, content: &str) -> PathBuf {
-    // `fs::write` truncates before writing, so a path two tests share is a
-    // race; the counter keeps every call on its own file.
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    let path =
-        std::env::temp_dir().join(format!("nitr-streaming-{}-{id}-{name}", std::process::id()));
-    std::fs::write(&path, content).expect("write temp script");
-    path
-}
-
-/// Binds port 0 (the OS picks a free port) and keeps the listener alive.
-/// The server adopts it via `.listener(...)`, so the port can never be
-/// taken by another test between choosing it and serving on it.
-fn reserve_addr() -> (std::net::TcpListener, SocketAddr) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind port 0");
-    let addr = listener.local_addr().expect("local addr");
-    (listener, addr)
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn streaming_bodies_end_to_end() {
-    let handler = write_temp_script("app.lua", APP_SCRIPT);
-    let (listener, addr) = reserve_addr();
-
-    let mut cfg = nitr::Config {
-        workers: 2,
-        max_streams: Some(1),
-        ..Default::default()
-    };
-    cfg.lua.exec_timeout_ms = 400;
-    // Config validation refuses a pool wait above the request budget.
-    cfg.limits.pool_wait_ms = 400;
-
-    let server = nitr::Server::builder()
-        .config(cfg)
-        .listen(addr)
-        .listener(listener)
-        .handler_script(&handler)
+    let mut server = TestServer::builder("streaming")
+        .handler(APP_SCRIPT)
         .builtins(nitr::Builtins::JSON | nitr::Builtins::HTTP)
-        .build()
-        .await
-        .expect("build server");
+        .config(|cfg| {
+            cfg.workers = 2;
+            cfg.max_streams = Some(1);
+            cfg.lua.exec_timeout_ms = 400;
+            // Config validation refuses a pool wait above the request budget.
+            cfg.limits.pool_wait_ms = 400;
+        })
+        .spawn()
+        .await;
 
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let served = tokio::spawn(server.serve_with_shutdown(async {
-        let _ = stop_rx.await;
-    }));
-
-    let base = format!("http://{addr}");
-    let client = reqwest::Client::new();
+    let base = server.url("");
+    let client = server.client().clone();
 
     // Writer callback: chunked transfer, chunks concatenated in order.
     let resp = client
@@ -207,11 +177,5 @@ async fn streaming_bodies_end_to_end() {
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.text().await.expect("body after release"), "[1,2,3]");
 
-    let _ = stop_tx.send(());
-    served
-        .await
-        .expect("server task")
-        .expect("server shutdown cleanly");
-
-    std::fs::remove_file(&handler).ok();
+    server.stop().await;
 }

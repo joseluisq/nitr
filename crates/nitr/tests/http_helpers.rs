@@ -3,9 +3,12 @@
 //! (Named `http_helpers` because `harness/` is the shared test harness;
 //! this file is a *test of* the response-helper API, not shared helpers.)
 
-use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+// Each test binary uses a subset of the shared harness.
+#![allow(dead_code)]
+
+mod harness;
+
+use harness::TestServer;
 
 const APP_SCRIPT: &str = r#"
 local SECRET = "s3cret"
@@ -65,51 +68,18 @@ end)
 return app
 "#;
 
-fn write_temp_script(name: &str, content: &str) -> PathBuf {
-    // `fs::write` truncates before writing, so a path two tests share is a
-    // race; the counter keeps every call on its own file.
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    let path =
-        std::env::temp_dir().join(format!("nitr-helpers-{}-{id}-{name}", std::process::id()));
-    std::fs::write(&path, content).expect("write temp script");
-    path
-}
-
-/// Binds port 0 (the OS picks a free port) and keeps the listener alive.
-/// The server adopts it via `.listener(...)`, so the port can never be
-/// taken by another test between choosing it and serving on it.
-fn reserve_addr() -> (std::net::TcpListener, SocketAddr) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind port 0");
-    let addr = listener.local_addr().expect("local addr");
-    (listener, addr)
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn helpers_cookies_and_negotiation_end_to_end() {
-    let handler = write_temp_script("app.lua", APP_SCRIPT);
-    let (listener, addr) = reserve_addr();
-
-    let server = nitr::Server::builder()
-        .listen(addr)
-        .listener(listener)
-        .handler_script(&handler)
+    let mut server = TestServer::builder("http-helpers")
+        .handler(APP_SCRIPT)
         .builtins(nitr::Builtins::JSON | nitr::Builtins::HTTP)
-        .workers(1)
-        .build()
-        .await
-        .expect("build server");
-
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let served = tokio::spawn(server.serve_with_shutdown(async {
-        let _ = stop_rx.await;
-    }));
-
-    let base = format!("http://{addr}");
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("client");
+        .config(|cfg| cfg.workers = 1)
+        .spawn()
+        .await;
+    // The harness client already declines redirects, which the /redirect
+    // assertion depends on.
+    let client = server.client().clone();
+    let base = server.url("");
 
     // nitr.text() / nitr.html() with optional status / callable nitr.json() helper.
     let resp = client
@@ -241,11 +211,5 @@ async fn helpers_cookies_and_negotiation_end_to_end() {
         .expect("accepts");
     assert_eq!(resp.text().await.expect("body"), "application/json");
 
-    let _ = stop_tx.send(());
-    served
-        .await
-        .expect("server task")
-        .expect("server shutdown cleanly");
-
-    std::fs::remove_file(&handler).ok();
+    server.stop().await;
 }

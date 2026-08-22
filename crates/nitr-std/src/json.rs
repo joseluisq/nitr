@@ -47,7 +47,7 @@ impl UserData for LuaJson {
 }
 
 /// JSON encode function via Serde.
-pub(crate) fn create_json_fn(lua: &Lua) -> mlua::Result<AnyUserData> {
+pub fn create_json_fn(lua: &Lua) -> mlua::Result<AnyUserData> {
     lua.create_userdata(LuaJson)
 }
 

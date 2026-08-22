@@ -1,8 +1,11 @@
 name: fuzz
 # Short per-PR fuzzing of the parsers an attacker fully controls
-# (signed-cookie verification, Accept negotiation, lexical paths).
+# (signed-cookie verification, Accept negotiation, lexical paths, the
+# JSON↔Lua boundary, multipart bodies, and Range headers).
 # A short run finds shallow bugs only — the corpus under fuzz/corpus is
-# retained across runs via the cache so depth accumulates over time.
+# retained across runs via the cache so depth accumulates over time, and
+# the committed seeds under fuzz/seeds keep a cold start (first run,
+# evicted cache) from beginning at zero coverage.
 on:
   push:
     branches:
@@ -33,6 +36,9 @@ jobs:
           - cookie_verify
           - accept_negotiation
           - path_lexical
+          - json_lua
+          - range_header
+          - multipart
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
@@ -55,6 +61,15 @@ jobs:
         key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
         restore-keys: |
           fuzz-corpus-${{ matrix.target }}-
+
+    # Committed seeds top up the cached corpus (no clobbering: the cache
+    # entries are content-addressed, the seeds are named files).
+    - name: Seed the corpus
+      run: |
+        mkdir -p "fuzz/corpus/${{ matrix.target }}"
+        if [ -d "fuzz/seeds/${{ matrix.target }}" ]; then
+          cp -n "fuzz/seeds/${{ matrix.target }}"/* "fuzz/corpus/${{ matrix.target }}/" || true
+        fi
 
     # The target triple is pinned to the host: fuzzing needs the address
     # sanitizer, which is incompatible with statically linked (musl) libc,

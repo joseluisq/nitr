@@ -39,3 +39,4 @@ crates/*/LICENSE-APACHE
 crates/*/LICENSE-MIT
 
 !crates/*/proptest-regressions/**/*.txt
+!fuzz/seeds/json_lua/*.json

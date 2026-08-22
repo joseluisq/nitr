@@ -2,45 +2,29 @@
 //! SSRF policy (default-deny, allow-list), policy-checked redirects, and
 //! SQLite transactions (commit, rollback, savepoint nesting).
 
-use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+// Each test binary uses a subset of the shared harness.
+#![allow(dead_code)]
 
-fn write_temp(name: &str, content: &str) -> PathBuf {
-    // `fs::write` truncates before writing, so a path two tests share is a
-    // race; the counter keeps every call on its own file.
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("nitr-p6-{}-{id}-{name}", std::process::id()));
-    std::fs::write(&path, content).expect("write temp file");
-    path
-}
+mod harness;
 
-/// Waits for a spawned server to actually be accepting on `addr`.
-async fn wait_until_listening(addr: std::net::SocketAddr) {
-    for _ in 0..200 {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    panic!("the server never started listening on {addr}");
-}
-
-/// Binds port 0 (the OS picks a free port) and keeps the listener alive.
-/// The server adopts it via `.listener(...)`, so the port can never be
-/// taken by another test between choosing it and serving on it.
-fn reserve_addr() -> (std::net::TcpListener, SocketAddr) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind port 0");
-    let addr = listener.local_addr().expect("local addr");
-    (listener, addr)
-}
+use harness::TestServer;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn await_all_fetch_options_redirects_and_transactions() {
-    let (listener, addr) = reserve_addr();
-    let db_path = std::env::temp_dir().join(format!("nitr-p6-{}.db", std::process::id()));
-    std::fs::remove_file(&db_path).ok();
+    let mut builder = TestServer::builder("p6-aggregate")
+        .builtins(
+            nitr::Builtins::JSON
+                | nitr::Builtins::HTTP
+                | nitr::Builtins::FETCH
+                | nitr::Builtins::DATABASE,
+        )
+        .config(|cfg| {
+            cfg.workers = 3;
+            // Local aggregation: this test talks to itself over loopback.
+            cfg.fetch.allow_private_networks = true;
+        })
+        .database("t.db");
+    let addr = builder.reserve();
 
     let app = format!(
         r#"
@@ -119,47 +103,20 @@ end)
 return app
 "#
     );
-    let handler = write_temp("app.lua", &app);
-    let config = write_temp(
-        "cfg.lua",
-        r#"
+    let mut server = builder
+        .handler(app)
+        .config_script(
+            r#"
         local db = ...
         db:execute("CREATE TABLE IF NOT EXISTS t (v TEXT)")
         return {}
         "#,
-    );
-
-    let mut cfg = nitr::Config {
-        workers: 3,
-        ..Default::default()
-    };
-    // Local aggregation: this test talks to itself over loopback.
-    cfg.fetch.allow_private_networks = true;
-
-    let server = nitr::Server::builder()
-        .config(cfg)
-        .listen(addr)
-        .listener(listener)
-        .handler_script(&handler)
-        .config_script(&config)
-        .database(&db_path)
-        .builtins(
-            nitr::Builtins::JSON
-                | nitr::Builtins::HTTP
-                | nitr::Builtins::FETCH
-                | nitr::Builtins::DATABASE,
         )
-        .build()
-        .await
-        .expect("build server");
+        .spawn()
+        .await;
 
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let served = tokio::spawn(server.serve_with_shutdown(async {
-        let _ = stop_rx.await;
-    }));
-
-    let base = format!("http://{addr}");
-    let client = reqwest::Client::new();
+    let base = server.url("");
+    let client = server.client().clone();
 
     // nitr.await_all preserves argument order.
     let body: serde_json::Value = client
@@ -214,11 +171,7 @@ return app
         "got: {body}"
     );
 
-    let _ = stop_tx.send(());
-    served.await.expect("task").expect("shutdown");
-    std::fs::remove_file(&handler).ok();
-    std::fs::remove_file(&config).ok();
-    std::fs::remove_file(&db_path).ok();
+    server.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -237,26 +190,16 @@ return app
 "#;
 
     // Default policy: private/loopback addresses are refused.
-    let handler = write_temp("deny.lua", APP);
-    let (listener, addr) = reserve_addr();
-    let server = nitr::Server::builder()
-        .listen(addr)
-        .listener(listener)
-        .handler_script(&handler)
+    let mut server = TestServer::builder("p6-deny")
+        .handler(APP)
         .builtins(nitr::Builtins::JSON | nitr::Builtins::HTTP | nitr::Builtins::FETCH)
-        .workers(1)
-        .build()
-        .await
-        .expect("build server");
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let served = tokio::spawn(server.serve_with_shutdown(async {
-        let _ = stop_rx.await;
-    }));
-    wait_until_listening(addr).await;
-    let client = reqwest::Client::new();
+        .config(|cfg| cfg.workers = 1)
+        .spawn()
+        .await;
+    let client = server.client().clone();
 
     let body: serde_json::Value = client
-        .get(format!("http://{addr}/try"))
+        .get(server.url("/try"))
         .query(&[("url", "http://127.0.0.1:9/internal")])
         .send()
         .await
@@ -275,7 +218,7 @@ return app
 
     // Metadata-endpoint style link-local addresses are refused too.
     let body: serde_json::Value = client
-        .get(format!("http://{addr}/try"))
+        .get(server.url("/try"))
         .query(&[("url", "http://169.254.169.254/latest/meta-data/")])
         .send()
         .await
@@ -285,39 +228,25 @@ return app
         .expect("body");
     assert_eq!(body["ok"], false);
 
-    let _ = stop_tx.send(());
-    served.await.expect("task").expect("shutdown");
-    std::fs::remove_file(&handler).ok();
+    server.stop().await;
 
     // Allow-list: hosts outside fetch.allowed_hosts are refused even with
     // private networks allowed.
-    let handler = write_temp("allowlist.lua", APP);
-    let (listener, addr) = reserve_addr();
-    let mut cfg = nitr::Config::default();
-    cfg.fetch.allowed_hosts = Some(vec!["api.example.com".into()]);
-    cfg.fetch.allow_private_networks = true;
-
-    let server = nitr::Server::builder()
-        .config(cfg)
-        .listen(addr)
-        .listener(listener)
-        .handler_script(&handler)
+    let mut server = TestServer::builder("p6-allowlist")
+        .handler(APP)
         .builtins(nitr::Builtins::JSON | nitr::Builtins::HTTP | nitr::Builtins::FETCH)
-        .workers(1)
-        .build()
-        .await
-        .expect("build server");
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let served = tokio::spawn(server.serve_with_shutdown(async {
-        let _ = stop_rx.await;
-    }));
-    // `serve` binds inside the spawned task, so the first request has to
-    // wait for the listener rather than race it.
-    wait_until_listening(addr).await;
+        .config(|cfg| {
+            cfg.workers = 1;
+            cfg.fetch.allowed_hosts = Some(vec!["api.example.com".into()]);
+            cfg.fetch.allow_private_networks = true;
+        })
+        .spawn()
+        .await;
 
+    let target = server.url("/whatever");
     let body: serde_json::Value = client
-        .get(format!("http://{addr}/try"))
-        .query(&[("url", format!("http://{addr}/whatever"))])
+        .get(server.url("/try"))
+        .query(&[("url", target)])
         .send()
         .await
         .expect("try unlisted")
@@ -333,7 +262,5 @@ return app
         "got: {body}"
     );
 
-    let _ = stop_tx.send(());
-    served.await.expect("task").expect("shutdown");
-    std::fs::remove_file(&handler).ok();
+    server.stop().await;
 }

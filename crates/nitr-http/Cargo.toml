@@ -78,3 +78,6 @@ uuid = { workspace = true }
 brotli = { workspace = true, optional = true }
 flate2 = { workspace = true, optional = true }
 multer = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

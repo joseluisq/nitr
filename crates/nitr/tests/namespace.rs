@@ -2,37 +2,20 @@
 //! namespace is the only surface Nitr exposes to Lua, Rust extension
 //! modules mount beside the builtins, and the crypto/auth primitives.
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+// Each test binary uses a subset of the shared harness.
+#![allow(dead_code)]
 
-fn write_script(name: &str, content: &str) -> PathBuf {
-    // `fs::write` truncates before writing, so a path two tests share is a
-    // race; the counter keeps every call on its own file.
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("nitr-ns-{}-{id}-{name}", std::process::id()));
-    std::fs::write(&path, content).expect("write temp script");
-    path
-}
+mod harness;
 
-async fn client_for(script: &PathBuf, builtins: nitr::Builtins) -> nitr::testing::TestClient {
-    let server = nitr::Server::builder()
-        .handler_script(script)
-        .builtins(builtins)
-        .workers(1)
-        .build()
-        .await
-        .expect("build server");
-    server.test_client()
-}
+use harness::TestServer;
 
 /// Nitr contributes exactly one global — `nitr` — and every builtin hangs
 /// off it. Nothing is intermixed with the Lua standard library.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn only_the_nitr_global_is_registered() {
-    let script = write_script(
-        "globals.lua",
-        r#"
+    let mut server = TestServer::builder("ns-globals")
+        .handler(
+            r#"
 local app = nitr.app()
 
 app:get("/globals", function(req)
@@ -63,23 +46,19 @@ end)
 
 return app
 "#,
-    );
+        )
+        .builtins(
+            nitr::Builtins::JSON
+                | nitr::Builtins::HTTP
+                | nitr::Builtins::LOG
+                | nitr::Builtins::DEBUG
+                | nitr::Builtins::CRYPTO,
+        )
+        .config(|cfg| cfg.workers = 1)
+        .spawn()
+        .await;
 
-    let client = client_for(
-        &script,
-        nitr::Builtins::JSON
-            | nitr::Builtins::HTTP
-            | nitr::Builtins::LOG
-            | nitr::Builtins::DEBUG
-            | nitr::Builtins::CRYPTO,
-    )
-    .await;
-
-    let resp = client
-        .request("GET", "/globals", &[], None)
-        .await
-        .expect("globals");
-    let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json");
+    let body = server.json("/globals").await;
     // An empty Lua table encodes as `{}`, so treat both shapes as empty.
     let leaked = body["leaked"].as_array().map(Vec::as_slice).unwrap_or(&[]);
     assert!(
@@ -88,11 +67,7 @@ return app
     );
 
     // …and everything is reachable through the namespace instead.
-    let resp = client
-        .request("GET", "/members", &[], None)
-        .await
-        .expect("members");
-    let members: serde_json::Value = serde_json::from_slice(&resp.body).expect("json");
+    let members = server.json("/members").await;
     for name in [
         "app",
         "json",
@@ -117,7 +92,7 @@ return app
     assert_eq!(members["log"], "table");
     assert_eq!(members["text"], "function");
 
-    std::fs::remove_file(&script).ok();
+    server.stop().await;
 }
 
 /// The handler script must return a `nitr.app()`: the legacy
@@ -125,16 +100,12 @@ return app
 /// startup error, not a per-request surprise.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn legacy_function_handlers_are_rejected() {
-    let script = write_script(
-        "legacy.lua",
-        "return function(cfg, req) return { status = 200, body = 'legacy' } end",
-    );
-
-    let err = nitr::Server::builder()
-        .handler_script(&script)
+    let mut builder = TestServer::builder("ns-legacy")
+        .handler("return function(cfg, req) return { status = 200, body = 'legacy' } end")
         .builtins(nitr::Builtins::JSON)
-        .workers(1)
-        .build()
+        .config(|cfg| cfg.workers = 1);
+    let err = builder
+        .try_build()
         .await
         .expect_err("a plain function handler must be rejected");
     let msg = err.to_string();
@@ -142,17 +113,17 @@ async fn legacy_function_handlers_are_rejected() {
         msg.contains("must return a nitr.app()"),
         "unexpected error: {msg}"
     );
-
-    std::fs::remove_file(&script).ok();
 }
 
-/// Rust extension modules mount at `nitr.<name>` in every pooled state and
-/// are indistinguishable from builtins on the Lua side.
+/// Rust extension modules mount at `nitr.ext.<name>` in every pooled state
+/// and are indistinguishable from builtins on the Lua side.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rust_modules_mount_on_the_namespace() {
-    let script = write_script(
-        "module.lua",
-        r#"
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let shared = counter.clone();
+    let mut server = TestServer::builder("ns-module")
+        .handler(
+            r#"
 local app = nitr.app()
 
 app:get("/greet/:name", function(req)
@@ -165,12 +136,7 @@ end)
 
 return app
 "#,
-    );
-
-    let counter = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
-    let shared = counter.clone();
-    let server = nitr::Server::builder()
-        .handler_script(&script)
+        )
         .builtins(nitr::Builtins::JSON)
         .module("demo", move |lua| {
             let table = lua.create_table()?;
@@ -188,30 +154,19 @@ return app
             Ok(table)
         })
         // Two states: the module closure must run for each of them.
-        .workers(2)
-        .build()
-        .await
-        .expect("build server");
-    let client = server.test_client();
+        .config(|cfg| cfg.workers = 2)
+        .spawn()
+        .await;
 
-    let resp = client
-        .request("GET", "/greet/nitr", &[], None)
-        .await
-        .expect("request");
-    assert_eq!(resp.status, 200);
-    let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json");
+    let body = server.json("/greet/nitr").await;
     assert_eq!(body["greeting"], "Hello, nitr!");
     assert_eq!(body["kind"], "table");
 
     // The Rust-side state is shared across pooled states.
-    let resp = client
-        .request("GET", "/greet/again", &[], None)
-        .await
-        .expect("request");
-    let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json");
+    let body = server.json("/greet/again").await;
     assert_eq!(body["counter"], 2);
 
-    std::fs::remove_file(&script).ok();
+    server.stop().await;
 }
 
 /// Modules live in `nitr.ext.*`, so a module may share a builtin's name —
@@ -219,59 +174,50 @@ return app
 /// with the same name still fail at build time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn module_names_are_isolated_from_the_std() {
-    let script = write_script(
-        "collide.lua",
-        "local app = nitr.app()\n\
+    const COLLIDE_SCRIPT: &str = "local app = nitr.app()\n\
          app:get('/', function(req)\n\
              return nitr.json({ std = type(nitr.json), ext = nitr.ext.json.kind })\n\
-         end)\nreturn app",
-    );
+         end)\nreturn app";
 
     // A module named `json` coexists with the `nitr.json` builtin: it
     // mounts at `nitr.ext.json`, one level away from the std.
-    let server = nitr::Server::builder()
-        .handler_script(&script)
+    let mut server = TestServer::builder("ns-collide")
+        .handler(COLLIDE_SCRIPT)
         .builtins(nitr::Builtins::JSON | nitr::Builtins::HTTP)
         .module("json", |lua| {
             let t = lua.create_table()?;
             t.set("kind", "extension")?;
             Ok(t)
         })
-        .workers(1)
-        .build()
-        .await
-        .expect("a module may share a builtin's name");
-    let resp = server
-        .test_client()
-        .request("GET", "/", &[], None)
-        .await
-        .expect("request");
-    let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json");
+        .config(|cfg| cfg.workers = 1)
+        .spawn()
+        .await;
+    let body = server.json("/").await;
     assert_eq!(body["std"], "userdata");
     assert_eq!(body["ext"], "extension");
+    server.stop().await;
 
     // Two modules with the same name collide with each other too.
-    let err = nitr::Server::builder()
-        .handler_script(&script)
+    let mut builder = TestServer::builder("ns-collide-twice")
+        .handler(COLLIDE_SCRIPT)
         .builtins(nitr::Builtins::HTTP)
         .module("twice", |lua| lua.create_table())
         .module("twice", |lua| lua.create_table())
-        .workers(1)
-        .build()
+        .config(|cfg| cfg.workers = 1);
+    let err = builder
+        .try_build()
         .await
         .expect_err("duplicate module names must be rejected");
     assert!(err.to_string().contains("already exists"), "got: {err}");
-
-    std::fs::remove_file(&script).ok();
 }
 
 /// `nitr.crypto` and `nitr.auth`: hashing, HMAC, randomness, constant-time
 /// comparison, argon2id passwords, and Authorization header parsing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn crypto_and_auth_primitives() {
-    let script = write_script(
-        "crypto.lua",
-        r#"
+    let mut server = TestServer::builder("ns-crypto")
+        .handler(
+            r#"
 local app = nitr.app()
 
 app:get("/digest", function(req)
@@ -307,15 +253,13 @@ end)
 
 return app
 "#,
-    );
+        )
+        .builtins(nitr::Builtins::JSON | nitr::Builtins::CRYPTO)
+        .config(|cfg| cfg.workers = 1)
+        .spawn()
+        .await;
 
-    let client = client_for(&script, nitr::Builtins::JSON | nitr::Builtins::CRYPTO).await;
-
-    let resp = client
-        .request("GET", "/digest", &[], None)
-        .await
-        .expect("digest");
-    let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json");
+    let body = server.json("/digest").await;
     assert_eq!(
         body["sha256"],
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
@@ -329,44 +273,42 @@ return app
     assert_eq!(body["eq_same"], true);
     assert_eq!(body["eq_diff"], false);
 
-    let resp = client
-        .request("POST", "/password", &[], None)
+    let resp = server
+        .client()
+        .post(server.url("/password"))
+        .send()
         .await
         .expect("password");
-    let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json");
+    let body: serde_json::Value = resp.json().await.expect("json");
     assert_eq!(body["prefix"], "$argon2id$");
     assert_eq!(body["ok"], true);
     assert_eq!(body["bad"], false);
     assert_eq!(body["garbage"], false);
 
     // Bearer and Basic parsing off the live request object.
-    let resp = client
-        .request(
-            "GET",
-            "/auth",
-            &[("authorization".into(), "Bearer t0ken".into())],
-            None,
-        )
+    let resp = server
+        .client()
+        .get(server.url("/auth"))
+        .header("authorization", "Bearer t0ken")
+        .send()
         .await
         .expect("bearer");
-    let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json");
+    let body: serde_json::Value = resp.json().await.expect("json");
     assert_eq!(body["bearer"], "t0ken");
     assert_eq!(body["user"], "none");
 
     // "ada:lovelace" base64-encoded.
-    let resp = client
-        .request(
-            "GET",
-            "/auth",
-            &[("authorization".into(), "Basic YWRhOmxvdmVsYWNl".into())],
-            None,
-        )
+    let resp = server
+        .client()
+        .get(server.url("/auth"))
+        .header("authorization", "Basic YWRhOmxvdmVsYWNl")
+        .send()
         .await
         .expect("basic");
-    let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json");
+    let body: serde_json::Value = resp.json().await.expect("json");
     assert_eq!(body["user"], "ada");
     assert_eq!(body["pass"], "lovelace");
     assert_eq!(body["bearer"], "none");
 
-    std::fs::remove_file(&script).ok();
+    server.stop().await;
 }

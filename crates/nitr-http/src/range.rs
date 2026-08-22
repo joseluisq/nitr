@@ -12,12 +12,17 @@ use hyper::header::{self, HeaderMap};
 
 /// What a `Range` header asks for, once resolved against a known length.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Resolved {
+pub enum Resolved {
     /// No range header, an unsupported unit, or more than one range: send
     /// the whole representation.
     Full,
-    /// Serve `start..=end` (inclusive, both within the representation).
-    Partial { start: u64, end: u64 },
+    /// Serve a single byte range of the representation.
+    Partial {
+        /// First byte served (inclusive, within the representation).
+        start: u64,
+        /// Last byte served (inclusive, within the representation).
+        end: u64,
+    },
     /// The range is syntactically valid but cannot be satisfied: `416`.
     Unsatisfiable,
 }
@@ -67,7 +72,7 @@ fn secs(t: SystemTime) -> u64 {
 }
 
 /// Parses a `Range` header value against a representation length.
-fn parse(value: &str, len: u64) -> Resolved {
+pub fn parse(value: &str, len: u64) -> Resolved {
     let Some(spec) = value.trim().strip_prefix("bytes=") else {
         // An unknown unit must be ignored, not rejected.
         return Resolved::Full;
@@ -189,5 +194,42 @@ mod tests {
             resolve(&mismatched, 100, "\"e\"", Some(modified)),
             Resolved::Full
         );
+    }
+
+    proptest::proptest! {
+        /// Property: parsing is total over arbitrary header text, and any
+        /// range it accepts lies entirely within the representation — a
+        /// `Partial` out of bounds would slice the static file server out
+        /// of its buffer.
+        #[test]
+        fn prop_parse_is_total_and_accepted_ranges_are_in_bounds(
+            header in "[ -~]{0,40}",
+            len in 0u64..100_000,
+        ) {
+            match parse(&header, len) {
+                Resolved::Partial { start, end } => {
+                    proptest::prop_assert!(start <= end, "inverted {start}..={end}");
+                    proptest::prop_assert!(end < len, "{start}..={end} beyond {len}");
+                }
+                Resolved::Full | Resolved::Unsatisfiable => {}
+            }
+        }
+
+        /// Property: a syntactically valid single range inside the
+        /// representation resolves to exactly itself.
+        #[test]
+        fn prop_valid_single_ranges_resolve_exactly(
+            start in 0u64..1000,
+            span in 0u64..1000,
+            slack in 1u64..1000,
+        ) {
+            let end = start + span;
+            let len = end + slack; // strictly beyond `end`
+            let header = format!("bytes={start}-{end}");
+            proptest::prop_assert_eq!(
+                parse(&header, len),
+                Resolved::Partial { start, end }
+            );
+        }
     }
 }

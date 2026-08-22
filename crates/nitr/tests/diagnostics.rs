@@ -4,10 +4,12 @@
 //! classification, the dev/production presentation split, and load-time
 //! diagnostics that point at the offending line.
 
-use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
+// Each test binary uses a subset of the shared harness.
+#![allow(dead_code)]
+
+mod harness;
+
+use harness::{TestDir, TestServer};
 
 /// The handler script: `/boom` fails at a known line, and the app-wide
 /// `on_error` reports every structured field back as JSON so tests can
@@ -71,25 +73,6 @@ end)
 return app
 "#;
 
-fn write_temp_script(name: &str, content: &str) -> PathBuf {
-    // Each script gets its own private DIRECTORY, not just its own file:
-    // a dev-mode server watches the handler's parent directory, and if
-    // that were the shared system temp dir, the watcher would recursively
-    // register the runner's whole temp tree and react to every other
-    // test's file churn — which is exactly the CI hang this fixes. The
-    // counter still keeps two tests in this process apart.
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("nitr-diagnostics-{}-{id}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create temp script dir");
-    let path = dir.join(name);
-    std::fs::write(&path, content).expect("write temp script");
-    path
-}
-
-/// Binds port 0 (the OS picks a free port) and keeps the listener alive.
-/// The server adopts it via `.listener(...)`, so the port can never be
-/// taken by another test between choosing it and serving on it.
 /// Removes ANSI SGR sequences (`ESC [ … m`), leaving the visible text.
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -109,78 +92,19 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-fn reserve_addr() -> (std::net::TcpListener, SocketAddr) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind port 0");
-    let addr = listener.local_addr().expect("local addr");
-    (listener, addr)
-}
-
-async fn wait_until_listening(addr: SocketAddr) {
-    for _ in 0..200 {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("the server never started listening on {addr}");
-}
-
-struct Harness {
-    addr: SocketAddr,
-    handler: PathBuf,
-    stop: tokio::sync::oneshot::Sender<()>,
-    served: tokio::task::JoinHandle<nitr::Result>,
-}
-
-impl Harness {
-    async fn start(script: &str, dev_mode: bool, tune: impl FnOnce(&mut nitr::Config)) -> Self {
-        let handler = write_temp_script("app.lua", script);
-        let (listener, addr) = reserve_addr();
-        let mut cfg = nitr::Config {
-            listen: addr,
-            workers: 1,
-            ..Default::default()
-        };
-        cfg.shutdown.grace = 5;
-        cfg.shutdown.stream_grace = 0;
-        tune(&mut cfg);
-        let server = nitr::Server::builder()
-            .config(cfg)
-            .listener(listener)
-            .handler_script(&handler)
-            .builtins(nitr::Builtins::JSON | nitr::Builtins::HTTP)
-            .dev_mode(dev_mode)
-            .build()
-            .await
-            .expect("build server");
-        let (stop, stop_rx) = tokio::sync::oneshot::channel::<()>();
-        let served = tokio::spawn(server.serve_with_shutdown(async {
-            let _ = stop_rx.await;
-        }));
-        wait_until_listening(addr).await;
-        Self {
-            addr,
-            handler,
-            stop,
-            served,
-        }
-    }
-
-    fn url(&self, path: &str) -> String {
-        format!("http://{}{path}", self.addr)
-    }
-
-    async fn stop(self) {
-        let _ = self.stop.send(());
-        self.served
-            .await
-            .expect("server task")
-            .expect("clean shutdown");
-        // Scripts live in a private per-test directory; remove it whole.
-        if let Some(dir) = self.handler.parent() {
-            std::fs::remove_dir_all(dir).ok();
-        }
-    }
+/// A one-state server for a diagnostics script. The harness gives each
+/// test a private directory, which dev mode requires: the watcher
+/// registers the handler's parent tree recursively, and a shared temp
+/// dir here once meant watching the whole runner's churn (a CI hang).
+async fn start(script: &str, dev_mode: bool, tune: impl FnOnce(&mut nitr::Config)) -> TestServer {
+    TestServer::builder("diagnostics")
+        .handler(script)
+        .builtins(nitr::Builtins::JSON | nitr::Builtins::HTTP)
+        .config(|cfg| cfg.workers = 1)
+        .config(|cfg| cfg.dev_mode = dev_mode)
+        .config(tune)
+        .spawn()
+        .await
 }
 
 // ---------------------------------------------------------------------------
@@ -189,8 +113,8 @@ impl Harness {
 /// source, line, and traceback — and it still stringifies.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_error_receives_structured_fields() {
-    let h = Harness::start(APP_SCRIPT, false, |_| {}).await;
-    let client = reqwest::Client::new();
+    let mut h = start(APP_SCRIPT, false, |_| {}).await;
+    let client = h.client().clone();
 
     let resp = client.get(h.url("/boom")).send().await.expect("GET /boom");
     assert_eq!(resp.status(), 500);
@@ -223,8 +147,8 @@ async fn on_error_receives_structured_fields() {
 /// A per-route `on_error` wins over the app-wide handler.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn per_route_on_error_overrides_app_handler() {
-    let h = Harness::start(APP_SCRIPT, false, |_| {}).await;
-    let client = reqwest::Client::new();
+    let mut h = start(APP_SCRIPT, false, |_| {}).await;
+    let client = h.client().clone();
 
     let resp = client
         .get(h.url("/routed"))
@@ -240,13 +164,13 @@ async fn per_route_on_error_overrides_app_handler() {
 /// A CPU-bound overrun is classified `timeout`, not a script bug.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn budget_overruns_are_classified_as_timeouts() {
-    let h = Harness::start(APP_SCRIPT, false, |cfg| {
+    let mut h = start(APP_SCRIPT, false, |cfg| {
         cfg.lua.exec_timeout_ms = 200;
         // Config validation refuses a pool wait above the request budget.
         cfg.limits.pool_wait_ms = 200;
     })
     .await;
-    let client = reqwest::Client::new();
+    let client = h.client().clone();
 
     let resp = client.get(h.url("/spin")).send().await.expect("GET /spin");
     assert_eq!(resp.status(), 500);
@@ -260,8 +184,8 @@ async fn budget_overruns_are_classified_as_timeouts() {
 /// builtin errors alike — and the value concatenates as the concise line.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn errinfo_classifies_caught_errors() {
-    let h = Harness::start(APP_SCRIPT, false, |_| {}).await;
-    let client = reqwest::Client::new();
+    let mut h = start(APP_SCRIPT, false, |_| {}).await;
+    let client = h.client().clone();
 
     let resp = client
         .get(h.url("/caught"))
@@ -320,8 +244,8 @@ app:get("/boom", function(req)
 end)
 return app
 "#;
-    let h = Harness::start(script, false, |_| {}).await;
-    let client = reqwest::Client::new();
+    let mut h = start(script, false, |_| {}).await;
+    let client = h.client().clone();
 
     let resp = client.get(h.url("/boom")).send().await.expect("GET /boom");
     assert_eq!(resp.status(), 500);
@@ -343,8 +267,8 @@ app:get("/boom", function(req)
 end)
 return app
 "#;
-    let h = Harness::start(script, true, |_| {}).await;
-    let client = reqwest::Client::new();
+    let mut h = start(script, true, |_| {}).await;
+    let client = h.client().clone();
 
     let resp = client.get(h.url("/boom")).send().await.expect("GET /boom");
     assert_eq!(resp.status(), 500);
@@ -388,7 +312,8 @@ app:get("/x", function(req) return { status = 200 } end)
 app:get("/x", function(req) return { status = 200 } end)
 return app
 "#;
-    let handler = write_temp_script("dup.lua", script);
+    let dir = TestDir::new("diagnostics-dup");
+    let handler = dir.write("dup.lua", script);
     let err = nitr::Server::builder()
         .listen("127.0.0.1:0".parse().expect("addr"))
         .handler_script(&handler)
@@ -404,16 +329,14 @@ return app
     // Both sites carry the line numbers of the two app:get calls.
     assert!(message.contains(":3"), "{message}");
     assert!(message.contains(":4"), "{message}");
-    if let Some(dir) = handler.parent() {
-        std::fs::remove_dir_all(dir).ok();
-    }
 }
 
 /// A syntax error points at the line, with the source rendered around it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn syntax_errors_point_at_the_line() {
     let script = "local app = nitr.app()\nlocal x =\nreturn app\n";
-    let handler = write_temp_script("syntax.lua", script);
+    let dir = TestDir::new("diagnostics-syntax");
+    let handler = dir.write("syntax.lua", script);
     let err = nitr::Server::builder()
         .listen("127.0.0.1:0".parse().expect("addr"))
         .handler_script(&handler)
@@ -427,7 +350,4 @@ async fn syntax_errors_point_at_the_line() {
     assert!(message.contains("syntax.lua"), "{message}");
     // The gutter renders the offending source line.
     assert!(message.contains("| return app"), "{message}");
-    if let Some(dir) = handler.parent() {
-        std::fs::remove_dir_all(dir).ok();
-    }
 }

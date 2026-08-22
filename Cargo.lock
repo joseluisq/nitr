@@ -1459,6 +1459,7 @@ dependencies = [
  "nitr-std",
  "notify",
  "percent-encoding",
+ "proptest",
  "serde",
  "serde_json",
  "tokio",
