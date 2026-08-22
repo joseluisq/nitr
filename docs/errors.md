@@ -88,7 +88,7 @@ Responses your application never sees, answered in Rust:
 | --- | --- | --- |
 | `404` | No route or static mount matched | |
 | `405` | The path exists, the method does not | Carries `Allow`; a bare `OPTIONS` on a known path gets `204` + `Allow` instead |
-| `408` | The client sent no complete request header within 30 s | Enforced by the HTTP layer per connection |
+| `408` | No complete request headers within `header_read_ms`, or a body read stalled beyond `body_read_ms` | A stalled body gets `Connection: close`; an expired header read simply closes the connection |
 | `413` | Body beyond `max_body_bytes` (declared or counted while reading) | Also for multipart parts beyond their limits |
 | `414` | URI beyond `max_uri_bytes` | |
 | `429` | Per-IP budget exceeded (`[rate_limit]`) | Carries `Retry-After` |
@@ -123,6 +123,8 @@ Every limit that produces one of the statuses above, in one place:
 | `max_header_bytes` | `[limits]` | 16 KiB | connection-level rejection |
 | `max_connections` | `[limits]` | 1024 | listener stops accepting |
 | `pool_wait_ms` | `[limits]` | 5000 | `503` + `Retry-After` |
+| `header_read_ms` | `[limits]` | 30000 | connection closed |
+| `body_read_ms` | `[limits]` | 30000 | `408` + `Connection: close` |
 | `max_form_parts` / `max_field_bytes` / `max_file_bytes` | `[limits]` | 64 / 64 KiB / 10 MiB | `413` |
 | `requests` per `window` | `[rate_limit]` | off | `429` + `Retry-After` |
 | `exec_timeout_ms` | `[lua]` | 30000 | error with `kind = "timeout"` → `500` |

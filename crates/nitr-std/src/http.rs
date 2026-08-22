@@ -122,7 +122,9 @@ pub(crate) fn register(lua: &Lua, nitr: &Table) -> mlua::Result<()> {
                 }
                 // A table body renders as JSON, e.g. `{ code = "NOT_FOUND" }`.
                 Some(Value::Table(t)) => {
-                    let body = serde_json::to_string(&Value::Table(t)).into_lua_err()?;
+                    let t = Value::Table(t);
+                    crate::utils::check_json_depth(&t)?;
+                    let body = serde_json::to_string(&t).into_lua_err()?;
                     set_content_type(&table, "application/json")?;
                     table.set("body", body)?;
                 }
@@ -151,7 +153,10 @@ pub(crate) fn register(lua: &Lua, nitr: &Table) -> mlua::Result<()> {
                 Value::String(s) => s.as_bytes().to_vec(),
                 Value::Integer(n) => n.to_string().into_bytes(),
                 Value::Number(n) => n.to_string().into_bytes(),
-                other => serde_json::to_vec(other).into_lua_err()?,
+                other => {
+                    crate::utils::check_json_depth(other)?;
+                    serde_json::to_vec(other).into_lua_err()?
+                }
             };
             // Hashed rather than embedded verbatim: the input may contain
             // anything, and a header value may not.
@@ -175,7 +180,10 @@ pub(crate) fn register(lua: &Lua, nitr: &Table) -> mlua::Result<()> {
 fn format_event(event: &str, data: Value) -> mlua::Result<String> {
     let data = match data {
         Value::String(s) => s.to_string_lossy().to_string(),
-        other => serde_json::to_string(&other).into_lua_err()?,
+        other => {
+            crate::utils::check_json_depth(&other)?;
+            serde_json::to_string(&other).into_lua_err()?
+        }
     };
     let mut out = format!("event: {event}\n");
     for line in data.split('\n') {

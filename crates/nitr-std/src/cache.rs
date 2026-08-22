@@ -223,6 +223,7 @@ impl UserData for Cache {
                     Some(opts) => opts.get::<Option<u64>>("ttl")?,
                     None => None,
                 };
+                crate::utils::check_json_depth(&value)?;
                 let bytes = serde_json::to_vec(&value).map_err(|err| {
                     mlua::Error::RuntimeError(format!(
                         "cache values must be plain data (a table, string, number or \
@@ -286,6 +287,7 @@ impl UserData for Cache {
                 if value.is_nil() {
                     return Ok(Value::Nil);
                 }
+                crate::utils::check_json_depth(&value)?;
                 let bytes = serde_json::to_vec(&value).map_err(|err| {
                     mlua::Error::RuntimeError(format!(
                         "cache:remember value for `{key}` is not serializable: {err}"
@@ -323,6 +325,41 @@ mod tests {
 
     fn cache(opts: CacheOptions) -> Cache {
         Cache::new(opts)
+    }
+
+    /// A chain of `depth` nested Lua tables (the root included).
+    fn deep_table(lua: &Lua, depth: usize) -> Value {
+        let root = lua.create_table().expect("table");
+        let mut cur = root.clone();
+        for _ in 1..depth {
+            let next = lua.create_table().expect("table");
+            cur.set("x", next.clone()).expect("set");
+            cur = next;
+        }
+        Value::Table(root)
+    }
+
+    /// `cache:set` serializes script values: without the depth guard a
+    /// deep chain recursed to a stack-overflow abort here too.
+    #[test]
+    fn set_rejects_values_nested_beyond_the_json_depth_bound() {
+        let lua = Lua::new();
+        let ud = lua
+            .create_userdata(cache(CacheOptions::default()))
+            .expect("ud");
+        lua.globals().set("cache", ud).expect("global");
+        lua.globals()
+            .set("deep", deep_table(&lua, 129))
+            .expect("global");
+        let err: String = lua
+            .load(
+                r#"local ok, err = pcall(function() cache:set("k", deep) end)
+                   assert(not ok)
+                   return tostring(err)"#,
+            )
+            .eval()
+            .expect("eval");
+        assert!(err.contains("nested deeper than 128 levels"), "got: {err}");
     }
 
     #[test]

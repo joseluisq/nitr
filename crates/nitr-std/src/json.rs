@@ -10,11 +10,20 @@ pub(crate) struct LuaJson;
 impl UserData for LuaJson {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method_mut("encode", |lua, _, input: Value| {
+            crate::utils::check_json_depth(&input)?;
             let s = serde_json::to_string(&input).into_lua_err()?;
             lua.to_value(&s)
         });
 
         methods.add_method_mut("decode", |lua, _, input: LuaString| {
+            // serde_json's default recursion limit (128) is load-bearing
+            // here: it is what stops hostile deeply nested input from
+            // overflowing the stack, with an ordinary error, before
+            // `lua.to_value` walks the tree. It also mirrors
+            // `MAX_JSON_DEPTH` on the encode side, so the two directions
+            // share one bound. Never enable `serde_json`'s
+            // `unbounded_depth` / disable that limit; a regression test
+            // pins the 129-deep rejection.
             let v = serde_json::from_slice::<SerdeValue>(&input.as_bytes()).into_lua_err()?;
             lua.to_value(&v)
         });
@@ -24,6 +33,7 @@ impl UserData for LuaJson {
         methods.add_meta_method(
             MetaMethod::Call,
             |lua, _, (value, status): (Value, Option<u16>)| {
+                crate::utils::check_json_depth(&value)?;
                 let body = serde_json::to_string(&value).into_lua_err()?;
                 let table = crate::http::response_table(lua, status.unwrap_or(200))?;
                 table
@@ -84,6 +94,67 @@ mod tests {
         })
     }
 
+    /// A chain of `depth` nested Lua tables (the root included).
+    fn deep_table(lua: &Lua, depth: usize) -> Value {
+        let root = lua.create_table().expect("table");
+        let mut cur = root.clone();
+        for _ in 1..depth {
+            let next = lua.create_table().expect("table");
+            cur.set("x", next.clone()).expect("set");
+            cur = next;
+        }
+        Value::Table(root)
+    }
+
+    /// The abort this pins: encoding used to recurse without limit, and a
+    /// deep-enough table chain overflowed the Rust stack — a process
+    /// kill no panic boundary can contain (verified as SIGABRT at
+    /// ~30,000 levels before the guard existed).
+    #[test]
+    fn encode_rejects_values_nested_beyond_the_depth_bound() {
+        let lua = Lua::new();
+        let json = create_json_fn(&lua).expect("json");
+
+        let ok: String = json
+            .call_method("encode", deep_table(&lua, 128))
+            .expect("128 levels encode");
+        assert!(ok.starts_with('{'));
+
+        for depth in [129usize, 4096] {
+            let err = json
+                .call_method::<String>("encode", deep_table(&lua, depth))
+                .expect_err("too deep");
+            assert!(
+                err.to_string().contains("nested deeper than 128 levels"),
+                "depth {depth}: {err}"
+            );
+        }
+
+        // The JSON response helper shares the guard.
+        let err = json
+            .call::<Table>((deep_table(&lua, 129), 200))
+            .expect_err("deep response body");
+        assert!(err.to_string().contains("nested deeper"), "got: {err}");
+    }
+
+    /// serde_json's default deserialization recursion limit is a
+    /// load-bearing part of the contract (see the comment at `decode`):
+    /// 128 levels parse, 129 fail with an ordinary error.
+    #[test]
+    fn decode_depth_limit_is_load_bearing() {
+        let lua = Lua::new();
+        let json = create_json_fn(&lua).expect("json");
+
+        let ok = format!("{}1{}", "[".repeat(127), "]".repeat(127));
+        json.call_method::<Value>("decode", ok).expect("127 deep");
+
+        let too_deep = format!("{}1{}", "[".repeat(129), "]".repeat(129));
+        let err = json
+            .call_method::<Value>("decode", too_deep)
+            .expect_err("129 deep");
+        assert!(err.to_string().contains("recursion limit"), "got: {err}");
+    }
+
     proptest::proptest! {
         /// Property: decode(encode(decode(json))) is a fixed point — a
         /// JSON document survives the trip through Lua values.
@@ -96,6 +167,25 @@ mod tests {
             let encoded: String = json.call_method("encode", decoded).expect("encode");
             let back: SerdeValue = serde_json::from_str(&encoded).expect("parse");
             proptest::prop_assert_eq!(back, tree);
+        }
+
+        /// Property: for any depth, encoding either succeeds (within the
+        /// bound) or fails with the depth error (beyond it) — never
+        /// anything else, and never a crash.
+        #[test]
+        fn prop_encode_depth_boundary_is_total(depth in 1usize..=160) {
+            let lua = Lua::new();
+            let json = create_json_fn(&lua).expect("json");
+            let result = json.call_method::<String>("encode", deep_table(&lua, depth));
+            if depth <= 128 {
+                proptest::prop_assert!(result.is_ok(), "depth {} must encode", depth);
+            } else {
+                let err = result.expect_err("beyond the bound");
+                proptest::prop_assert!(
+                    err.to_string().contains("nested deeper than 128 levels"),
+                    "depth {}: {}", depth, err
+                );
+            }
         }
     }
 }

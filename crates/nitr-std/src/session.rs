@@ -67,7 +67,9 @@ fn serialize(session: &Table) -> mlua::Result<String> {
             )));
         }
     }
-    let json = serde_json::to_string(&Value::Table(session.clone())).map_err(|err| {
+    let session = Value::Table(session.clone());
+    crate::utils::check_json_depth(&session)?;
+    let json = serde_json::to_string(&session).map_err(|err| {
         mlua::Error::RuntimeError(format!(
             "session values must be JSON-serializable (strings, numbers, booleans, tables): {err}"
         ))
@@ -174,6 +176,28 @@ mod tests {
         let session_fn = create_session_fn(lua).expect("fn");
         let opts: Table = lua.load(opts).eval().expect("opts");
         session_fn.call((Value::Nil, opts)).expect("session")
+    }
+
+    /// Session tables are script data serialized to JSON: the depth guard
+    /// must fire before the byte cap can even be measured.
+    #[test]
+    fn save_rejects_a_session_nested_beyond_the_json_depth_bound() {
+        let lua = Lua::new();
+        let session = make_session(&lua, r#"{ secret = "0123456789abcdef" }"#);
+        let mut cur = lua.create_table().expect("table");
+        session.set("deep", cur.clone()).expect("set");
+        for _ in 0..128 {
+            let next = lua.create_table().expect("table");
+            cur.set("x", next.clone()).expect("set");
+            cur = next;
+        }
+        let save: mlua::Function = session.get("save").expect("method");
+        let resp = lua.create_table().expect("resp");
+        let err = save.call::<Value>((session, resp)).expect_err("too deep");
+        assert!(
+            err.to_string().contains("nested deeper than 128 levels"),
+            "got: {err}"
+        );
     }
 
     #[test]

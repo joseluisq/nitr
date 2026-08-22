@@ -167,8 +167,8 @@ async fn handle_inner(
         return resp;
     }
     // `check` only compared the *declared* length; from here the bytes are
-    // counted as the handler reads them.
-    let oversized = req.limit_body(protection.max_body_bytes());
+    // counted — and their arrival clocked — as the handler reads them.
+    let guards = req.guard_body(protection.max_body_bytes(), protection.body_read_timeout());
     req.limits = protection.form_limits();
 
     // Bounded wait for a state: past the budget the request is shed rather
@@ -251,10 +251,23 @@ async fn handle_inner(
             // An oversized body is a rejection, not an application failure:
             // answer it in Rust and skip the app's error handler, which
             // would only see an opaque read error.
-            if oversized.load(std::sync::atomic::Ordering::Relaxed) {
+            if guards.oversized.load(std::sync::atomic::Ordering::Relaxed) {
                 tracing::debug!("request rejected: body exceeded max_body_bytes");
                 discard_body(&req_ud);
                 return plain_response(StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large");
+            }
+            // A stalled body likewise: the client is the culprit, and the
+            // connection is closed with the response — keep-alive would
+            // hand a misbehaving client a fresh slot.
+            if guards.stalled.load(std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!("request rejected: body read stalled beyond [limits] body_read_ms");
+                discard_body(&req_ud);
+                let mut resp = plain_response(StatusCode::REQUEST_TIMEOUT, "Request Timeout")?;
+                resp.headers_mut().insert(
+                    header::CONNECTION,
+                    header::HeaderValue::from_static("close"),
+                );
+                return Ok(resp);
             }
 
             // Classified once, on the error path only; the structured

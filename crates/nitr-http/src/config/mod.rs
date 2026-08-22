@@ -464,6 +464,22 @@ mod tests {
     }
 
     #[test]
+    fn read_timeout_limits_parse_and_default() {
+        let cfg = Config::default();
+        assert_eq!(cfg.limits.header_read_ms, 30_000);
+        assert_eq!(cfg.limits.body_read_ms, 30_000);
+
+        let path = write_temp_config(
+            "read-timeouts.toml",
+            "[limits]\nheader_read_ms = 0\nbody_read_ms = 250\n",
+        );
+        let cfg = Config::from_file(&path).expect("parse");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(cfg.limits.header_read_ms, 0, "0 disables the deadline");
+        assert_eq!(cfg.limits.body_read_ms, 250);
+    }
+
+    #[test]
     fn moved_keys_fail_with_directions() {
         // Superseded spellings are refused with the new spelling named,
         // not as a bare unknown-field/type error.

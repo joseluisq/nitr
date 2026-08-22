@@ -22,9 +22,6 @@ use nitr_core::{Error, Result};
 use nitr_core::{Runtime, RuntimePool};
 use nitr_std::Builtins;
 
-/// How long to read request headers before giving up on a connection.
-const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// A closure that customizes each pooled Lua state (advanced escape hatch;
 /// prefer [`ServerBuilder::module()`] for extensions).
 type SetupFn = Box<dyn Fn(&mlua::Lua) -> mlua::Result<()> + Send + Sync>;
@@ -278,6 +275,13 @@ impl Server {
         let conn_slots = Arc::new(Semaphore::new(self.cfg.limits.max_connections.max(1)));
         // hyper enforces a floor of 8 KiB on its read buffer.
         let max_buf_size = self.cfg.limits.max_header_bytes.max(8 * 1024);
+        // Complete-headers deadline (`[limits] header_read_ms`); `None`
+        // disables it. Enforced by hyper per connection: an expired one
+        // is simply closed — no request exists yet to answer.
+        let header_read = match self.cfg.limits.header_read_ms {
+            0 => None,
+            ms => Some(Duration::from_millis(ms)),
+        };
 
         loop {
             tokio::select! {
@@ -316,7 +320,7 @@ impl Server {
                     );
                     let conn = http1::Builder::new()
                         .timer(TokioTimer::new())
-                        .header_read_timeout(HEADER_READ_TIMEOUT)
+                        .header_read_timeout(header_read)
                         .max_buf_size(max_buf_size)
                         .serve_connection(TokioIo::new(stream), svc);
                     let conn = graceful.watch(conn);

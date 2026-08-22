@@ -27,6 +27,8 @@ pub(crate) struct Protection {
     max_uri_bytes: usize,
     trust_request_id: bool,
     dev_mode: bool,
+    /// Per-read body progress budget; `None` when disabled.
+    body_read: Option<Duration>,
     /// How long a request may wait for a Lua state before it is shed.
     pool_wait: Duration,
     rate: Option<RateLimiter>,
@@ -45,6 +47,10 @@ impl Protection {
             max_uri_bytes: cfg.limits.max_uri_bytes,
             trust_request_id: cfg.trust_request_id,
             dev_mode: cfg.dev_mode,
+            body_read: match cfg.limits.body_read_ms {
+                0 => None,
+                ms => Some(Duration::from_millis(ms)),
+            },
             pool_wait: Duration::from_millis(cfg.limits.pool_wait_ms),
             rate: cfg.rate_limit.enabled.then(|| RateLimiter {
                 max: cfg.rate_limit.requests.max(1),
@@ -85,6 +91,12 @@ impl Protection {
     /// The checkout wait budget; zero means wait indefinitely.
     pub(crate) fn pool_wait(&self) -> Duration {
         self.pool_wait
+    }
+
+    /// How long each body read may wait for the next bytes (`[limits]
+    /// body_read_ms`); `None` when the bound is disabled.
+    pub(crate) fn body_read_timeout(&self) -> Option<Duration> {
+        self.body_read
     }
 
     /// The configured request body ceiling, enforced as the body is read.

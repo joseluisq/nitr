@@ -14,6 +14,50 @@ pub(crate) fn new_hmac<M: hmac::digest::KeyInit>(key: &[u8]) -> M {
     <M as hmac::digest::KeyInit>::new_from_slice(key).expect("HMAC accepts any key length")
 }
 
+/// The deepest nesting a Lua value may have before it is serialized to
+/// JSON, deliberately mirroring serde_json's *deserialization* recursion
+/// limit so the two directions share one documented bound.
+///
+/// The limit exists because serialization has none of its own: serde_json
+/// recurses once per nesting level, and a script can build a table chain
+/// deep enough to overflow the Rust stack well within its Lua memory
+/// budget (verified empirically: ~30,000 levels aborts the process with
+/// SIGABRT on a default tokio worker stack). A stack overflow is an
+/// abort, not a panic — the containment boundary cannot catch
+/// it, so the bound must hold *before* a serializer recurses.
+pub(crate) const MAX_JSON_DEPTH: usize = 128;
+
+/// Refuses a value nested deeper than [`MAX_JSON_DEPTH`] with an ordinary
+/// catchable error, before any serializer recurses over it.
+///
+/// Every Lua-value-to-JSON site in the crate calls this first.
+/// `nitr.json` encoding and the JSON response helper, `cache:set` /
+/// `cache:remember`, `fetch` JSON bodies, JWT claims, sessions, SSE data,
+/// `nitr.etag`, `nitr.error` table bodies, and log fields, so the bound
+/// has one auditable home. The walk itself recurses, but its depth is
+/// capped by the very bound it enforces; a cyclic table is infinitely
+/// deep and reports the same error instead of hanging.
+pub(crate) fn check_json_depth(value: &Value) -> mlua::Result<()> {
+    depth_walk(value, MAX_JSON_DEPTH)
+}
+
+fn depth_walk(value: &Value, remaining: usize) -> mlua::Result<()> {
+    let Value::Table(table) = value else {
+        return Ok(());
+    };
+    if remaining == 0 {
+        return Err(mlua::Error::RuntimeError(format!(
+            "json value nested deeper than {MAX_JSON_DEPTH} levels"
+        )));
+    }
+    // Raw iteration, matching what serialization will walk; keys can be
+    // tables too, and a deep key must not slip past the check.
+    table.for_each(|key: Value, item: Value| {
+        depth_walk(&key, remaining - 1)?;
+        depth_walk(&item, remaining - 1)
+    })
+}
+
 /// Debug function.
 pub(crate) fn create_debug_fn(lua: &Lua) -> mlua::Result<Function> {
     lua.create_function(|_, value: Value| {
@@ -167,5 +211,53 @@ mod tests {
         assert_eq!(message, "nope");
         assert_eq!(kind, "lua");
         assert!(twice_same, "a structured value passes through unchanged");
+    }
+
+    /// A chain of `depth` nested tables (the root included).
+    fn deep_table(lua: &Lua, depth: usize) -> Value {
+        let root = lua.create_table().expect("table");
+        let mut cur = root.clone();
+        for _ in 1..depth {
+            let next = lua.create_table().expect("table");
+            cur.set("x", next.clone()).expect("set");
+            cur = next;
+        }
+        Value::Table(root)
+    }
+
+    #[test]
+    fn json_depth_boundary_is_exact() {
+        let lua = Lua::new();
+        assert!(check_json_depth(&deep_table(&lua, MAX_JSON_DEPTH)).is_ok());
+        let err = check_json_depth(&deep_table(&lua, MAX_JSON_DEPTH + 1)).expect_err("129 deep");
+        assert!(
+            err.to_string().contains("nested deeper than 128 levels"),
+            "got: {err}"
+        );
+        // Scalars and shallow values pass untouched.
+        assert!(check_json_depth(&Value::Integer(7)).is_ok());
+    }
+
+    /// A cyclic table is infinitely deep: the walk must report the depth
+    /// error, not hang or overflow.
+    #[test]
+    fn a_cyclic_table_reports_depth_instead_of_hanging() {
+        let lua = Lua::new();
+        let t = lua.create_table().expect("table");
+        t.set("me", t.clone()).expect("set");
+        let err = check_json_depth(&Value::Table(t)).expect_err("cycle");
+        assert!(err.to_string().contains("nested deeper"), "got: {err}");
+    }
+
+    /// Lua table keys can be tables too; a deep *key* must not slip past
+    /// the check and recurse in the serializer instead.
+    #[test]
+    fn deep_table_keys_are_bounded_too() {
+        let lua = Lua::new();
+        let outer = lua.create_table().expect("table");
+        outer
+            .set(deep_table(&lua, MAX_JSON_DEPTH), true)
+            .expect("set");
+        assert!(check_json_depth(&Value::Table(outer)).is_err());
     }
 }

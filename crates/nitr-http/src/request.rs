@@ -1,3 +1,4 @@
+use std::future::Future as _;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -109,6 +110,83 @@ impl std::fmt::Display for BodyTooLarge {
 
 impl std::error::Error for BodyTooLarge {}
 
+/// A body wrapper that bounds how long each read may wait for the next
+/// frame — progress, not total transfer. The timer arms when a read comes
+/// up empty and disarms the moment anything arrives, so a slow-but-moving
+/// upload of any allowed size passes while a stalled one fails
+/// deterministically instead of holding a connection slot (and a pooled
+/// Lua state) until the compute budget notices.
+struct StalledBody {
+    inner: IncomingBody,
+    budget: std::time::Duration,
+    /// Armed while the inner body is pending; `None` whenever it last
+    /// made progress.
+    deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+    stalled: Arc<AtomicBool>,
+}
+
+impl Body for StalledBody {
+    type Data = Bytes;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(ready) => {
+                this.deadline = None;
+                Poll::Ready(ready)
+            }
+            Poll::Pending => {
+                let budget = this.budget;
+                let deadline = this
+                    .deadline
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(budget)));
+                match deadline.as_mut().poll(cx) {
+                    Poll::Ready(()) => {
+                        this.stalled.store(true, Ordering::Relaxed);
+                        Poll::Ready(Some(Err(Box::new(BodyStalled(budget)))))
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// The error a body read fails with when the client stops sending.
+#[derive(Debug)]
+struct BodyStalled(std::time::Duration);
+
+impl std::fmt::Display for BodyStalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the request body stalled: no bytes arrived within {} ms",
+            self.0.as_millis()
+        )
+    }
+}
+
+impl std::error::Error for BodyStalled {}
+
+/// The protection flags [`LuaRequest::guard_body`] installs: by the time
+/// either violation surfaces it has crossed into Lua and become an opaque
+/// error value, so the handler reads these to answer `413`/`408` instead
+/// of a generic `500`.
+pub(crate) struct BodyGuards {
+    /// The body exceeded the byte ceiling.
+    pub(crate) oversized: Arc<AtomicBool>,
+    /// A body read made no progress within the stall budget.
+    pub(crate) stalled: Arc<AtomicBool>,
+}
+
 /// Wrapper around the incoming request that implements UserData.
 pub(crate) struct LuaRequest {
     pub(crate) peer_addr: SocketAddr,
@@ -164,21 +242,39 @@ impl LuaRequest {
     /// stream the moment it passes the ceiling, so an oversized upload is cut
     /// mid-flight instead of being buffered in full.
     ///
-    /// The overflow is also recorded in the returned flag, because by the
-    /// time the failure surfaces it has crossed into Lua and become an opaque
-    /// error value. The flag lets the handler answer 413 instead of a
-    /// generic 500.
-    pub(crate) fn limit_body(&mut self, limit: u64) -> Arc<AtomicBool> {
-        let exceeded = Arc::new(AtomicBool::new(false));
+    /// The violations are also recorded in the returned flags, because by
+    /// the time either failure surfaces it has crossed into Lua and become
+    /// an opaque error value. The flags let the handler answer `413` (too
+    /// large) or `408` (stalled) instead of a generic `500`.
+    pub(crate) fn guard_body(
+        &mut self,
+        limit: u64,
+        stall: Option<std::time::Duration>,
+    ) -> BodyGuards {
+        let guards = BodyGuards {
+            oversized: Arc::new(AtomicBool::new(false)),
+            stalled: Arc::new(AtomicBool::new(false)),
+        };
         let inner = std::mem::take(self.req.body_mut());
-        *self.req.body_mut() = LimitedBody {
+        let limited = LimitedBody {
             inner,
             limit,
             read: 0,
-            exceeded: exceeded.clone(),
-        }
-        .boxed();
-        exceeded
+            exceeded: guards.oversized.clone(),
+        };
+        // The stall timer wraps the byte counter so its budget covers the
+        // whole read; when disabled the counter is installed alone.
+        *self.req.body_mut() = match stall {
+            Some(budget) => StalledBody {
+                inner: limited.boxed(),
+                budget,
+                deadline: None,
+                stalled: guards.stalled.clone(),
+            }
+            .boxed(),
+            None => limited.boxed(),
+        };
+        guards
     }
 
     /// Releases the unread remainder of the body.
@@ -409,6 +505,101 @@ impl UserData for LuaRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A body that never produces anything — the stalled client.
+    struct NeverBody;
+
+    impl Body for NeverBody {
+        type Data = Bytes;
+        type Error = Box<dyn std::error::Error + Send + Sync>;
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
+            // No waker registration needed: the stall timer is what wakes
+            // the task.
+            Poll::Pending
+        }
+    }
+
+    /// A body that trickles `frames` one-byte frames, one per `delay` —
+    /// the slow-but-honest client.
+    struct TrickleBody {
+        frames: usize,
+        delay: std::time::Duration,
+        sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+    }
+
+    impl Body for TrickleBody {
+        type Data = Bytes;
+        type Error = Box<dyn std::error::Error + Send + Sync>;
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
+            let this = self.get_mut();
+            if this.frames == 0 {
+                return Poll::Ready(None);
+            }
+            let delay = this.delay;
+            let sleep = this
+                .sleep
+                .get_or_insert_with(|| Box::pin(tokio::time::sleep(delay)));
+            match sleep.as_mut().poll(cx) {
+                Poll::Ready(()) => {
+                    this.sleep = None;
+                    this.frames -= 1;
+                    Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"x")))))
+                }
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stalled_body_read_fails_and_sets_the_flag() {
+        let stalled = Arc::new(AtomicBool::new(false));
+        let mut body = StalledBody {
+            inner: NeverBody.boxed(),
+            budget: std::time::Duration::from_millis(40),
+            deadline: None,
+            stalled: stalled.clone(),
+        };
+        let err = body
+            .frame()
+            .await
+            .expect("a frame result")
+            .expect_err("the stall must fail the read");
+        assert!(err.to_string().contains("stalled"), "got: {err}");
+        assert!(stalled.load(Ordering::Relaxed));
+    }
+
+    /// The budget bounds *progress*, not total transfer: a transfer whose
+    /// every gap stays under the budget completes no matter how long it
+    /// takes in total.
+    #[tokio::test]
+    async fn a_slow_but_moving_body_completes() {
+        let stalled = Arc::new(AtomicBool::new(false));
+        let mut body = StalledBody {
+            inner: TrickleBody {
+                frames: 4,
+                delay: std::time::Duration::from_millis(30),
+                sleep: None,
+            }
+            .boxed(),
+            // Under 4 × 30 ms of total transfer, over any single gap.
+            budget: std::time::Duration::from_millis(80),
+            deadline: None,
+            stalled: stalled.clone(),
+        };
+        let mut got = 0;
+        while let Some(frame) = body.frame().await {
+            frame.expect("no gap exceeds the budget");
+            got += 1;
+        }
+        assert_eq!(got, 4);
+        assert!(!stalled.load(Ordering::Relaxed));
+    }
 
     fn headers(pairs: &[(&'static str, &str)]) -> hyper::HeaderMap {
         let mut map = hyper::HeaderMap::new();

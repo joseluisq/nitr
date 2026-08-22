@@ -57,6 +57,22 @@ impl Config {
                 self.limits.pool_wait_ms, self.lua.exec_timeout_ms
             )));
         }
+        // A warning, not an error: the stall bound still protects handlers
+        // that read the body incrementally past the compute budget — but
+        // for the common buffered read (`req:text()`, `req:form()`) the
+        // execution timeout fires first, turning what should be a clear
+        // 408 into a timeout-kind 500 that blames the handler.
+        if self.limits.body_read_ms > self.lua.exec_timeout_ms
+            && self.limits.body_read_ms != 0
+            && self.lua.exec_timeout_ms != 0
+        {
+            tracing::warn!(
+                "[limits] body_read_ms = {} exceeds [lua] exec_timeout_ms = {}: a stalled \
+                 buffered body read will surface as a handler timeout instead of a 408",
+                self.limits.body_read_ms,
+                self.lua.exec_timeout_ms
+            );
+        }
         if self.health.enabled {
             for (name, path) in [
                 ("liveness", &self.health.liveness),

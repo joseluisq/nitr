@@ -8,9 +8,15 @@ use mlua::{Lua, Table, Value};
 /// requires statically-known field names, so dynamic Lua fields travel as a
 /// single `fields` value.
 fn fields_json(fields: Option<Table>) -> Option<String> {
-    let fields = fields?;
+    let fields = Value::Table(fields?);
+    // Logging is infallible by contract: a value the serializer cannot
+    // take — too deep included, which would otherwise overflow the stack
+    // — degrades to a placeholder instead of failing the request.
+    if crate::utils::check_json_depth(&fields).is_err() {
+        return Some("\"<unserializable fields>\"".to_string());
+    }
     Some(
-        serde_json::to_string(&Value::Table(fields))
+        serde_json::to_string(&fields)
             .unwrap_or_else(|_| "\"<unserializable fields>\"".to_string()),
     )
 }

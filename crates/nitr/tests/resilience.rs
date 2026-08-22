@@ -44,6 +44,23 @@ app:post("/echo", function(req)
     return nitr.text(req:text())
 end)
 
+-- Phase 24: serializing a deep table chain must be a catchable error,
+-- not the stack-overflow abort it used to be.
+app:get("/deep-json", function(req)
+    local root = {}
+    local cur = root
+    for i = 1, 2000 do
+        local n = {}
+        cur.x = n
+        cur = n
+    end
+    local ok, err = pcall(function() return nitr.json:encode(root) end)
+    if ok then
+        return nitr.text("encoded")
+    end
+    return nitr.text("caught: " .. tostring(err))
+end)
+
 return app
 "#;
 
@@ -529,5 +546,174 @@ async fn an_expired_drain_deadline_is_reported() {
 
     // The abandoned request was cut rather than answered.
     let _ = inflight.await;
+    std::fs::remove_file(&handler).ok();
+}
+
+/// Phase 24: encoding a deeply nested table is an ordinary catchable Lua
+/// error. It used to recurse per level and overflow the Rust stack — a
+/// SIGABRT no panic boundary can contain (verified empirically at ~30,000
+/// levels before the guard existed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deep_json_serialization_is_a_catchable_error_not_an_abort() {
+    let (server, addr, handler) = build(base_config(1)).await;
+
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let served = tokio::spawn(server.serve_with_shutdown(async {
+        let _ = stop_rx.await;
+    }));
+    wait_until_listening(addr).await;
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{base}/deep-json"))
+        .send()
+        .await
+        .expect("the process must survive the encode");
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.expect("body");
+    assert!(
+        body.contains("nested deeper than 128 levels"),
+        "got: {body}"
+    );
+
+    // And the state is unharmed: no recycling was needed, the next
+    // request runs on the same pool.
+    let resp = client.get(format!("{base}/ok")).send().await.expect("ok");
+    assert_eq!(resp.status(), 200);
+
+    let _ = stop_tx.send(());
+    served.await.expect("server task").expect("clean shutdown");
+    std::fs::remove_file(&handler).ok();
+}
+
+/// A client that stops sending its body mid-way is answered `408` with
+/// `Connection: close`, instead of holding a pooled state until the
+/// compute budget notices.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stalled_body_is_answered_408_and_the_connection_is_closed() {
+    let mut cfg = base_config(1);
+    cfg.limits.body_read_ms = 200;
+    let (server, addr, handler) = build(cfg).await;
+
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let served = tokio::spawn(server.serve_with_shutdown(async {
+        let _ = stop_rx.await;
+    }));
+    wait_until_listening(addr).await;
+
+    let mut sock = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    sock.write_all(b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\nabc")
+        .await
+        .expect("write partial body");
+    // ...and then nothing: the stall bound must answer, not wait for the
+    // remaining 7 bytes.
+    let mut raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut raw))
+        .await
+        .expect("the server must answer within the stall budget")
+        .expect("read response");
+    let head = String::from_utf8_lossy(&raw).to_lowercase();
+    assert!(head.starts_with("http/1.1 408"), "got: {head}");
+    assert!(head.contains("connection: close"), "got: {head}");
+    // `read_to_end` returning proves the close was real, not just a header.
+
+    // The pool is intact: a fresh connection is served immediately.
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("http://{addr}/ok"))
+        .send()
+        .await
+        .expect("post-stall request");
+    assert_eq!(resp.status(), 200);
+
+    let _ = stop_tx.send(());
+    served.await.expect("server task").expect("clean shutdown");
+    std::fs::remove_file(&handler).ok();
+}
+
+/// The stall bound clocks progress, not total transfer: a trickled body
+/// whose every gap stays under the budget completes, however long the
+/// whole upload takes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_but_moving_body_is_not_punished() {
+    let mut cfg = base_config(1);
+    cfg.limits.body_read_ms = 300;
+    let (server, addr, handler) = build(cfg).await;
+
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let served = tokio::spawn(server.serve_with_shutdown(async {
+        let _ = stop_rx.await;
+    }));
+    wait_until_listening(addr).await;
+
+    let mut sock = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    sock.write_all(b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\n")
+        .await
+        .expect("write headers");
+    // Ten bytes, one every 80 ms: 800 ms total against a 300 ms budget —
+    // fine, because no single gap exceeds it.
+    for byte in b"0123456789" {
+        sock.write_all(&[*byte]).await.expect("trickle a byte");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+    }
+    let mut raw = [0u8; 512];
+    let n = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut raw))
+        .await
+        .expect("the server must answer")
+        .expect("read response");
+    let head = String::from_utf8_lossy(&raw[..n]);
+    assert!(head.starts_with("HTTP/1.1 200"), "got: {head}");
+    assert!(
+        head.contains("0123456789"),
+        "the echo must be whole: {head}"
+    );
+
+    let _ = stop_tx.send(());
+    served.await.expect("server task").expect("clean shutdown");
+    std::fs::remove_file(&handler).ok();
+}
+
+/// The header deadline is configurable now (it was a hardcoded 30 s): a
+/// connection that never completes its request headers is cut at
+/// `[limits] header_read_ms`, not half a minute later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_incomplete_header_read_is_cut_at_the_configured_deadline() {
+    let mut cfg = base_config(1);
+    cfg.limits.header_read_ms = 300;
+    let (server, addr, handler) = build(cfg).await;
+
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let served = tokio::spawn(server.serve_with_shutdown(async {
+        let _ = stop_rx.await;
+    }));
+    wait_until_listening(addr).await;
+
+    let started = std::time::Instant::now();
+    let mut sock = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    sock.write_all(b"GET /ok HT")
+        .await
+        .expect("partial request");
+    // The server must end the connection on its own; hyper may send a 408
+    // or nothing at all — the contract under test is the deadline.
+    let mut raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut raw))
+        .await
+        .expect("the connection must be cut at the deadline, not at 30 s")
+        .expect("read until close");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "took {:?}",
+        started.elapsed()
+    );
+    let head = String::from_utf8_lossy(&raw);
+    assert!(
+        !head.contains("200 OK"),
+        "no request existed to answer: {head}"
+    );
+
+    let _ = stop_tx.send(());
+    served.await.expect("server task").expect("clean shutdown");
     std::fs::remove_file(&handler).ok();
 }

@@ -49,6 +49,13 @@ dev_mode = true
 #pool_wait_ms = 5000         # how long a request waits for a free Lua state
                              # before it is shed with 503 + Retry-After;
                              # 0 waits forever
+#header_read_ms = 30000      # deadline for the complete request headers;
+                             # the connection is closed past it. 0 disables
+#body_read_ms = 30000        # how long each body read may wait for the
+                             # next bytes (408 + connection close past it).
+                             # Bounds progress, not total transfer: any
+                             # allowed size may take as long as it keeps
+                             # moving. 0 disables
 #max_form_parts = 64         # parts allowed in a multipart/form-data body
 #max_field_bytes = 65536     # per non-file form field; these become Lua
                              # strings, so this bounds the state's heap

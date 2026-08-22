@@ -116,6 +116,17 @@ pub struct LimitsConfig {
     /// so an overloaded server answers quickly instead of queueing work
     /// nobody is still waiting for.
     pub pool_wait_ms: u64,
+    /// How long a client may take to send its complete request headers,
+    /// in milliseconds; the connection is closed past it. `0` disables
+    /// the deadline.
+    pub header_read_ms: u64,
+    /// How long each read of the request body may wait for the next
+    /// bytes, in milliseconds (`408` past it, and the connection is
+    /// closed). A progress bound, not a total-transfer one: a body that
+    /// keeps arriving is fine at any size the byte limits allow; one
+    /// that stalls fails deterministically instead of holding a
+    /// connection slot and a pooled Lua state. `0` disables the bound.
+    pub body_read_ms: u64,
     /// Maximum number of parts in a `multipart/form-data` body.
     pub max_form_parts: usize,
     /// Maximum size of a single non-file form field, in bytes. Fields
@@ -139,6 +150,11 @@ impl Default for LimitsConfig {
             // rather than sheds, short enough that a saturated server fails
             // fast instead of accumulating doomed requests.
             pool_wait_ms: 5_000,
+            // 30 s each: far beyond any honest client or network hiccup,
+            // far short of forever. The header value matches what was a
+            // hardcoded constant before it became configurable.
+            header_read_ms: 30_000,
+            body_read_ms: 30_000,
             max_form_parts: 64,
             max_field_bytes: 64 * 1024,       // 64 KiB
             max_file_bytes: 10 * 1024 * 1024, // 10 MiB
